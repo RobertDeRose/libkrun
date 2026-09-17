@@ -516,8 +516,7 @@ impl Proxy for UnixProxy {
     }
 
     fn shutdown(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
-        const SHUTDOWN_MASK: u32 =
-            uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND;
+        const SHUTDOWN_MASK: u32 = uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND;
 
         let shutdown_flags = pkt.flags() & SHUTDOWN_MASK;
         if shutdown_flags == 0 || self.peer_shutdown == SHUTDOWN_MASK {
