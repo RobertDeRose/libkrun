@@ -10,4 +10,15 @@ fn main() {
         std::env::var("CARGO_PKG_VERSION_MAJOR").unwrap(), std::env::var("CARGO_PKG_VERSION_MAJOR").unwrap(),
         std::env::var("CARGO_PKG_VERSION_MAJOR").unwrap(), std::env::var("CARGO_PKG_VERSION_MINOR").unwrap()
     );
+
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("CARGO_FEATURE_NET").is_some() {
+        println!("cargo:rerun-if-changed=src/vmnet.c");
+        cc::Build::new()
+            .file("src/vmnet.c")
+            .flag("-fblocks")
+            .compile("krun_vmnet");
+        println!("cargo:rustc-link-lib=framework=vmnet");
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+    }
 }

@@ -221,7 +221,9 @@ ifeq ($(OS),Darwin)
 ifeq ($(EFI),1)
 	install_name_tool -id $(PREFIX)/$(LIBDIR_$(OS))/$(KRUN_SONAME_$(OS)) target/release/libkrun.dylib
 endif
+ifneq ($(KRUN_BASE_$(OS)),libkrun.dylib)
 	mv target/release/libkrun.dylib target/release/$(KRUN_BASE_$(OS))
+endif
 endif
 	cp target/release/$(KRUN_BASE_$(OS)) $(LIBRARY_RELEASE_$(OS))
 

@@ -147,6 +147,39 @@ impl KrunfwBindings {
     }
 }
 
+#[cfg(all(target_os = "macos", feature = "net"))]
+extern "C" {
+    fn krun_vmnet_start(
+        network_serialization: *const c_void,
+        out_fd: *mut c_int,
+        out_bridge: *mut *mut c_void,
+    ) -> c_int;
+    fn krun_vmnet_start_shared(
+        gateway: *const c_char,
+        netmask: *const c_char,
+        out_fd: *mut c_int,
+        out_bridge: *mut *mut c_void,
+    ) -> c_int;
+    fn krun_vmnet_stop(bridge: *mut c_void);
+}
+
+#[cfg(all(target_os = "macos", feature = "net"))]
+struct VmnetBridge(*mut c_void);
+
+// SAFETY: the opaque bridge is internally synchronized by vmnet, dispatch,
+// and its forwarding thread. Rust only owns its lifetime.
+#[cfg(all(target_os = "macos", feature = "net"))]
+unsafe impl Send for VmnetBridge {}
+
+#[cfg(all(target_os = "macos", feature = "net"))]
+impl Drop for VmnetBridge {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { krun_vmnet_stop(self.0) };
+        }
+    }
+}
+
 #[derive(Clone)]
 #[cfg(feature = "net")]
 enum LegacyNetworkConfig {
@@ -167,6 +200,8 @@ struct ContextConfig {
     legacy_net_cfg: Option<LegacyNetworkConfig>,
     #[cfg(feature = "net")]
     legacy_mac: Option<[u8; 6]>,
+    #[cfg(all(target_os = "macos", feature = "net"))]
+    vmnet_bridges: Vec<VmnetBridge>,
     net_index: u8,
     tsi_port_map: Option<HashMap<u16, u16>>,
     vsock_config: VsockConfig,
@@ -457,7 +492,17 @@ fn with_cfg(ctx_id: u32, f: impl FnOnce(&mut ContextConfig) -> i32) -> i32 {
 }
 
 static CTX_MAP: Lazy<Mutex<HashMap<u32, ContextConfig>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static RUNNING_VMM_STOPS: Lazy<Mutex<HashMap<u32, EventFd>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 static CTX_IDS: AtomicI32 = AtomicI32::new(0);
+
+struct RunningVmmStopGuard(u32);
+
+impl Drop for RunningVmmStopGuard {
+    fn drop(&mut self) {
+        RUNNING_VMM_STOPS.lock().unwrap().remove(&self.0);
+    }
+}
 
 fn log_level_to_filter_str(level: u32) -> &'static str {
     match level {
@@ -540,8 +585,19 @@ pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, op
     KRUN_SUCCESS
 }
 
+/// Do not search for or load a default libkrunfw. The caller supplies a kernel.
+const KRUN_CTX_NO_DEFAULT_FIRMWARE: u32 = 1;
+
 #[no_mangle]
 pub extern "C" fn krun_create_ctx() -> i32 {
+    krun_create_ctx2(0)
+}
+
+#[no_mangle]
+pub extern "C" fn krun_create_ctx2(flags: u32) -> i32 {
+    if flags & !KRUN_CTX_NO_DEFAULT_FIRMWARE != 0 {
+        return -libc::EINVAL;
+    }
     let shutdown_efd = if cfg!(target_arch = "aarch64") && cfg!(target_os = "macos") {
         Some(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap())
     } else {
@@ -550,7 +606,11 @@ pub extern "C" fn krun_create_ctx() -> i32 {
 
     let ctx_cfg = {
         ContextConfig {
-            krunfw: KrunfwBindings::new(),
+            krunfw: if flags & KRUN_CTX_NO_DEFAULT_FIRMWARE == 0 {
+                KrunfwBindings::new()
+            } else {
+                None
+            },
             shutdown_efd,
             ..Default::default()
         }
@@ -571,6 +631,19 @@ pub extern "C" fn krun_free_ctx(ctx_id: u32) -> i32 {
     match CTX_MAP.lock().unwrap().remove(&ctx_id) {
         Some(_) => KRUN_SUCCESS,
         None => -libc::ENOENT,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn krun_request_vmm_stop(ctx_id: u32) -> i32 {
+    let running = RUNNING_VMM_STOPS.lock().unwrap();
+    let Some(event) = running.get(&ctx_id) else {
+        return -libc::ENOENT;
+    };
+
+    match event.write(1) {
+        Ok(()) => KRUN_SUCCESS,
+        Err(error) => -error.raw_os_error().unwrap_or(libc::EIO),
     }
 }
 
@@ -1131,6 +1204,129 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
         Entry::Vacant(_) => return -libc::ENOENT,
     }
     KRUN_SUCCESS
+}
+
+#[cfg(all(target_os = "macos", feature = "net"))]
+unsafe fn add_vmnet_backend(
+    ctx_id: u32,
+    c_mac: *const u8,
+    features: u32,
+    flags: u32,
+    start: impl FnOnce(*mut c_int, *mut *mut c_void) -> c_int,
+) -> i32 {
+    if c_mac.is_null()
+        || (features & !NET_ALL_FEATURES) != 0
+        || (flags & !NET_FLAG_DHCP_CLIENT) != 0
+    {
+        return -libc::EINVAL;
+    }
+    // Raw Ethernet only: do not advertise unsupported virtio offloads.
+    if features != 0 {
+        return -libc::ENOTSUP;
+    }
+    if !CTX_MAP.lock().unwrap().contains_key(&ctx_id) {
+        return -libc::ENOENT;
+    }
+    let mac: [u8; 6] = slice::from_raw_parts(c_mac, 6).try_into().unwrap();
+    if mac == [0; 6] || mac[0] & 1 != 0 {
+        return -libc::EINVAL;
+    }
+    let mut fd = -1;
+    let mut bridge = std::ptr::null_mut();
+    let result = start(&mut fd, &mut bridge);
+    if result != 0 {
+        return result;
+    }
+    if fd < 0 || bridge.is_null() {
+        if fd >= 0 {
+            libc::close(fd);
+        }
+        if !bridge.is_null() {
+            krun_vmnet_stop(bridge);
+        }
+        return -libc::EIO;
+    }
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            create_virtio_net(cfg, VirtioNetBackend::UnixgramFd(fd), mac, features);
+            cfg.vmnet_bridges.push(VmnetBridge(bridge));
+            if flags & NET_FLAG_DHCP_CLIENT != 0 {
+                cfg.vmr.dhcp_client = true;
+            }
+        }
+        Entry::Vacant(_) => {
+            libc::close(fd);
+            krun_vmnet_stop(bridge);
+            return -libc::ENOENT;
+        }
+    }
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(all(target_os = "macos", feature = "net"))]
+pub unsafe extern "C" fn krun_add_net_vmnet(
+    ctx_id: u32,
+    network_serialization: *const c_void,
+    c_mac: *const u8,
+    features: u32,
+    flags: u32,
+) -> i32 {
+    if network_serialization.is_null() {
+        return -libc::EINVAL;
+    }
+    add_vmnet_backend(ctx_id, c_mac, features, flags, |fd, bridge| {
+        krun_vmnet_start(network_serialization, fd, bridge)
+    })
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(all(target_os = "macos", feature = "net"))]
+pub unsafe extern "C" fn krun_add_net_vmnet_shared(
+    ctx_id: u32,
+    gateway: *const c_char,
+    netmask: *const c_char,
+    c_mac: *const u8,
+    features: u32,
+    flags: u32,
+) -> i32 {
+    // Address assignment belongs to the caller; DHCP is disabled on this network.
+    if gateway.is_null() || netmask.is_null() || flags != 0 {
+        return -libc::EINVAL;
+    }
+    add_vmnet_backend(ctx_id, c_mac, features, flags, |fd, bridge| {
+        krun_vmnet_start_shared(gateway, netmask, fd, bridge)
+    })
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(all(not(target_os = "macos"), feature = "net"))]
+pub unsafe extern "C" fn krun_add_net_vmnet(
+    _ctx_id: u32,
+    _network_serialization: *const c_void,
+    _c_mac: *const u8,
+    _features: u32,
+    _flags: u32,
+) -> i32 {
+    -libc::ENOTSUP
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(all(not(target_os = "macos"), feature = "net"))]
+pub unsafe extern "C" fn krun_add_net_vmnet_shared(
+    _ctx_id: u32,
+    _gateway: *const c_char,
+    _netmask: *const c_char,
+    _c_mac: *const u8,
+    _features: u32,
+    _flags: u32,
+) -> i32 {
+    -libc::ENOTSUP
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -3019,6 +3215,27 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     };
 
+    #[cfg(all(target_os = "macos", feature = "net"))]
+    if !ctx_cfg.vmnet_bridges.is_empty() {
+        // Vmm::stop() terminates with _exit(), so ContextConfig destructors never run on
+        // a normal guest shutdown. Transfer native bridges to the VMM exit path so vmnet
+        // interfaces and network reservations are released before the process exits.
+        let bridges = Mutex::new(Some(std::mem::take(&mut ctx_cfg.vmnet_bridges)));
+        _vmm.lock().unwrap().add_exit_observer(move || {
+            drop(bridges.lock().unwrap().take());
+        });
+    }
+
+    let stop_event = match _vmm.lock().unwrap().clone_exit_event() {
+        Ok(event) => event,
+        Err(error) => {
+            error!("Failed to clone VMM stop event: {error}");
+            return -error.raw_os_error().unwrap_or(libc::EIO);
+        }
+    };
+    RUNNING_VMM_STOPS.lock().unwrap().insert(ctx_id, stop_event);
+    let _running_vmm_stop_guard = RunningVmmStopGuard(ctx_id);
+
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
@@ -3087,5 +3304,63 @@ mod test_disable_implicit_init {
         drop(ctx_map);
 
         assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
+    }
+}
+
+#[cfg(test)]
+mod native_context_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_context_flags() {
+        assert_eq!(krun_create_ctx2(2), -libc::EINVAL);
+    }
+
+    #[test]
+    fn explicit_kernel_context_does_not_load_default_firmware() {
+        let context = krun_create_ctx2(KRUN_CTX_NO_DEFAULT_FIRMWARE);
+        assert!(context >= 0);
+        {
+            let contexts = CTX_MAP.lock().unwrap();
+            assert!(contexts.get(&(context as u32)).unwrap().krunfw.is_none());
+        }
+        assert_eq!(krun_free_ctx(context as u32), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn vmm_stop_request_rejects_unknown_context() {
+        assert_eq!(krun_request_vmm_stop(u32::MAX), -libc::ENOENT);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "net"))]
+    fn native_shared_rejects_unsupported_flags_before_framework_setup() {
+        let context = krun_create_ctx2(KRUN_CTX_NO_DEFAULT_FIRMWARE) as u32;
+        let mac = [2u8, 0, 0, 0, 0, 1];
+        unsafe {
+            assert_eq!(
+                krun_add_net_vmnet_shared(
+                    context,
+                    c"192.168.200.1".as_ptr(),
+                    c"255.255.255.0".as_ptr(),
+                    mac.as_ptr(),
+                    0,
+                    NET_FLAG_DHCP_CLIENT,
+                ),
+                -libc::EINVAL
+            );
+            assert_eq!(
+                krun_add_net_vmnet_shared(
+                    context,
+                    c"192.168.200.1".as_ptr(),
+                    c"255.255.255.0".as_ptr(),
+                    mac.as_ptr(),
+                    NET_FEATURE_CSUM,
+                    0,
+                ),
+                -libc::ENOTSUP
+            );
+        }
+        assert_eq!(krun_free_ctx(context), KRUN_SUCCESS);
     }
 }

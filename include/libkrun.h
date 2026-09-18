@@ -73,6 +73,27 @@ int32_t krun_init_log(int target_fd, uint32_t level, uint32_t style, uint32_t op
  */
 int32_t krun_create_ctx();
 
+#define KRUN_CTX_NO_DEFAULT_FIRMWARE 1u
+/**
+ * Creates a context with optional behavior flags. With
+ * KRUN_CTX_NO_DEFAULT_FIRMWARE, no libkrunfw search/load is performed. The caller
+ * must set an explicit kernel before krun_start_enter(). Useful when only
+ * trusted, explicitly selected code may be loaded during privileged setup.
+ * flags=0 preserves krun_create_ctx() behavior; unknown flags return -EINVAL.
+ */
+int32_t krun_create_ctx2(uint32_t flags);
+
+/**
+ * Request that a running VMM stop through its normal host-side exit path.
+ *
+ * This does not request an orderly guest shutdown. It signals the VMM's
+ * internal exit event so exit observers run before the process terminates.
+ * The context must currently be running inside krun_start_enter().
+ *
+ * Returns zero on success or -ENOENT if the context has no running VMM.
+ */
+int32_t krun_request_vmm_stop(uint32_t ctx_id);
+
 /**
  * Frees an existing configuration context.
  *
@@ -495,6 +516,66 @@ int32_t krun_add_net_unixgram(uint32_t ctx_id,
                               uint8_t *const c_mac,
                               uint32_t features,
                               uint32_t flags);
+
+/**
+ * Adds an independent virtio-net device backed by a serialized macOS
+ * vmnet network.
+ *
+ * "network_serialization" must point to the opaque XPC object returned
+ * by vmnet_network_copy_serialization(), or to the same object received
+ * over an XPC connection. libkrun only uses the object while this call
+ * is executing and does not retain it.
+ *
+ * This backend requires macOS 26 or later. Other platforms return
+ * -ENOTSUP. The backend currently transports raw Ethernet frames only,
+ * so "features" must be zero. NET_FLAG_DHCP_CLIENT is the only accepted
+ * flag.
+ *
+ * Arguments:
+ *  "ctx_id"                - the configuration context ID.
+ *  "network_serialization" - opaque serialized vmnet network object.
+ *  "c_mac"                 - MAC address as an array of 6 uint8_t entries.
+ *  "features"              - virtio-net features; must be zero.
+ *  "flags"                 - generic flags for the network interface.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_add_net_vmnet(uint32_t ctx_id,
+                           const void *network_serialization,
+                           uint8_t *const c_mac,
+                           uint32_t features,
+                           uint32_t flags);
+
+/**
+ * Starts an isolated shared/NAT vmnet interface and attaches a virtio-net device
+ * in the same process. Matching shared interfaces may coexist in separate VMM
+ * processes on the same subnet; no exclusive vmnet_network_ref reservation is made.
+ * ipv4_gateway and ipv4_netmask are NUL-terminated dotted-decimal IPv4 strings.
+ * The subnet must be /1../30 and the gateway must be a usable host address.
+ * Address allocation and guest configuration belong to the caller. The guest is
+ * configured statically by the caller and does not run a DHCP client; vmnet's
+ * shared-mode DHCP service may remain available for other interfaces. MAC allocation
+ * is disabled and c_mac supplies the six-byte unicast MAC used by virtio-net.
+ * features and flags must both be zero (raw Ethernet; no offload or DHCP client).
+ *
+ * macOS 26+ and a net-enabled build are required. The caller needs vmnet setup
+ * permission for this call, but may permanently drop privileges before booting
+ * the guest. The context owns the interface through VM execution; freeing an
+ * unstarted context releases it. There is no packet-helper process or fallback.
+ *
+ * Asynchronous setup/teardown waits are bounded. Startup timeout returns
+ * -ETIMEDOUT. Unacknowledged native callbacks/threads are retained until process
+ * exit instead of being freed underneath framework code; callers should discard
+ * the owning process after such a failure. Errors are never converted to success.
+ */
+int32_t krun_add_net_vmnet_shared(uint32_t ctx_id,
+                                 const char *ipv4_gateway,
+                                 const char *ipv4_netmask,
+                                 uint8_t *const c_mac,
+                                 uint32_t features,
+                                 uint32_t flags);
+
 
 /**
  * Adds an independent virtio-net device with the tap backend.

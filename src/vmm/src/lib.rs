@@ -355,16 +355,24 @@ impl Vmm {
             .map_err(Error::I8042Error)
     }
 
+    /// Register cleanup that must run before the VMM terminates the process.
+    pub fn add_exit_observer<F>(&mut self, observer: F)
+    where
+        F: Fn() + Send + 'static,
+    {
+        self.exit_observers.push(Arc::new(Mutex::new(observer)));
+    }
+
+    /// Clone the internal VMM exit event for a host-side stop request.
+    pub fn clone_exit_event(&self) -> std::io::Result<EventFd> {
+        self.exit_evt.try_clone()
+    }
+
     /// Waits for all vCPUs to exit and terminates the Firecracker process.
     pub fn stop(&mut self, exit_code: i32) {
         info!("Vmm is stopping.");
 
-        for observer in &self.exit_observers {
-            observer
-                .lock()
-                .expect("Poisoned mutex for exit observer")
-                .on_vmm_exit();
-        }
+        notify_exit_observers(&self.exit_observers);
 
         // Exit from Firecracker using the provided exit code. Safe because we're terminating
         // the process anyway.
@@ -393,6 +401,16 @@ impl Vmm {
     #[cfg(target_os = "macos")]
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         self.vm.remove_mapping(reply_sender, guest_addr, len);
+    }
+}
+
+
+fn notify_exit_observers(exit_observers: &[Arc<Mutex<dyn VmmExitObserver>>]) {
+    for observer in exit_observers {
+        observer
+            .lock()
+            .expect("Poisoned mutex for exit observer")
+            .on_vmm_exit();
     }
 }
 
@@ -438,5 +456,24 @@ impl Subscriber for Vmm {
             EventSet::IN,
             self.exit_evt.as_raw_fd() as u64,
         )]
+    }
+}
+
+#[cfg(test)]
+mod exit_observer_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn exit_observers_run_before_process_exit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let observers: Vec<Arc<Mutex<dyn VmmExitObserver>>> = vec![Arc::new(Mutex::new(move || {
+            observed.fetch_add(1, AtomicOrdering::SeqCst);
+        }))];
+
+        notify_exit_observers(&observers);
+
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
     }
 }
