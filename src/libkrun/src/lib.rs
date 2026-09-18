@@ -147,6 +147,33 @@ impl KrunfwBindings {
     }
 }
 
+#[cfg(all(target_os = "macos", feature = "net"))]
+extern "C" {
+    fn krun_vmnet_start(
+        network_serialization: *const c_void,
+        out_fd: *mut c_int,
+        out_bridge: *mut *mut c_void,
+    ) -> c_int;
+    fn krun_vmnet_stop(bridge: *mut c_void);
+}
+
+#[cfg(all(target_os = "macos", feature = "net"))]
+struct VmnetBridge(*mut c_void);
+
+// SAFETY: the opaque bridge is internally synchronized by vmnet, dispatch,
+// and its forwarding thread. Rust only owns its lifetime.
+#[cfg(all(target_os = "macos", feature = "net"))]
+unsafe impl Send for VmnetBridge {}
+
+#[cfg(all(target_os = "macos", feature = "net"))]
+impl Drop for VmnetBridge {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { krun_vmnet_stop(self.0) };
+        }
+    }
+}
+
 #[derive(Clone)]
 #[cfg(feature = "net")]
 enum LegacyNetworkConfig {
@@ -167,6 +194,8 @@ struct ContextConfig {
     legacy_net_cfg: Option<LegacyNetworkConfig>,
     #[cfg(feature = "net")]
     legacy_mac: Option<[u8; 6]>,
+    #[cfg(all(target_os = "macos", feature = "net"))]
+    vmnet_bridges: Vec<VmnetBridge>,
     net_index: u8,
     tsi_port_map: Option<HashMap<u16, u16>>,
     vsock_config: VsockConfig,
@@ -1131,6 +1160,88 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
         Entry::Vacant(_) => return -libc::ENOENT,
     }
     KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(all(target_os = "macos", feature = "net"))]
+pub unsafe extern "C" fn krun_add_net_vmnet(
+    ctx_id: u32,
+    network_serialization: *const c_void,
+    c_mac: *const u8,
+    features: u32,
+    flags: u32,
+) -> i32 {
+    if network_serialization.is_null() || c_mac.is_null() {
+        return -libc::EINVAL;
+    }
+    if (features & !NET_ALL_FEATURES) != 0 {
+        return -libc::EINVAL;
+    }
+    // The vmnet bridge transports raw Ethernet frames. Until it translates
+    // virtio-net offload metadata, advertising any offload feature is unsafe.
+    if features != 0 {
+        return -libc::ENOTSUP;
+    }
+    if (flags & !NET_FLAG_DHCP_CLIENT) != 0 {
+        return -libc::EINVAL;
+    }
+
+    if !CTX_MAP.lock().unwrap().contains_key(&ctx_id) {
+        return -libc::ENOENT;
+    }
+
+    let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
+        Ok(m) => m,
+        Err(_) => return -libc::EINVAL,
+    };
+
+    let mut fd = -1;
+    let mut bridge = std::ptr::null_mut();
+    let result = krun_vmnet_start(network_serialization, &mut fd, &mut bridge);
+    if result != 0 {
+        return result;
+    }
+    if fd < 0 || bridge.is_null() {
+        if fd >= 0 {
+            libc::close(fd);
+        }
+        if !bridge.is_null() {
+            krun_vmnet_stop(bridge);
+        }
+        return -libc::EIO;
+    }
+
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            create_virtio_net(cfg, VirtioNetBackend::UnixgramFd(fd), mac, features);
+            cfg.vmnet_bridges.push(VmnetBridge(bridge));
+            if flags & NET_FLAG_DHCP_CLIENT != 0 {
+                cfg.vmr.dhcp_client = true;
+            }
+        }
+        Entry::Vacant(_) => {
+            libc::close(fd);
+            krun_vmnet_stop(bridge);
+            return -libc::ENOENT;
+        }
+    }
+
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(all(not(target_os = "macos"), feature = "net"))]
+pub unsafe extern "C" fn krun_add_net_vmnet(
+    _ctx_id: u32,
+    _network_serialization: *const c_void,
+    _c_mac: *const u8,
+    _features: u32,
+    _flags: u32,
+) -> i32 {
+    -libc::ENOTSUP
 }
 
 #[allow(clippy::missing_safety_doc)]

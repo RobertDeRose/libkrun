@@ -497,6 +497,36 @@ int32_t krun_add_net_unixgram(uint32_t ctx_id,
                               uint32_t flags);
 
 /**
+ * Adds an independent virtio-net device backed by a serialized macOS
+ * vmnet network.
+ *
+ * "network_serialization" must point to the opaque XPC object returned
+ * by vmnet_network_copy_serialization(), or to the same object received
+ * over an XPC connection. libkrun only uses the object while this call
+ * is executing and does not retain it.
+ *
+ * This backend requires macOS 26 or later. Other platforms return
+ * -ENOTSUP. The backend currently transports raw Ethernet frames only,
+ * so "features" must be zero. NET_FLAG_DHCP_CLIENT is the only accepted
+ * flag.
+ *
+ * Arguments:
+ *  "ctx_id"                - the configuration context ID.
+ *  "network_serialization" - opaque serialized vmnet network object.
+ *  "c_mac"                 - MAC address as an array of 6 uint8_t entries.
+ *  "features"              - virtio-net features; must be zero.
+ *  "flags"                 - generic flags for the network interface.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_add_net_vmnet(uint32_t ctx_id,
+                           const void *network_serialization,
+                           uint8_t *const c_mac,
+                           uint32_t features,
+                           uint32_t flags);
+
+/**
  * Adds an independent virtio-net device with the tap backend.
  * Call to this function disables TSI backend.
 
