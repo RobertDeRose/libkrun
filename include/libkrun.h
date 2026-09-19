@@ -73,6 +73,16 @@ int32_t krun_init_log(int target_fd, uint32_t level, uint32_t style, uint32_t op
  */
 int32_t krun_create_ctx();
 
+#define KRUN_CTX_NO_DEFAULT_FIRMWARE 1u
+/**
+ * Creates a context with optional behavior flags. With
+ * KRUN_CTX_NO_DEFAULT_FIRMWARE, no libkrunfw search/load is performed. The caller
+ * must set an explicit kernel before krun_start_enter(). Useful when only
+ * trusted, explicitly selected code may be loaded during privileged setup.
+ * flags=0 preserves krun_create_ctx() behavior; unknown flags return -EINVAL.
+ */
+int32_t krun_create_ctx2(uint32_t flags);
+
 /**
  * Frees an existing configuration context.
  *
@@ -525,6 +535,33 @@ int32_t krun_add_net_vmnet(uint32_t ctx_id,
                            uint8_t *const c_mac,
                            uint32_t features,
                            uint32_t flags);
+
+/**
+ * Creates an owned, isolated shared/NAT vmnet network and attaches a virtio-net
+ * device in the same process. No opaque network from another executable is used.
+ * ipv4_gateway and ipv4_netmask are NUL-terminated dotted-decimal IPv4 strings.
+ * The subnet must be /1../30 and the gateway must be a usable host address.
+ * Address allocation and guest configuration belong to the caller: vmnet DHCP
+ * and MAC allocation are disabled, and c_mac supplies the six-byte unicast MAC.
+ * features and flags must both be zero (raw Ethernet; no offload or DHCP client).
+ *
+ * macOS 26+ and a net-enabled build are required. The caller needs vmnet setup
+ * permission for this call, but may permanently drop privileges before booting
+ * the guest. The context owns the interface/network through VM execution; freeing
+ * an unstarted context releases them. There is no helper process or fallback.
+ *
+ * Asynchronous setup/teardown waits are bounded. Startup timeout returns
+ * -ETIMEDOUT. Unacknowledged native callbacks/threads are retained until process
+ * exit instead of being freed underneath framework code; callers should discard
+ * the owning process after such a failure. Errors are never converted to success.
+ */
+int32_t krun_add_net_vmnet_shared(uint32_t ctx_id,
+                                 const char *ipv4_gateway,
+                                 const char *ipv4_netmask,
+                                 uint8_t *const c_mac,
+                                 uint32_t features,
+                                 uint32_t flags);
+
 
 /**
  * Adds an independent virtio-net device with the tap backend.

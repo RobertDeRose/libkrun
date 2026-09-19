@@ -154,6 +154,12 @@ extern "C" {
         out_fd: *mut c_int,
         out_bridge: *mut *mut c_void,
     ) -> c_int;
+    fn krun_vmnet_start_shared(
+        gateway: *const c_char,
+        netmask: *const c_char,
+        out_fd: *mut c_int,
+        out_bridge: *mut *mut c_void,
+    ) -> c_int;
     fn krun_vmnet_stop(bridge: *mut c_void);
 }
 
@@ -569,8 +575,19 @@ pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, op
     KRUN_SUCCESS
 }
 
+/// Do not search for or load a default libkrunfw. The caller supplies a kernel.
+const KRUN_CTX_NO_DEFAULT_FIRMWARE: u32 = 1;
+
 #[no_mangle]
 pub extern "C" fn krun_create_ctx() -> i32 {
+    krun_create_ctx2(0)
+}
+
+#[no_mangle]
+pub extern "C" fn krun_create_ctx2(flags: u32) -> i32 {
+    if flags & !KRUN_CTX_NO_DEFAULT_FIRMWARE != 0 {
+        return -libc::EINVAL;
+    }
     let shutdown_efd = if cfg!(target_arch = "aarch64") && cfg!(target_os = "macos") {
         Some(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap())
     } else {
@@ -579,7 +596,11 @@ pub extern "C" fn krun_create_ctx() -> i32 {
 
     let ctx_cfg = {
         ContextConfig {
-            krunfw: KrunfwBindings::new(),
+            krunfw: if flags & KRUN_CTX_NO_DEFAULT_FIRMWARE == 0 {
+                KrunfwBindings::new()
+            } else {
+                None
+            },
             shutdown_efd,
             ..Default::default()
         }
@@ -1162,43 +1183,34 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
     KRUN_SUCCESS
 }
 
-#[allow(clippy::missing_safety_doc)]
-#[no_mangle]
 #[cfg(all(target_os = "macos", feature = "net"))]
-pub unsafe extern "C" fn krun_add_net_vmnet(
+unsafe fn add_vmnet_backend(
     ctx_id: u32,
-    network_serialization: *const c_void,
     c_mac: *const u8,
     features: u32,
     flags: u32,
+    start: impl FnOnce(*mut c_int, *mut *mut c_void) -> c_int,
 ) -> i32 {
-    if network_serialization.is_null() || c_mac.is_null() {
+    if c_mac.is_null()
+        || (features & !NET_ALL_FEATURES) != 0
+        || (flags & !NET_FLAG_DHCP_CLIENT) != 0
+    {
         return -libc::EINVAL;
     }
-    if (features & !NET_ALL_FEATURES) != 0 {
-        return -libc::EINVAL;
-    }
-    // The vmnet bridge transports raw Ethernet frames. Until it translates
-    // virtio-net offload metadata, advertising any offload feature is unsafe.
+    // Raw Ethernet only: do not advertise unsupported virtio offloads.
     if features != 0 {
         return -libc::ENOTSUP;
     }
-    if (flags & !NET_FLAG_DHCP_CLIENT) != 0 {
-        return -libc::EINVAL;
-    }
-
     if !CTX_MAP.lock().unwrap().contains_key(&ctx_id) {
         return -libc::ENOENT;
     }
-
-    let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
-        Ok(m) => m,
-        Err(_) => return -libc::EINVAL,
-    };
-
+    let mac: [u8; 6] = slice::from_raw_parts(c_mac, 6).try_into().unwrap();
+    if mac == [0; 6] || mac[0] & 1 != 0 {
+        return -libc::EINVAL;
+    }
     let mut fd = -1;
     let mut bridge = std::ptr::null_mut();
-    let result = krun_vmnet_start(network_serialization, &mut fd, &mut bridge);
+    let result = start(&mut fd, &mut bridge);
     if result != 0 {
         return result;
     }
@@ -1211,7 +1223,6 @@ pub unsafe extern "C" fn krun_add_net_vmnet(
         }
         return -libc::EIO;
     }
-
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
@@ -1227,8 +1238,45 @@ pub unsafe extern "C" fn krun_add_net_vmnet(
             return -libc::ENOENT;
         }
     }
-
     KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(all(target_os = "macos", feature = "net"))]
+pub unsafe extern "C" fn krun_add_net_vmnet(
+    ctx_id: u32,
+    network_serialization: *const c_void,
+    c_mac: *const u8,
+    features: u32,
+    flags: u32,
+) -> i32 {
+    if network_serialization.is_null() {
+        return -libc::EINVAL;
+    }
+    add_vmnet_backend(ctx_id, c_mac, features, flags, |fd, bridge| {
+        krun_vmnet_start(network_serialization, fd, bridge)
+    })
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(all(target_os = "macos", feature = "net"))]
+pub unsafe extern "C" fn krun_add_net_vmnet_shared(
+    ctx_id: u32,
+    gateway: *const c_char,
+    netmask: *const c_char,
+    c_mac: *const u8,
+    features: u32,
+    flags: u32,
+) -> i32 {
+    // Address assignment belongs to the caller; DHCP is disabled on this network.
+    if gateway.is_null() || netmask.is_null() || flags != 0 {
+        return -libc::EINVAL;
+    }
+    add_vmnet_backend(ctx_id, c_mac, features, flags, |fd, bridge| {
+        krun_vmnet_start_shared(gateway, netmask, fd, bridge)
+    })
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -1237,6 +1285,20 @@ pub unsafe extern "C" fn krun_add_net_vmnet(
 pub unsafe extern "C" fn krun_add_net_vmnet(
     _ctx_id: u32,
     _network_serialization: *const c_void,
+    _c_mac: *const u8,
+    _features: u32,
+    _flags: u32,
+) -> i32 {
+    -libc::ENOTSUP
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(all(not(target_os = "macos"), feature = "net"))]
+pub unsafe extern "C" fn krun_add_net_vmnet_shared(
+    _ctx_id: u32,
+    _gateway: *const c_char,
+    _netmask: *const c_char,
     _c_mac: *const u8,
     _features: u32,
     _flags: u32,
@@ -3198,5 +3260,58 @@ mod test_disable_implicit_init {
         drop(ctx_map);
 
         assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
+    }
+}
+
+#[cfg(test)]
+mod native_context_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_context_flags() {
+        assert_eq!(krun_create_ctx2(2), -libc::EINVAL);
+    }
+
+    #[test]
+    fn explicit_kernel_context_does_not_load_default_firmware() {
+        let context = krun_create_ctx2(KRUN_CTX_NO_DEFAULT_FIRMWARE);
+        assert!(context >= 0);
+        {
+            let contexts = CTX_MAP.lock().unwrap();
+            assert!(contexts.get(&(context as u32)).unwrap().krunfw.is_none());
+        }
+        assert_eq!(krun_free_ctx(context as u32), KRUN_SUCCESS);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "net"))]
+    fn native_shared_rejects_unsupported_flags_before_framework_setup() {
+        let context = krun_create_ctx2(KRUN_CTX_NO_DEFAULT_FIRMWARE) as u32;
+        let mac = [2u8, 0, 0, 0, 0, 1];
+        unsafe {
+            assert_eq!(
+                krun_add_net_vmnet_shared(
+                    context,
+                    c"192.168.200.1".as_ptr(),
+                    c"255.255.255.0".as_ptr(),
+                    mac.as_ptr(),
+                    0,
+                    NET_FLAG_DHCP_CLIENT,
+                ),
+                -libc::EINVAL
+            );
+            assert_eq!(
+                krun_add_net_vmnet_shared(
+                    context,
+                    c"192.168.200.1".as_ptr(),
+                    c"255.255.255.0".as_ptr(),
+                    mac.as_ptr(),
+                    NET_FEATURE_CSUM,
+                    0,
+                ),
+                -libc::ENOTSUP
+            );
+        }
+        assert_eq!(krun_free_ctx(context), KRUN_SUCCESS);
     }
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <Availability.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -8,6 +9,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -20,21 +22,68 @@
 
 #define KRUN_VMNET_MAX_FRAME_SIZE 65550
 #define KRUN_VMNET_SOCKET_RCVBUF (7 * 1024 * 1024)
+#ifndef KRUN_VMNET_TIMEOUT_MS
+#define KRUN_VMNET_TIMEOUT_MS 5000
+#endif
+
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+
+// Completion blocks may outlive a timed-out caller. Never capture stack storage
+// or release the semaphore until both the caller and the block have finished.
+struct completion {
+    atomic_uint references;
+    dispatch_semaphore_t done;
+    vmnet_return_t status;
+    uint64_t max_packet_size;
+};
 
 struct krun_vmnet_bridge {
     interface_ref interface;
+    vmnet_network_ref network;
+    xpc_object_t descriptor;
     dispatch_queue_t queue;
+    dispatch_semaphore_t tx_done;
     int fd;
     pthread_t tx_thread;
+    bool tx_started;
     size_t max_packet_size;
+    uint8_t *tx_buffer;
     atomic_bool stopping;
 };
+
+static struct completion *completion_create(void)
+{
+    struct completion *completion = calloc(1, sizeof(*completion));
+    if (completion == NULL) {
+        return NULL;
+    }
+    atomic_init(&completion->references, 2); // caller and completion block
+    completion->done = dispatch_semaphore_create(0);
+    completion->status = VMNET_FAILURE;
+    if (completion->done == NULL) {
+        free(completion);
+        return NULL;
+    }
+    return completion;
+}
+
+static void completion_release(struct completion *completion)
+{
+    if (atomic_fetch_sub_explicit(&completion->references, 1, memory_order_acq_rel) == 1) {
+        dispatch_release(completion->done);
+        free(completion);
+    }
+}
+
+static bool wait_for(dispatch_semaphore_t done)
+{
+    return dispatch_semaphore_wait(
+        done, dispatch_time(DISPATCH_TIME_NOW, KRUN_VMNET_TIMEOUT_MS * NSEC_PER_MSEC)) == 0;
+}
 
 static int vmnet_status_to_errno(vmnet_return_t status)
 {
     switch (status) {
-    case VMNET_SUCCESS:
-        return 0;
     case VMNET_INVALID_ARGUMENT:
         return EINVAL;
     case VMNET_INVALID_ACCESS:
@@ -46,90 +95,75 @@ static int vmnet_status_to_errno(vmnet_return_t status)
     case VMNET_SETUP_INCOMPLETE:
         return EAGAIN;
     default:
+        // A null handle with VMNET_SUCCESS is also an error, never success.
         return EIO;
     }
 }
 
-static void set_socket_options(int fd)
+static int set_socket_options(int fd)
 {
     int flags = fcntl(fd, F_GETFL);
-    if (flags >= 0) {
-        (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    }
-
     int fd_flags = fcntl(fd, F_GETFD);
-    if (fd_flags >= 0) {
-        (void)fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC);
+    if (flags < 0 || fd_flags < 0
+        || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0
+        || fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0) {
+        return -errno;
     }
-
+#ifdef SO_NOSIGPIPE
     const int no_sigpipe = 1;
-    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
-
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) < 0) {
+        return -errno;
+    }
+#endif
     const int rcvbuf = KRUN_VMNET_SOCKET_RCVBUF;
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-
     const int sndbuf = KRUN_VMNET_MAX_FRAME_SIZE;
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    return 0;
 }
-
-#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
 
 static void forward_packets_to_guest(struct krun_vmnet_bridge *bridge, xpc_object_t event)
 {
     if (atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
         return;
     }
-
     uint64_t available = xpc_dictionary_get_uint64(event, vmnet_estimated_packets_available_key);
-    if (available == 0) {
-        available = 1;
-    }
-
+    // Check stopping between packets rather than capping the advertised batch:
+    // leaving queued frames unread can lose an edge-triggered notification.
+    available = available == 0 ? 1 : available;
     uint8_t *buffer = malloc(bridge->max_packet_size);
     if (buffer == NULL) {
         return;
     }
-
     for (uint64_t i = 0; i < available; i++) {
-        struct iovec iov = {
-            .iov_base = buffer,
-            .iov_len = bridge->max_packet_size,
-        };
+        if (atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
+            break;
+        }
+        struct iovec iov = {.iov_base = buffer, .iov_len = bridge->max_packet_size};
         struct vmpktdesc packet = {
-            .vm_pkt_size = bridge->max_packet_size,
-            .vm_pkt_iov = &iov,
-            .vm_pkt_iovcnt = 1,
-            .vm_flags = 0,
+            .vm_pkt_size = bridge->max_packet_size, .vm_pkt_iov = &iov,
+            .vm_pkt_iovcnt = 1, .vm_flags = 0,
         };
         int count = 1;
         vmnet_return_t status = vmnet_read(bridge->interface, &packet, &count);
-        if (status != VMNET_SUCCESS || count != 1) {
+        if (status != VMNET_SUCCESS || count != 1 || packet.vm_pkt_size > bridge->max_packet_size) {
             break;
         }
-
         ssize_t written = send(bridge->fd, buffer, packet.vm_pkt_size, 0);
         if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS) {
             break;
         }
     }
-
     free(buffer);
 }
 
 static void *forward_packets_to_vmnet(void *opaque)
 {
     struct krun_vmnet_bridge *bridge = opaque;
-    uint8_t *buffer = malloc(bridge->max_packet_size);
-    if (buffer == NULL) {
-        return NULL;
-    }
-
+    uint8_t *buffer = bridge->tx_buffer;
     while (!atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
-        struct pollfd pollfd = {
-            .fd = bridge->fd,
-            .events = POLLIN,
-        };
-        int ready = poll(&pollfd, 1, 250);
+        struct pollfd pollfd = {.fd = bridge->fd, .events = POLLIN};
+        int ready = poll(&pollfd, 1, 100);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
@@ -142,211 +176,327 @@ static void *forward_packets_to_vmnet(void *opaque)
         if ((pollfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
             break;
         }
-
-        for (;;) {
-            ssize_t length = recv(bridge->fd, buffer, bridge->max_packet_size, 0);
+        while (!atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
+            struct iovec iov = {.iov_base = buffer, .iov_len = bridge->max_packet_size};
+            struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
+            ssize_t length = recvmsg(bridge->fd, &message, 0);
             if (length < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    break;
-                }
                 if (errno == EINTR) {
                     continue;
                 }
-                atomic_store_explicit(&bridge->stopping, true, memory_order_relaxed);
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    atomic_store_explicit(&bridge->stopping, true, memory_order_relaxed);
+                }
                 break;
             }
-            if (length == 0) {
-                break;
+            if (length == 0 || (message.msg_flags & MSG_TRUNC) != 0) {
+                continue;
             }
-
-            struct iovec iov = {
-                .iov_base = buffer,
-                .iov_len = (size_t)length,
-            };
+            iov.iov_len = (size_t)length;
             struct vmpktdesc packet = {
-                .vm_pkt_size = (size_t)length,
-                .vm_pkt_iov = &iov,
-                .vm_pkt_iovcnt = 1,
-                .vm_flags = 0,
+                .vm_pkt_size = (size_t)length, .vm_pkt_iov = &iov,
+                .vm_pkt_iovcnt = 1, .vm_flags = 0,
             };
             int count = 1;
             (void)vmnet_write(bridge->interface, &packet, &count);
         }
     }
-
-    free(buffer);
+    dispatch_semaphore_signal(bridge->tx_done);
     return NULL;
 }
 
-static void stop_interface(struct krun_vmnet_bridge *bridge)
+static void destroy_bridge(struct krun_vmnet_bridge *bridge)
 {
-    if (bridge->interface == NULL) {
-        return;
+    if (bridge->fd >= 0) {
+        close(bridge->fd);
     }
-
-    dispatch_semaphore_t done = dispatch_semaphore_create(0);
-    vmnet_return_t status = vmnet_stop_interface(
-        bridge->interface,
-        bridge->queue,
-        ^(vmnet_return_t stop_status) {
-            (void)stop_status;
-            dispatch_semaphore_signal(done);
-        });
-    if (status == VMNET_SUCCESS) {
-        dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+    if (bridge->queue != NULL) {
+        dispatch_release(bridge->queue);
     }
-    dispatch_release(done);
-    bridge->interface = NULL;
+    if (bridge->tx_done != NULL) {
+        dispatch_release(bridge->tx_done);
+    }
+    if (bridge->descriptor != NULL) {
+        xpc_release(bridge->descriptor);
+    }
+    CFRelease(bridge->network);
+    free(bridge->tx_buffer);
+    free(bridge);
 }
 
+static void quarantine(const char *operation)
+{
+    // A missing framework acknowledgement leaves callback/thread ownership
+    // uncertain. Do not free a live bridge. The per-VM owner must exit on a
+    // startup failure; process teardown reclaims these exceptional resources.
+    fprintf(stderr, "libkrun: vmnet %s; native resources retained until process exit\n", operation);
+}
+
+static bool stop_bridge(struct krun_vmnet_bridge *bridge)
+{
+    atomic_store_explicit(&bridge->stopping, true, memory_order_relaxed);
+    if (bridge->tx_started) {
+        if (!wait_for(bridge->tx_done)) {
+            quarantine("TX shutdown timed out");
+            return false;
+        }
+        (void)pthread_join(bridge->tx_thread, NULL);
+        bridge->tx_started = false;
+    }
+    if (bridge->interface != NULL) {
+        struct completion *completion = completion_create();
+        if (completion == NULL) {
+            quarantine("stop completion allocation failed");
+            return false;
+        }
+        vmnet_return_t submitted = vmnet_stop_interface(
+            bridge->interface, bridge->queue, ^(vmnet_return_t status) {
+                completion->status = status;
+                dispatch_semaphore_signal(completion->done);
+                completion_release(completion);
+            });
+        bool stopped = submitted == VMNET_SUCCESS && wait_for(completion->done);
+        bool success = stopped && completion->status == VMNET_SUCCESS;
+        // If submission failed, no completion is promised. Keep its block ref
+        // too: a late callback must remain safe even on this failure path.
+        completion_release(completion);
+        if (!success) {
+            quarantine("interface stop failed or timed out");
+            return false;
+        }
+        bridge->interface = NULL;
+    }
+    // Drain the callback queue even after a failed start with a null handle.
+    // A completion signal can wake its caller before the block has returned.
+    struct completion *completion = completion_create();
+    if (completion == NULL) {
+        quarantine("queue drain allocation failed");
+        return false;
+    }
+    struct completion *drained = completion;
+    dispatch_async(bridge->queue, ^{
+        dispatch_semaphore_signal(drained->done);
+        completion_release(drained);
+    });
+    bool empty = wait_for(completion->done);
+    completion_release(completion);
+    if (!empty) {
+        quarantine("event queue drain timed out");
+        return false;
+    }
+    destroy_bridge(bridge);
+    return true;
+}
+
+// Takes ownership of network, including on failure.
+static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_fd, void **out_bridge)
+    __attribute__((availability(macos, introduced = 26.0)));
+
+static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_fd, void **out_bridge)
+{
+    struct krun_vmnet_bridge *bridge = calloc(1, sizeof(*bridge));
+    if (bridge == NULL) {
+        CFRelease(network);
+        return -ENOMEM;
+    }
+    bridge->network = network;
+    bridge->fd = -1;
+    atomic_init(&bridge->stopping, false);
+    bridge->queue = dispatch_queue_create("org.libkrun.vmnet", DISPATCH_QUEUE_SERIAL);
+    bridge->tx_done = dispatch_semaphore_create(0);
+    if (bridge->queue == NULL || bridge->tx_done == NULL) {
+        destroy_bridge(bridge);
+        return -ENOMEM;
+    }
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) != 0) {
+        int error = errno;
+        destroy_bridge(bridge);
+        return -error;
+    }
+    bridge->fd = sockets[1];
+    int result = set_socket_options(sockets[0]);
+    if (result == 0) {
+        result = set_socket_options(sockets[1]);
+    }
+    if (result != 0) {
+        close(sockets[0]);
+        destroy_bridge(bridge);
+        return result;
+    }
+    struct completion *completion = completion_create();
+    xpc_object_t descriptor = xpc_dictionary_create(NULL, NULL, 0);
+    if (completion == NULL || descriptor == NULL) {
+        if (completion != NULL) {
+            completion_release(completion);
+            completion_release(completion);
+        }
+        if (descriptor != NULL) {
+            xpc_release(descriptor);
+        }
+        close(sockets[0]);
+        destroy_bridge(bridge);
+        return -ENOMEM;
+    }
+    bridge->descriptor = descriptor;
+    xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, false);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_isolation_key, isolated);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, false);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, false);
+    bridge->interface = vmnet_interface_start_with_network(
+        network, descriptor, bridge->queue, ^(vmnet_return_t status, xpc_object_t parameters) {
+            completion->status = status;
+            if (status == VMNET_SUCCESS && parameters != NULL) {
+                completion->max_packet_size = xpc_dictionary_get_uint64(parameters, vmnet_max_packet_size_key);
+            }
+            dispatch_semaphore_signal(completion->done);
+            completion_release(completion);
+        });
+    bool completed = wait_for(completion->done);
+    vmnet_return_t status = completed ? completion->status : VMNET_FAILURE;
+    uint64_t max_packet_size = completed ? completion->max_packet_size : 0;
+    completion_release(completion);
+    if (!completed) {
+        close(sockets[0]);
+        // No packet callback/thread was installed. Keep the network and queue
+        // alive for a late start callback rather than racing an incomplete start.
+        quarantine("interface start timed out");
+        return -ETIMEDOUT;
+    }
+    if (bridge->interface == NULL || status != VMNET_SUCCESS) {
+        close(sockets[0]);
+        (void)stop_bridge(bridge);
+        return -vmnet_status_to_errno(status);
+    }
+    if (max_packet_size < 1514 || max_packet_size > KRUN_VMNET_MAX_FRAME_SIZE) {
+        close(sockets[0]);
+        (void)stop_bridge(bridge);
+        return -EMSGSIZE;
+    }
+    bridge->max_packet_size = (size_t)max_packet_size;
+    bridge->tx_buffer = malloc(bridge->max_packet_size);
+    if (bridge->tx_buffer == NULL) {
+        close(sockets[0]);
+        (void)stop_bridge(bridge);
+        return -ENOMEM;
+    }
+    status = vmnet_interface_set_event_callback(
+        bridge->interface, VMNET_INTERFACE_PACKETS_AVAILABLE, bridge->queue,
+        ^(interface_event_t event_id, xpc_object_t event) {
+            if (event_id == VMNET_INTERFACE_PACKETS_AVAILABLE) {
+                forward_packets_to_guest(bridge, event);
+            }
+        });
+    if (status != VMNET_SUCCESS) {
+        close(sockets[0]);
+        (void)stop_bridge(bridge);
+        return -vmnet_status_to_errno(status);
+    }
+    int error = pthread_create(&bridge->tx_thread, NULL, forward_packets_to_vmnet, bridge);
+    if (error != 0) {
+        close(sockets[0]);
+        (void)stop_bridge(bridge);
+        return -error;
+    }
+    bridge->tx_started = true;
+    *out_fd = sockets[0];
+    *out_bridge = bridge;
+    return 0;
+}
+
+static int32_t start_shared(const char *gateway, const char *netmask, int *out_fd, void **out_bridge)
+    __attribute__((availability(macos, introduced = 26.0)));
+
+static int32_t start_shared(const char *gateway, const char *netmask, int *out_fd, void **out_bridge)
+{
+    struct in_addr address, mask;
+    if (inet_pton(AF_INET, gateway, &address) != 1 || inet_pton(AF_INET, netmask, &mask) != 1) {
+        return -EINVAL;
+    }
+    uint32_t host_mask = ~ntohl(mask.s_addr);
+    uint32_t host = ntohl(address.s_addr) & host_mask;
+    // A contiguous /1../30 network and an actual host address are required.
+    if (mask.s_addr == 0 || host_mask < 3 || (host_mask & (host_mask + 1)) != 0
+        || host == 0 || host == host_mask) {
+        return -EINVAL;
+    }
+    vmnet_return_t status = VMNET_FAILURE;
+    vmnet_network_configuration_ref configuration = vmnet_network_configuration_create(VMNET_SHARED_MODE, &status);
+    if (configuration == NULL || status != VMNET_SUCCESS) {
+        if (configuration != NULL) {
+            CFRelease(configuration);
+        }
+        return -vmnet_status_to_errno(status);
+    }
+    vmnet_network_configuration_disable_dhcp(configuration);
+    status = vmnet_network_configuration_set_ipv4_subnet(configuration, &address, &mask);
+    if (status != VMNET_SUCCESS) {
+        CFRelease(configuration);
+        return -vmnet_status_to_errno(status);
+    }
+    vmnet_network_ref network = vmnet_network_create(configuration, &status);
+    CFRelease(configuration);
+    if (network == NULL || status != VMNET_SUCCESS) {
+        if (network != NULL) {
+            CFRelease(network);
+        }
+        return -vmnet_status_to_errno(status);
+    }
+    struct in_addr actual_address = {0}, actual_mask = {0};
+    vmnet_network_get_ipv4_subnet(network, &actual_address, &actual_mask);
+    if (actual_address.s_addr != address.s_addr || actual_mask.s_addr != mask.s_addr) {
+        CFRelease(network);
+        return -EADDRNOTAVAIL;
+    }
+    return start_network(network, true, out_fd, out_bridge);
+}
 #endif
 
-int32_t krun_vmnet_start(
-    const void *network_serialization,
-    int *out_fd,
-    void **out_bridge)
+int32_t krun_vmnet_start(const void *network_serialization, int *out_fd, void **out_bridge)
 {
     if (network_serialization == NULL || out_fd == NULL || out_bridge == NULL) {
         return -EINVAL;
     }
-
+    *out_fd = -1;
+    *out_bridge = NULL;
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
     if (__builtin_available(macOS 26.0, *)) {
-        xpc_object_t serialization = (xpc_object_t)network_serialization;
-
-        struct krun_vmnet_bridge *bridge = calloc(1, sizeof(*bridge));
-        if (bridge == NULL) {
-            return -ENOMEM;
-        }
-        bridge->fd = -1;
-        atomic_init(&bridge->stopping, false);
-
-        int sockets[2] = {-1, -1};
-        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) != 0) {
-            int error = errno;
-            free(bridge);
-            return -error;
-        }
-        set_socket_options(sockets[0]);
-        set_socket_options(sockets[1]);
-        bridge->fd = sockets[1];
-
         vmnet_return_t status = VMNET_FAILURE;
-        vmnet_network_ref network = vmnet_network_create_with_serialization(serialization, &status);
+        vmnet_network_ref network = vmnet_network_create_with_serialization((xpc_object_t)network_serialization, &status);
         if (network == NULL || status != VMNET_SUCCESS) {
-            close(sockets[0]);
-            close(sockets[1]);
-            free(bridge);
+            if (network != NULL) {
+                CFRelease(network);
+            }
             return -vmnet_status_to_errno(status);
         }
-
-        bridge->queue = dispatch_queue_create("org.libkrun.vmnet", DISPATCH_QUEUE_SERIAL);
-        xpc_object_t interface_desc = xpc_dictionary_create(NULL, NULL, 0);
-        xpc_dictionary_set_bool(interface_desc, vmnet_allocate_mac_address_key, false);
-        xpc_dictionary_set_bool(interface_desc, vmnet_enable_tso_key, false);
-        xpc_dictionary_set_bool(interface_desc, vmnet_enable_checksum_offload_key, false);
-
-        dispatch_semaphore_t started = dispatch_semaphore_create(0);
-        __block vmnet_return_t start_status = VMNET_FAILURE;
-        __block uint64_t max_packet_size = 0;
-        bridge->interface = vmnet_interface_start_with_network(
-            network,
-            interface_desc,
-            bridge->queue,
-            ^(vmnet_return_t callback_status, xpc_object_t interface_params) {
-                start_status = callback_status;
-                if (callback_status == VMNET_SUCCESS && interface_params != NULL) {
-                    max_packet_size = xpc_dictionary_get_uint64(
-                        interface_params,
-                        vmnet_max_packet_size_key);
-                }
-                dispatch_semaphore_signal(started);
-            });
-
-        dispatch_semaphore_wait(started, DISPATCH_TIME_FOREVER);
-        dispatch_release(started);
-        xpc_release(interface_desc);
-        CFRelease(network);
-
-        if (bridge->interface == NULL || start_status != VMNET_SUCCESS) {
-            close(sockets[0]);
-            close(sockets[1]);
-            if (bridge->queue != NULL) {
-                dispatch_release(bridge->queue);
-            }
-            free(bridge);
-            return -vmnet_status_to_errno(start_status);
-        }
-
-        if (max_packet_size == 0 || max_packet_size > KRUN_VMNET_MAX_FRAME_SIZE) {
-            max_packet_size = KRUN_VMNET_MAX_FRAME_SIZE;
-        }
-        bridge->max_packet_size = (size_t)max_packet_size;
-
-        status = vmnet_interface_set_event_callback(
-            bridge->interface,
-            VMNET_INTERFACE_PACKETS_AVAILABLE,
-            bridge->queue,
-            ^(interface_event_t event_id, xpc_object_t event) {
-                if (event_id == VMNET_INTERFACE_PACKETS_AVAILABLE) {
-                    forward_packets_to_guest(bridge, event);
-                }
-            });
-        if (status != VMNET_SUCCESS) {
-            int error = vmnet_status_to_errno(status);
-            stop_interface(bridge);
-            close(sockets[0]);
-            close(sockets[1]);
-            dispatch_release(bridge->queue);
-            free(bridge);
-            return -error;
-        }
-
-        int pthread_status = pthread_create(
-            &bridge->tx_thread,
-            NULL,
-            forward_packets_to_vmnet,
-            bridge);
-        if (pthread_status != 0) {
-            stop_interface(bridge);
-            close(sockets[0]);
-            close(sockets[1]);
-            dispatch_release(bridge->queue);
-            free(bridge);
-            return -pthread_status;
-        }
-
-        *out_fd = sockets[0];
-        *out_bridge = bridge;
-        return 0;
+        return start_network(network, false, out_fd, out_bridge);
     }
 #endif
+    return -ENOTSUP;
+}
 
+int32_t krun_vmnet_start_shared(const char *gateway, const char *netmask, int *out_fd, void **out_bridge)
+{
+    if (gateway == NULL || netmask == NULL || out_fd == NULL || out_bridge == NULL) {
+        return -EINVAL;
+    }
+    *out_fd = -1;
+    *out_bridge = NULL;
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    if (__builtin_available(macOS 26.0, *)) {
+        return start_shared(gateway, netmask, out_fd, out_bridge);
+    }
+#endif
     return -ENOTSUP;
 }
 
 void krun_vmnet_stop(void *opaque)
 {
-    if (opaque == NULL) {
-        return;
-    }
-
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
-    if (__builtin_available(macOS 26.0, *)) {
-        struct krun_vmnet_bridge *bridge = opaque;
-        atomic_store_explicit(&bridge->stopping, true, memory_order_relaxed);
-        (void)pthread_join(bridge->tx_thread, NULL);
-        stop_interface(bridge);
-        if (bridge->fd >= 0) {
-            close(bridge->fd);
-        }
-        if (bridge->queue != NULL) {
-            dispatch_release(bridge->queue);
-        }
-        free(bridge);
-        return;
+    if (opaque != NULL) {
+        (void)stop_bridge(opaque);
     }
-#endif
-
+#else
     (void)opaque;
+#endif
 }
