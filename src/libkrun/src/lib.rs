@@ -3192,6 +3192,17 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     };
 
+    #[cfg(all(target_os = "macos", feature = "net"))]
+    if !ctx_cfg.vmnet_bridges.is_empty() {
+        // Vmm::stop() terminates with _exit(), so ContextConfig destructors never run on
+        // a normal guest shutdown. Transfer native bridges to the VMM exit path so vmnet
+        // interfaces and network reservations are released before the process exits.
+        let bridges = Mutex::new(Some(std::mem::take(&mut ctx_cfg.vmnet_bridges)));
+        _vmm.lock().unwrap().add_exit_observer(move || {
+            drop(bridges.lock().unwrap().take());
+        });
+    }
+
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
