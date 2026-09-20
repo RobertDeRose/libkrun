@@ -14,6 +14,7 @@ static const char *scenario;
 static atomic_int writes;
 static atomic_int reads_pending;
 static atomic_int network_releases;
+static atomic_int network_create_calls;
 static vmnet_network_ref owned_network;
 static interface_ref active_interface;
 static bool is(const char *name) { return strcmp(scenario, name) == 0; }
@@ -52,6 +53,19 @@ vmnet_return_t vmnet_network_configuration_set_ipv4_subnet(vmnet_network_configu
 vmnet_network_ref vmnet_network_create(vmnet_network_configuration_ref config, vmnet_return_t *status)
 {
     assert(config->dhcp_disabled);
+    int call = atomic_fetch_add(&network_create_calls, 1) + 1;
+    if (is("network_busy") || (is("network_busy_once") && call == 1)) {
+        *status = VMNET_SHARING_SERVICE_BUSY;
+        return NULL;
+    }
+    if (is("network_setup_once") && call == 1) {
+        *status = VMNET_SETUP_INCOMPLETE;
+        return NULL;
+    }
+    if (is("network_not_authorized")) {
+        *status = VMNET_NOT_AUTHORIZED;
+        return NULL;
+    }
     *status = VMNET_SUCCESS;
     if (is("null_network_success")) return NULL;
     owned_network = calloc(1, sizeof(struct fake_network));
@@ -144,6 +158,15 @@ int main(int argc, char **argv)
     int result = is("serialized") ? krun_vmnet_start((void *)1, &fd, &bridge)
                                   : krun_vmnet_start_shared("192.168.200.1", "255.255.255.0", &fd, &bridge);
     if (is("permission") || is("start_failure")) assert(result == -EACCES);
+    else if (is("network_not_authorized")) assert(result == -EPERM);
+    else if (is("network_busy")) {
+        assert(result == -EBUSY);
+        assert(atomic_load(&network_create_calls) == KRUN_VMNET_RESERVATION_ATTEMPTS);
+    }
+    else if (is("network_busy_once") || is("network_setup_once")) {
+        assert(result == 0);
+        assert(atomic_load(&network_create_calls) == 2);
+    }
     else if (is("subnet_failure")) assert(result == -EINVAL);
     else if (is("subnet_mismatch")) assert(result == -EADDRNOTAVAIL);
     else if (is("null_network_success") || is("null_interface_success") || is("event_failure")) assert(result == -EIO);

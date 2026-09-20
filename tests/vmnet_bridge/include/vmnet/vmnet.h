@@ -9,7 +9,8 @@ typedef struct fake_network *vmnet_network_ref;
 typedef struct fake_configuration *vmnet_network_configuration_ref;
 typedef struct fake_interface *interface_ref;
 enum { VMNET_FAILURE = 0, VMNET_SUCCESS = 1, VMNET_INVALID_ARGUMENT, VMNET_INVALID_ACCESS,
-       VMNET_MEM_FAILURE, VMNET_PACKET_TOO_BIG, VMNET_SETUP_INCOMPLETE };
+       VMNET_MEM_FAILURE, VMNET_PACKET_TOO_BIG, VMNET_SETUP_INCOMPLETE, VMNET_BUFFER_EXHAUSTED,
+       VMNET_TOO_MANY_PACKETS, VMNET_NOT_AUTHORIZED, VMNET_SHARING_SERVICE_BUSY };
 enum { VMNET_SHARED_MODE = 1, VMNET_INTERFACE_PACKETS_AVAILABLE = 1 };
 #define vmnet_allocate_mac_address_key "allocate_mac"
 #define vmnet_enable_isolation_key "isolation"

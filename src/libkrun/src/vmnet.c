@@ -25,6 +25,12 @@
 #ifndef KRUN_VMNET_TIMEOUT_MS
 #define KRUN_VMNET_TIMEOUT_MS 5000
 #endif
+#ifndef KRUN_VMNET_RESERVATION_ATTEMPTS
+#define KRUN_VMNET_RESERVATION_ATTEMPTS 50
+#endif
+#ifndef KRUN_VMNET_RESERVATION_RETRY_US
+#define KRUN_VMNET_RESERVATION_RETRY_US 100000
+#endif
 
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
 
@@ -81,23 +87,79 @@ static bool wait_for(dispatch_semaphore_t done)
         done, dispatch_time(DISPATCH_TIME_NOW, KRUN_VMNET_TIMEOUT_MS * NSEC_PER_MSEC)) == 0;
 }
 
+static const char *vmnet_status_name(vmnet_return_t status)
+{
+    switch (status) {
+    case VMNET_SUCCESS:
+        return "VMNET_SUCCESS";
+    case VMNET_FAILURE:
+        return "VMNET_FAILURE";
+    case VMNET_MEM_FAILURE:
+        return "VMNET_MEM_FAILURE";
+    case VMNET_INVALID_ARGUMENT:
+        return "VMNET_INVALID_ARGUMENT";
+    case VMNET_SETUP_INCOMPLETE:
+        return "VMNET_SETUP_INCOMPLETE";
+    case VMNET_INVALID_ACCESS:
+        return "VMNET_INVALID_ACCESS";
+    case VMNET_PACKET_TOO_BIG:
+        return "VMNET_PACKET_TOO_BIG";
+    case VMNET_BUFFER_EXHAUSTED:
+        return "VMNET_BUFFER_EXHAUSTED";
+    case VMNET_TOO_MANY_PACKETS:
+        return "VMNET_TOO_MANY_PACKETS";
+    case VMNET_NOT_AUTHORIZED:
+        return "VMNET_NOT_AUTHORIZED";
+    case VMNET_SHARING_SERVICE_BUSY:
+        return "VMNET_SHARING_SERVICE_BUSY";
+    default:
+        return "VMNET_UNKNOWN";
+    }
+}
+
 static int vmnet_status_to_errno(vmnet_return_t status)
 {
     switch (status) {
+    case VMNET_SUCCESS:
+        return 0;
     case VMNET_INVALID_ARGUMENT:
         return EINVAL;
     case VMNET_INVALID_ACCESS:
         return EACCES;
+    case VMNET_NOT_AUTHORIZED:
+        return EPERM;
     case VMNET_MEM_FAILURE:
         return ENOMEM;
     case VMNET_PACKET_TOO_BIG:
         return EMSGSIZE;
+    case VMNET_BUFFER_EXHAUSTED:
+        return ENOBUFS;
+    case VMNET_TOO_MANY_PACKETS:
+        return E2BIG;
     case VMNET_SETUP_INCOMPLETE:
         return EAGAIN;
+    case VMNET_SHARING_SERVICE_BUSY:
+        return EBUSY;
     default:
-        // A null handle with VMNET_SUCCESS is also an error, never success.
         return EIO;
     }
+}
+
+static int32_t vmnet_framework_error(const char *operation, vmnet_return_t status)
+{
+    int error = vmnet_status_to_errno(status);
+    if (error == 0) {
+        // A NULL handle paired with VMNET_SUCCESS is still an API failure.
+        error = EIO;
+    }
+    fprintf(
+        stderr,
+        "libkrun: vmnet %s failed: status=%u (%s), errno=%d\n",
+        operation,
+        (unsigned)status,
+        vmnet_status_name(status),
+        error);
+    return -error;
 }
 
 static int set_socket_options(int fd)
@@ -364,9 +426,10 @@ static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_
         return -ETIMEDOUT;
     }
     if (bridge->interface == NULL || status != VMNET_SUCCESS) {
+        int32_t result = vmnet_framework_error("vmnet_interface_start_with_network", status);
         close(sockets[0]);
         (void)stop_bridge(bridge);
-        return -vmnet_status_to_errno(status);
+        return result;
     }
     if (max_packet_size < 1514 || max_packet_size > KRUN_VMNET_MAX_FRAME_SIZE) {
         close(sockets[0]);
@@ -388,9 +451,10 @@ static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_
             }
         });
     if (status != VMNET_SUCCESS) {
+        int32_t result = vmnet_framework_error("vmnet_interface_set_event_callback", status);
         close(sockets[0]);
         (void)stop_bridge(bridge);
-        return -vmnet_status_to_errno(status);
+        return result;
     }
     int error = pthread_create(&bridge->tx_thread, NULL, forward_packets_to_vmnet, bridge);
     if (error != 0) {
@@ -402,6 +466,34 @@ static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_
     *out_fd = sockets[0];
     *out_bridge = bridge;
     return 0;
+}
+
+static vmnet_network_ref create_shared_network(
+    vmnet_network_configuration_ref configuration,
+    vmnet_return_t *status)
+{
+    for (unsigned attempt = 1; attempt <= KRUN_VMNET_RESERVATION_ATTEMPTS; attempt++) {
+        vmnet_network_ref network = vmnet_network_create(configuration, status);
+        if (network != NULL && *status == VMNET_SUCCESS) {
+            return network;
+        }
+        if (network != NULL) {
+            CFRelease(network);
+        }
+        if ((*status != VMNET_SHARING_SERVICE_BUSY && *status != VMNET_SETUP_INCOMPLETE)
+            || attempt == KRUN_VMNET_RESERVATION_ATTEMPTS) {
+            return NULL;
+        }
+        if (attempt == 1) {
+            fprintf(
+                stderr,
+                "libkrun: vmnet network reservation temporarily unavailable: status=%u (%s); retrying\n",
+                (unsigned)*status,
+                vmnet_status_name(*status));
+        }
+        usleep(KRUN_VMNET_RESERVATION_RETRY_US);
+    }
+    return NULL;
 }
 
 static int32_t start_shared(const char *gateway, const char *netmask, int *out_fd, void **out_bridge)
@@ -426,21 +518,18 @@ static int32_t start_shared(const char *gateway, const char *netmask, int *out_f
         if (configuration != NULL) {
             CFRelease(configuration);
         }
-        return -vmnet_status_to_errno(status);
+        return vmnet_framework_error("vmnet_network_configuration_create", status);
     }
     vmnet_network_configuration_disable_dhcp(configuration);
     status = vmnet_network_configuration_set_ipv4_subnet(configuration, &address, &mask);
     if (status != VMNET_SUCCESS) {
         CFRelease(configuration);
-        return -vmnet_status_to_errno(status);
+        return vmnet_framework_error("vmnet_network_configuration_set_ipv4_subnet", status);
     }
-    vmnet_network_ref network = vmnet_network_create(configuration, &status);
+    vmnet_network_ref network = create_shared_network(configuration, &status);
     CFRelease(configuration);
-    if (network == NULL || status != VMNET_SUCCESS) {
-        if (network != NULL) {
-            CFRelease(network);
-        }
-        return -vmnet_status_to_errno(status);
+    if (network == NULL) {
+        return vmnet_framework_error("vmnet_network_create", status);
     }
     struct in_addr actual_address = {0}, actual_mask = {0};
     vmnet_network_get_ipv4_subnet(network, &actual_address, &actual_mask);
@@ -467,7 +556,7 @@ int32_t krun_vmnet_start(const void *network_serialization, int *out_fd, void **
             if (network != NULL) {
                 CFRelease(network);
             }
-            return -vmnet_status_to_errno(status);
+            return vmnet_framework_error("vmnet_network_create_with_serialization", status);
         }
         return start_network(network, false, out_fd, out_bridge);
     }
