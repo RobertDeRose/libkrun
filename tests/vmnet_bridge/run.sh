@@ -4,7 +4,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 build="$(mktemp -d)"
 trap 'rm -rf "$build"' EXIT
 cc="${CC:-clang}"
-flags=(-fblocks -std=c11 -D_DEFAULT_SOURCE -DKRUN_VMNET_TIMEOUT_MS=200   -DKRUN_VMNET_RESERVATION_ATTEMPTS=3 -DKRUN_VMNET_RESERVATION_RETRY_US=1000   -Wall -Wextra -Werror)
+flags=(-fblocks -std=c11 -D_DEFAULT_SOURCE -DKRUN_VMNET_TIMEOUT_MS=200   -Wall -Wextra -Werror)
 libs=(-lpthread)
 if [[ "$(uname -s)" == Linux ]]; then
   swift_lib="${SWIFT_LIBRARY_PATH:-$(cd "$(dirname "$(command -v swift)")/../lib/swift" && pwd -P)}"
@@ -18,9 +18,8 @@ if [[ "${ASAN:-0}" == 1 ]]; then
 fi
 "$cc" -I"$root/tests/vmnet_bridge/include" "${flags[@]}" \
   "$root/tests/vmnet_bridge/test_bridge.c" "${libs[@]}" -o "$build/test-bridge"
-for scenario in success serialized invalid_arguments permission network_not_authorized \
-  network_busy network_busy_once network_setup_once subnet_failure subnet_mismatch \
-  null_network_success null_interface_success start_failure invalid_packet_size event_failure \
+for scenario in success shared_pair serialized serialized_not_authorized invalid_arguments permission \
+  null_interface_success start_failure invalid_packet_size event_failure \
   truncated_frame late_start late_stop stop_submit_failure; do
   "$build/test-bridge" "$scenario"
 done

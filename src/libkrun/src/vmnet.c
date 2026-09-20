@@ -25,12 +25,6 @@
 #ifndef KRUN_VMNET_TIMEOUT_MS
 #define KRUN_VMNET_TIMEOUT_MS 5000
 #endif
-#ifndef KRUN_VMNET_RESERVATION_ATTEMPTS
-#define KRUN_VMNET_RESERVATION_ATTEMPTS 50
-#endif
-#ifndef KRUN_VMNET_RESERVATION_RETRY_US
-#define KRUN_VMNET_RESERVATION_RETRY_US 100000
-#endif
 
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
 
@@ -281,7 +275,9 @@ static void destroy_bridge(struct krun_vmnet_bridge *bridge)
     if (bridge->descriptor != NULL) {
         xpc_release(bridge->descriptor);
     }
-    CFRelease(bridge->network);
+    if (bridge->network != NULL) {
+        CFRelease(bridge->network);
+    }
     free(bridge->tx_buffer);
     free(bridge);
 }
@@ -350,18 +346,30 @@ static bool stop_bridge(struct krun_vmnet_bridge *bridge)
     return true;
 }
 
-// Takes ownership of network, including on failure.
-static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_fd, void **out_bridge)
+// Takes ownership of network (when non-NULL) and descriptor, including on failure.
+static int32_t start_interface(
+    vmnet_network_ref network,
+    xpc_object_t descriptor,
+    int *out_fd,
+    void **out_bridge)
     __attribute__((availability(macos, introduced = 26.0)));
 
-static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_fd, void **out_bridge)
+static int32_t start_interface(
+    vmnet_network_ref network,
+    xpc_object_t descriptor,
+    int *out_fd,
+    void **out_bridge)
 {
     struct krun_vmnet_bridge *bridge = calloc(1, sizeof(*bridge));
     if (bridge == NULL) {
-        CFRelease(network);
+        if (network != NULL) {
+            CFRelease(network);
+        }
+        xpc_release(descriptor);
         return -ENOMEM;
     }
     bridge->network = network;
+    bridge->descriptor = descriptor;
     bridge->fd = -1;
     atomic_init(&bridge->stopping, false);
     bridge->queue = dispatch_queue_create("org.libkrun.vmnet", DISPATCH_QUEUE_SERIAL);
@@ -387,49 +395,44 @@ static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_
         return result;
     }
     struct completion *completion = completion_create();
-    xpc_object_t descriptor = xpc_dictionary_create(NULL, NULL, 0);
-    if (completion == NULL || descriptor == NULL) {
-        if (completion != NULL) {
-            completion_release(completion);
-            completion_release(completion);
-        }
-        if (descriptor != NULL) {
-            xpc_release(descriptor);
-        }
+    if (completion == NULL) {
         close(sockets[0]);
         destroy_bridge(bridge);
         return -ENOMEM;
     }
-    bridge->descriptor = descriptor;
-    xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, false);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_isolation_key, isolated);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, false);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, false);
-    bridge->interface = vmnet_interface_start_with_network(
-        network, descriptor, bridge->queue, ^(vmnet_return_t status, xpc_object_t parameters) {
-            completion->status = status;
-            if (status == VMNET_SUCCESS && parameters != NULL) {
-                completion->max_packet_size = xpc_dictionary_get_uint64(parameters, vmnet_max_packet_size_key);
-            }
-            dispatch_semaphore_signal(completion->done);
-            completion_release(completion);
-        });
+    void (^started)(vmnet_return_t, xpc_object_t) = ^(vmnet_return_t status, xpc_object_t parameters) {
+        completion->status = status;
+        if (status == VMNET_SUCCESS && parameters != NULL) {
+            completion->max_packet_size = xpc_dictionary_get_uint64(parameters, vmnet_max_packet_size_key);
+        }
+        dispatch_semaphore_signal(completion->done);
+        completion_release(completion);
+    };
+    if (network != NULL) {
+        bridge->interface = vmnet_interface_start_with_network(
+            network, descriptor, bridge->queue, started);
+    } else {
+        bridge->interface = vmnet_start_interface(descriptor, bridge->queue, started);
+    }
     bool completed = wait_for(completion->done);
     vmnet_return_t status = completed ? completion->status : VMNET_FAILURE;
     uint64_t max_packet_size = completed ? completion->max_packet_size : 0;
     completion_release(completion);
     if (!completed) {
         close(sockets[0]);
-        // No packet callback/thread was installed. Keep the network and queue
-        // alive for a late start callback rather than racing an incomplete start.
+        // No packet callback/thread was installed. Keep framework state alive
+        // for a late start callback rather than racing an incomplete start.
         quarantine("interface start timed out");
         return -ETIMEDOUT;
     }
     if (bridge->interface == NULL || status != VMNET_SUCCESS) {
-        int32_t result = vmnet_framework_error("vmnet_interface_start_with_network", status);
+        const char *operation = network != NULL
+            ? "vmnet_interface_start_with_network"
+            : "vmnet_start_interface";
+        int32_t error = vmnet_framework_error(operation, status);
         close(sockets[0]);
         (void)stop_bridge(bridge);
-        return result;
+        return error;
     }
     if (max_packet_size < 1514 || max_packet_size > KRUN_VMNET_MAX_FRAME_SIZE) {
         close(sockets[0]);
@@ -451,10 +454,10 @@ static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_
             }
         });
     if (status != VMNET_SUCCESS) {
-        int32_t result = vmnet_framework_error("vmnet_interface_set_event_callback", status);
+        int32_t error = vmnet_framework_error("vmnet_interface_set_event_callback", status);
         close(sockets[0]);
         (void)stop_bridge(bridge);
-        return result;
+        return error;
     }
     int error = pthread_create(&bridge->tx_thread, NULL, forward_packets_to_vmnet, bridge);
     if (error != 0) {
@@ -468,32 +471,21 @@ static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_
     return 0;
 }
 
-static vmnet_network_ref create_shared_network(
-    vmnet_network_configuration_ref configuration,
-    vmnet_return_t *status)
+static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_fd, void **out_bridge)
+    __attribute__((availability(macos, introduced = 26.0)));
+
+static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_fd, void **out_bridge)
 {
-    for (unsigned attempt = 1; attempt <= KRUN_VMNET_RESERVATION_ATTEMPTS; attempt++) {
-        vmnet_network_ref network = vmnet_network_create(configuration, status);
-        if (network != NULL && *status == VMNET_SUCCESS) {
-            return network;
-        }
-        if (network != NULL) {
-            CFRelease(network);
-        }
-        if ((*status != VMNET_SHARING_SERVICE_BUSY && *status != VMNET_SETUP_INCOMPLETE)
-            || attempt == KRUN_VMNET_RESERVATION_ATTEMPTS) {
-            return NULL;
-        }
-        if (attempt == 1) {
-            fprintf(
-                stderr,
-                "libkrun: vmnet network reservation temporarily unavailable: status=%u (%s); retrying\n",
-                (unsigned)*status,
-                vmnet_status_name(*status));
-        }
-        usleep(KRUN_VMNET_RESERVATION_RETRY_US);
+    xpc_object_t descriptor = xpc_dictionary_create(NULL, NULL, 0);
+    if (descriptor == NULL) {
+        CFRelease(network);
+        return -ENOMEM;
     }
-    return NULL;
+    xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, false);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_isolation_key, isolated);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, false);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, false);
+    return start_interface(network, descriptor, out_fd, out_bridge);
 }
 
 static int32_t start_shared(const char *gateway, const char *netmask, int *out_fd, void **out_bridge)
@@ -505,39 +497,42 @@ static int32_t start_shared(const char *gateway, const char *netmask, int *out_f
     if (inet_pton(AF_INET, gateway, &address) != 1 || inet_pton(AF_INET, netmask, &mask) != 1) {
         return -EINVAL;
     }
-    uint32_t host_mask = ~ntohl(mask.s_addr);
-    uint32_t host = ntohl(address.s_addr) & host_mask;
+    uint32_t address_host = ntohl(address.s_addr);
+    uint32_t mask_host = ntohl(mask.s_addr);
+    uint32_t host_mask = ~mask_host;
+    uint32_t host = address_host & host_mask;
     // A contiguous /1../30 network and an actual host address are required.
     if (mask.s_addr == 0 || host_mask < 3 || (host_mask & (host_mask + 1)) != 0
         || host == 0 || host == host_mask) {
         return -EINVAL;
     }
-    vmnet_return_t status = VMNET_FAILURE;
-    vmnet_network_configuration_ref configuration = vmnet_network_configuration_create(VMNET_SHARED_MODE, &status);
-    if (configuration == NULL || status != VMNET_SUCCESS) {
-        if (configuration != NULL) {
-            CFRelease(configuration);
-        }
-        return vmnet_framework_error("vmnet_network_configuration_create", status);
+
+    // Use the long-standing vmnet_start_interface shared-mode API here rather
+    // than reserving the subnet with vmnet_network_create(). A network_ref is
+    // an exclusive reservation: creating one in every per-VM helper prevents a
+    // second VM from joining the same Apple allocationOnly network. Shared-mode
+    // interfaces with matching address settings are intentionally allowed to
+    // coexist across VM processes.
+    uint32_t network_host = address_host & mask_host;
+    struct in_addr end_address = {.s_addr = htonl(network_host | (host_mask - 1))};
+    char end[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, &end_address, end, sizeof(end)) == NULL) {
+        return -errno;
     }
-    vmnet_network_configuration_disable_dhcp(configuration);
-    status = vmnet_network_configuration_set_ipv4_subnet(configuration, &address, &mask);
-    if (status != VMNET_SUCCESS) {
-        CFRelease(configuration);
-        return vmnet_framework_error("vmnet_network_configuration_set_ipv4_subnet", status);
+
+    xpc_object_t descriptor = xpc_dictionary_create(NULL, NULL, 0);
+    if (descriptor == NULL) {
+        return -ENOMEM;
     }
-    vmnet_network_ref network = create_shared_network(configuration, &status);
-    CFRelease(configuration);
-    if (network == NULL) {
-        return vmnet_framework_error("vmnet_network_create", status);
-    }
-    struct in_addr actual_address = {0}, actual_mask = {0};
-    vmnet_network_get_ipv4_subnet(network, &actual_address, &actual_mask);
-    if (actual_address.s_addr != address.s_addr || actual_mask.s_addr != mask.s_addr) {
-        CFRelease(network);
-        return -EADDRNOTAVAIL;
-    }
-    return start_network(network, true, out_fd, out_bridge);
+    xpc_dictionary_set_uint64(descriptor, vmnet_operation_mode_key, VMNET_SHARED_MODE);
+    xpc_dictionary_set_string(descriptor, vmnet_start_address_key, gateway);
+    xpc_dictionary_set_string(descriptor, vmnet_end_address_key, end);
+    xpc_dictionary_set_string(descriptor, vmnet_subnet_mask_key, netmask);
+    xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, false);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_isolation_key, true);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, false);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, false);
+    return start_interface(NULL, descriptor, out_fd, out_bridge);
 }
 #endif
 

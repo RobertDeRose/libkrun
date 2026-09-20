@@ -7,8 +7,9 @@ sanitization. Linux needs the Swift toolchain's libdispatch/BlocksRuntime; set
 `SWIFT_LIBRARY_PATH` when they are installed elsewhere. macOS uses system dispatch.
 
 These tests exercise raw frames in both directions, truncation rejection, static
-subnet validation, configuration/permission/start/event failures, resource release,
-and callbacks arriving after timed-out start/stop calls. Timeout paths deliberately
+subnet validation, shared-interface descriptor construction, serialized-network
+compatibility, permission/start/event failures, resource release, and callbacks
+arriving after timed-out start/stop calls. Timeout paths deliberately
 retain uncertain framework resources until process exit; ASan leak reporting is
 disabled for those tests, but use-after-free detection remains enabled.
 
@@ -25,5 +26,8 @@ cargo test -p libkrun --features blk,net native_context_tests
 
 The new `krun_create_ctx2(KRUN_CTX_NO_DEFAULT_FIRMWARE)` avoids default firmware
 library discovery before privilege drop. Legacy `krun_create_ctx()` retains its
-existing behavior. `krun_add_net_vmnet_shared()` is additive; the serialized API
-remains available. Both use the same packet bridge and bounded callback handling.
+existing behavior. `krun_add_net_vmnet_shared()` is additive; the serialized API remains available.
+The shared path uses `vmnet_start_interface()` so independent VMM processes can
+join the same configured shared subnet, while the serialized path continues to
+use `vmnet_interface_start_with_network()`. Both use the same packet bridge and
+bounded callback handling.

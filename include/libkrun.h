@@ -548,18 +548,21 @@ int32_t krun_add_net_vmnet(uint32_t ctx_id,
                            uint32_t flags);
 
 /**
- * Creates an owned, isolated shared/NAT vmnet network and attaches a virtio-net
- * device in the same process. No opaque network from another executable is used.
+ * Starts an isolated shared/NAT vmnet interface and attaches a virtio-net device
+ * in the same process. Matching shared interfaces may coexist in separate VMM
+ * processes on the same subnet; no exclusive vmnet_network_ref reservation is made.
  * ipv4_gateway and ipv4_netmask are NUL-terminated dotted-decimal IPv4 strings.
  * The subnet must be /1../30 and the gateway must be a usable host address.
- * Address allocation and guest configuration belong to the caller: vmnet DHCP
- * and MAC allocation are disabled, and c_mac supplies the six-byte unicast MAC.
+ * Address allocation and guest configuration belong to the caller. The guest is
+ * configured statically by the caller and does not run a DHCP client; vmnet's
+ * shared-mode DHCP service may remain available for other interfaces. MAC allocation
+ * is disabled and c_mac supplies the six-byte unicast MAC used by virtio-net.
  * features and flags must both be zero (raw Ethernet; no offload or DHCP client).
  *
  * macOS 26+ and a net-enabled build are required. The caller needs vmnet setup
  * permission for this call, but may permanently drop privileges before booting
- * the guest. The context owns the interface/network through VM execution; freeing
- * an unstarted context releases them. There is no helper process or fallback.
+ * the guest. The context owns the interface through VM execution; freeing an
+ * unstarted context releases it. There is no packet-helper process or fallback.
  *
  * Asynchronous setup/teardown waits are bounded. Startup timeout returns
  * -ETIMEDOUT. Unacknowledged native callbacks/threads are retained until process
