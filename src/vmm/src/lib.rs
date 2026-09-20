@@ -363,6 +363,11 @@ impl Vmm {
         self.exit_observers.push(Arc::new(Mutex::new(observer)));
     }
 
+    /// Clone the internal VMM exit event for a host-side stop request.
+    pub fn clone_exit_event(&self) -> std::io::Result<EventFd> {
+        self.exit_evt.try_clone()
+    }
+
     /// Waits for all vCPUs to exit and terminates the Firecracker process.
     pub fn stop(&mut self, exit_code: i32) {
         info!("Vmm is stopping.");

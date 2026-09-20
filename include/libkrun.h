@@ -84,16 +84,15 @@ int32_t krun_create_ctx();
 int32_t krun_create_ctx2(uint32_t flags);
 
 /**
- * Request an orderly shutdown of a macOS/aarch64 microVM.
+ * Request that a running VMM stop through its normal host-side exit path.
  *
- * The request is delivered through libkrun's existing PL061 shutdown device.
- * It may be issued immediately before or after krun_start_enter(); a request
- * made before the VMM event loop starts remains pending on the shutdown event.
+ * This does not request an orderly guest shutdown. It signals the VMM's
+ * internal exit event so exit observers run before the process terminates.
+ * The context must currently be running inside krun_start_enter().
  *
- * Returns zero on success, -ENOENT for an unknown context, or -ENOTSUP on
- * platforms where the shutdown device is unavailable.
+ * Returns zero on success or -ENOENT if the context has no running VMM.
  */
-int32_t krun_request_shutdown(uint32_t ctx_id);
+int32_t krun_request_vmm_stop(uint32_t ctx_id);
 
 /**
  * Frees an existing configuration context.

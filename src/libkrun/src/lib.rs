@@ -492,18 +492,15 @@ fn with_cfg(ctx_id: u32, f: impl FnOnce(&mut ContextConfig) -> i32) -> i32 {
 }
 
 static CTX_MAP: Lazy<Mutex<HashMap<u32, ContextConfig>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-static RUNNING_SHUTDOWN: Lazy<Mutex<HashMap<u32, EventFd>>> =
+static RUNNING_VMM_STOPS: Lazy<Mutex<HashMap<u32, EventFd>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static CTX_IDS: AtomicI32 = AtomicI32::new(0);
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-struct RunningShutdownGuard(u32);
+struct RunningVmmStopGuard(u32);
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-impl Drop for RunningShutdownGuard {
+impl Drop for RunningVmmStopGuard {
     fn drop(&mut self) {
-        RUNNING_SHUTDOWN.lock().unwrap().remove(&self.0);
+        RUNNING_VMM_STOPS.lock().unwrap().remove(&self.0);
     }
 }
 
@@ -638,36 +635,15 @@ pub extern "C" fn krun_free_ctx(ctx_id: u32) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn krun_request_shutdown(ctx_id: u32) -> i32 {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        {
-            let contexts = CTX_MAP.lock().unwrap();
-            if let Some(event) = contexts
-                .get(&ctx_id)
-                .and_then(|context| context.shutdown_efd.as_ref())
-            {
-                return match event.write(1) {
-                    Ok(()) => KRUN_SUCCESS,
-                    Err(error) => -error.raw_os_error().unwrap_or(libc::EIO),
-                };
-            }
-        }
+pub extern "C" fn krun_request_vmm_stop(ctx_id: u32) -> i32 {
+    let running = RUNNING_VMM_STOPS.lock().unwrap();
+    let Some(event) = running.get(&ctx_id) else {
+        return -libc::ENOENT;
+    };
 
-        let running = RUNNING_SHUTDOWN.lock().unwrap();
-        let Some(event) = running.get(&ctx_id) else {
-            return -libc::ENOENT;
-        };
-        return match event.write(1) {
-            Ok(()) => KRUN_SUCCESS,
-            Err(error) => -error.raw_os_error().unwrap_or(libc::EIO),
-        };
-    }
-
-    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-    {
-        let _ = ctx_id;
-        -libc::ENOTSUP
+    match event.write(1) {
+        Ok(()) => KRUN_SUCCESS,
+        Err(error) => -error.raw_os_error().unwrap_or(libc::EIO),
     }
 }
 
@@ -3076,27 +3052,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     };
 
-    let mut ctx_cfg = {
-        let mut contexts = CTX_MAP.lock().unwrap();
-        let Some(ctx_cfg) = contexts.remove(&ctx_id) else {
-            return -libc::ENOENT;
-        };
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-        if let Some(event) = ctx_cfg.shutdown_efd.as_ref() {
-            let clone = match event.try_clone() {
-                Ok(clone) => clone,
-                Err(error) => {
-                    error!("Failed to clone shutdown event: {error}");
-                    contexts.insert(ctx_id, ctx_cfg);
-                    return -error.raw_os_error().unwrap_or(libc::EIO);
-                }
-            };
-            RUNNING_SHUTDOWN.lock().unwrap().insert(ctx_id, clone);
-        }
-        ctx_cfg
+    let mut ctx_cfg = match CTX_MAP.lock().unwrap().remove(&ctx_id) {
+        Some(ctx_cfg) => ctx_cfg,
+        None => return -libc::ENOENT,
     };
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    let _shutdown_guard = RunningShutdownGuard(ctx_id);
 
     if ctx_cfg.vmr.external_kernel.is_none()
         && ctx_cfg.vmr.kernel_bundle.is_none()
@@ -3267,6 +3226,16 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         });
     }
 
+    let stop_event = match _vmm.lock().unwrap().clone_exit_event() {
+        Ok(event) => event,
+        Err(error) => {
+            error!("Failed to clone VMM stop event: {error}");
+            return -error.raw_os_error().unwrap_or(libc::EIO);
+        }
+    };
+    RUNNING_VMM_STOPS.lock().unwrap().insert(ctx_id, stop_event);
+    let _running_vmm_stop_guard = RunningVmmStopGuard(ctx_id);
+
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
@@ -3359,9 +3328,8 @@ mod native_context_tests {
     }
 
     #[test]
-    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-    fn shutdown_request_is_unsupported_off_macos_arm64() {
-        assert_eq!(krun_request_shutdown(123), -libc::ENOTSUP);
+    fn vmm_stop_request_rejects_unknown_context() {
+        assert_eq!(krun_request_vmm_stop(u32::MAX), -libc::ENOENT);
     }
 
     #[test]
