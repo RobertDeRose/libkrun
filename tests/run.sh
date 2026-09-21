@@ -10,18 +10,6 @@ OS=$(uname -s)
  # macOS uses the string "arm64" but Rust uses "aarch64"
 ARCH=$(uname -m | sed 's/^arm64$/aarch64/')
 
-# Set the OS-specific library path from LIBKRUN_LIB_PATH.
-# On macOS, SIP strips DYLD_LIBRARY_PATH when executing scripts via a shebang,
-# so the Makefile passes it through this alternative variable instead.
-# We do the same on Linux for consistency.
-if [ -n "${LIBKRUN_LIB_PATH}" ]; then
-	if [ "$OS" = "Darwin" ]; then
-		export DYLD_LIBRARY_PATH="${LIBKRUN_LIB_PATH}:${DYLD_LIBRARY_PATH}"
-	else
-		export LD_LIBRARY_PATH="${LIBKRUN_LIB_PATH}:${LD_LIBRARY_PATH}"
-	fi
-fi 
-
 GUEST_TARGET="${ARCH}-unknown-linux-musl"
 
 # Run the unit tests first (this tests the testing framework itself not libkrun).
@@ -58,6 +46,19 @@ if [ "$OS" = "Darwin" ]; then
 fi
 
 export KRUN_TEST_GUEST_AGENT_PATH="target/$GUEST_TARGET/debug/guest-agent"
+
+# Set the OS-specific library path only for the runtime phase. On macOS,
+# exposing Homebrew LLVM while cargo is running can make rustc load an
+# incompatible libLLVM instead of the one bundled with the toolchain. SIP
+# strips DYLD_LIBRARY_PATH when executing scripts via a shebang, so the
+# Makefile passes the path through LIBKRUN_LIB_PATH and we apply it here.
+if [ -n "${LIBKRUN_LIB_PATH}" ]; then
+	if [ "$OS" = "Darwin" ]; then
+		export DYLD_LIBRARY_PATH="${LIBKRUN_LIB_PATH}${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
+	else
+		export LD_LIBRARY_PATH="${LIBKRUN_LIB_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+	fi
+fi
 
 # Build runner args: pass through all arguments
 RUNNER_ARGS="$*"
