@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io;
-use std::os::fd::OwnedFd;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
