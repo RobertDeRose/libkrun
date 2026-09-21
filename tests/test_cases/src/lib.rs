@@ -7,6 +7,9 @@ use test_vsock_guest_connect::TestVsockGuestConnect;
 mod test_vsock_guest_reconnect;
 use test_vsock_guest_reconnect::TestVsockGuestReconnect;
 
+mod test_vsock_host_dial;
+use test_vsock_host_dial::TestVsockHostDial;
+
 mod test_tsi_tcp_guest_connect;
 use test_tsi_tcp_guest_connect::TestTsiTcpGuestConnect;
 
@@ -83,6 +86,7 @@ pub fn test_cases() -> Vec<TestCase> {
             "vsock-guest-reconnect",
             Box::new(TestVsockGuestReconnect),
         ),
+        TestCase::new("vsock-host-dial", Box::new(TestVsockHostDial)),
         TestCase::new(
             "tsi-tcp-guest-connect",
             Box::new(TestTsiTcpGuestConnect::new()),
