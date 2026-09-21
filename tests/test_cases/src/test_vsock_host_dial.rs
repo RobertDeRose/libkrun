@@ -6,7 +6,6 @@ use std::time::Duration;
 pub struct TestVsockHostDial;
 
 const VSOCK_PORT: u32 = 43210;
-const UNUSED_VSOCK_PORT: u32 = 43211;
 
 fn stream_set_timeouts(stream: &UnixStream) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -39,6 +38,8 @@ mod host {
     use std::path::Path;
     use std::thread;
     use std::time::Instant;
+
+    const UNUSED_VSOCK_PORT: u32 = 43211;
 
     fn dial_once(ctx: u32, port: u32) -> io::Result<UnixStream> {
         let fd = unsafe { krun_vsock_connect(ctx, port) };

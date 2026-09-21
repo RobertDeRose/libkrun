@@ -277,11 +277,17 @@ test-prefix: test-prefix/$(LIBDIR_$(OS))/libkrun.pc
 TEST ?= all
 TEST_FLAGS ?=
 
-# Extra library paths needed for tests (libkrunfw, llvm)
+# Extra runtime library paths needed by the test runner.
 EXTRA_LIBPATH_Linux =
-EXTRA_LIBPATH_Darwin = /opt/homebrew/opt/libkrunfw/lib:/opt/homebrew/opt/llvm/lib
+EXTRA_LIBPATH_Darwin = /opt/homebrew/opt/libkrunfw/lib
+
+# bindgen loads libclang while building the host-side runner. Keep LLVM out of
+# DYLD_LIBRARY_PATH so rustc continues to use the LLVM bundled with its toolchain.
+LIBCLANG_PATH_Linux =
+LIBCLANG_PATH_Darwin = /opt/homebrew/opt/llvm/lib
 
 # On macOS, SIP strips DYLD_LIBRARY_PATH when executing scripts via a shebang,
-# so we pass the path via LIBKRUN_LIB_PATH and let run.sh set the real variable.
+# so we pass the runtime path via LIBKRUN_LIB_PATH and let run.sh set it only
+# after the Cargo builds have completed.
 test: test-prefix
-	cd tests; RUST_LOG=trace LIBKRUN_LIB_PATH="$$(realpath ../test-prefix/$(LIBDIR_$(OS))/):$(EXTRA_LIBPATH_$(OS))" PKG_CONFIG_PATH="$$(realpath ../test-prefix/$(LIBDIR_$(OS))/pkgconfig/)" ./run.sh test --test-case "$(TEST)" $(TEST_FLAGS)
+	cd tests; RUST_LOG=trace LIBKRUN_LIB_PATH="$$(realpath ../test-prefix/$(LIBDIR_$(OS))/):$(EXTRA_LIBPATH_$(OS))" LIBCLANG_PATH="$(LIBCLANG_PATH_$(OS))" PKG_CONFIG_PATH="$$(realpath ../test-prefix/$(LIBDIR_$(OS))/pkgconfig/)" ./run.sh test --test-case "$(TEST)" $(TEST_FLAGS)
