@@ -57,7 +57,9 @@ mod host {
                 Err(error)
                     if matches!(
                         error.raw_os_error(),
-                        Some(libc::ENOENT) | Some(libc::ECONNREFUSED)
+                        Some(libc::ENOENT)
+                            | Some(libc::ENODEV)
+                            | Some(libc::ECONNREFUSED)
                     ) && Instant::now() < deadline =>
                 {
                     thread::sleep(Duration::from_millis(20));
@@ -113,6 +115,22 @@ mod host {
 
         fn check(self: Box<Self>, stdout: Vec<u8>, test_setup: TestSetup) -> TestOutcome {
             let guest_output = String::from_utf8_lossy(&stdout);
+            let status_path = test_setup.tmp_dir.join("host-status.txt");
+            match fs::read_to_string(&status_path) {
+                Ok(status) if status != "OK\n" => {
+                    return TestOutcome::Fail(format!(
+                        "host validation failed: {status}guest stdout: {guest_output:?}"
+                    ));
+                }
+                Err(error) => {
+                    return TestOutcome::Fail(format!(
+                        "host validation status missing at {}: {error}; guest stdout: {guest_output:?}",
+                        status_path.display()
+                    ));
+                }
+                Ok(_) => {}
+            }
+
             if guest_output != "OK\n" {
                 return TestOutcome::Fail(format!(
                     "guest expected exactly {:?}, got {:?}",
@@ -120,15 +138,7 @@ mod host {
                 ));
             }
 
-            let status_path = test_setup.tmp_dir.join("host-status.txt");
-            match fs::read_to_string(&status_path) {
-                Ok(status) if status == "OK\n" => TestOutcome::Pass,
-                Ok(status) => TestOutcome::Fail(format!("host validation failed: {status}")),
-                Err(error) => TestOutcome::Fail(format!(
-                    "host validation status missing at {}: {error}",
-                    status_path.display()
-                )),
-            }
+            TestOutcome::Pass
         }
     }
 }
