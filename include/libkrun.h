@@ -1033,6 +1033,21 @@ int32_t krun_add_vsock_port2(uint32_t ctx_id,
 int32_t krun_add_vsock(uint32_t ctx_id, uint32_t tsi_features);
 
 /**
+ * Connects to a listening vsock port in a running guest.
+ *
+ * The call blocks until the guest accepts or rejects the connection. The returned file descriptor
+ * is a bidirectional stream connected to the guest's AF_VSOCK listener.
+ *
+ * Arguments:
+ *  "ctx_id"    - the running configuration context ID.
+ *  "port"      - the guest vsock port to connect to.
+ *
+ * Returns:
+ *  A connected file descriptor on success or a negative error number on failure.
+ */
+int32_t krun_vsock_connect(uint32_t ctx_id, uint32_t port);
+
+/**
  * Returns the eventfd file descriptor to signal the guest to shut down orderly. This must be
  * called before starting the microVM with "krun_start_event". Only available in libkrun-efi.
  *

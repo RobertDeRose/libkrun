@@ -6,8 +6,12 @@
 // found in the THIRD-PARTY file.
 
 use std::collections::HashMap;
+use std::io;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+use crossbeam_channel::Receiver;
 
 use utils::byte_order;
 use utils::eventfd::EventFd;
@@ -34,6 +38,25 @@ pub(crate) const EVQ_INDEX: usize = 2;
 pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u64)
     | (1 << uapi::VIRTIO_F_IN_ORDER as u64)
     | (1 << uapi::VIRTIO_VSOCK_F_DGRAM);
+
+pub struct VsockConnection {
+    fd: OwnedFd,
+    result: Receiver<i32>,
+}
+
+impl VsockConnection {
+    pub(crate) fn new(fd: OwnedFd, result: Receiver<i32>) -> Self {
+        Self { fd, result }
+    }
+
+    pub fn wait(self) -> io::Result<OwnedFd> {
+        match self.result.recv() {
+            Ok(0) => Ok(self.fd),
+            Ok(errno) => Err(io::Error::from_raw_os_error(errno)),
+            Err(_) => Err(io::Error::from_raw_os_error(libc::EIO)),
+        }
+    }
+}
 
 pub struct Vsock {
     cid: u64,
@@ -76,6 +99,10 @@ impl Vsock {
 
     pub fn cid(&self) -> u64 {
         self.cid
+    }
+
+    pub fn connect(&mut self, port: u32) -> io::Result<VsockConnection> {
+        self.muxer.connect(port)
     }
 
     /// Walk the driver-provided RX queue buffers and attempt to fill them up with any data that we

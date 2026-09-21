@@ -4,6 +4,7 @@ extern crate log;
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{ImageType, SyncMode};
+use devices::virtio::Vsock;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::passthrough::PermissionSemantics;
 #[cfg(feature = "gpu")]
@@ -31,12 +32,12 @@ use std::fs::File;
 use std::io::IsTerminal;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
+use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, RawFd};
 use std::path::PathBuf;
 use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use utils::eventfd::EventFd;
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
@@ -494,6 +495,8 @@ fn with_cfg(ctx_id: u32, f: impl FnOnce(&mut ContextConfig) -> i32) -> i32 {
 static CTX_MAP: Lazy<Mutex<HashMap<u32, ContextConfig>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static RUNNING_VMM_STOPS: Lazy<Mutex<HashMap<u32, EventFd>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static RUNNING_VSOCKS: Lazy<Mutex<HashMap<u32, Arc<Mutex<Vsock>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 static CTX_IDS: AtomicI32 = AtomicI32::new(0);
 
 struct RunningVmmStopGuard(u32);
@@ -501,6 +504,7 @@ struct RunningVmmStopGuard(u32);
 impl Drop for RunningVmmStopGuard {
     fn drop(&mut self) {
         RUNNING_VMM_STOPS.lock().unwrap().remove(&self.0);
+        RUNNING_VSOCKS.lock().unwrap().remove(&self.0);
     }
 }
 
@@ -2083,6 +2087,31 @@ pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
     }
 }
 
+#[no_mangle]
+pub extern "C" fn krun_vsock_connect(ctx_id: u32, port: u32) -> i32 {
+    if port == 0 {
+        return -libc::EINVAL;
+    }
+
+    let vsock = match RUNNING_VSOCKS.lock().unwrap().get(&ctx_id).cloned() {
+        Some(vsock) => vsock,
+        None => return -libc::ENOENT,
+    };
+
+    let connection = {
+        let mut vsock = vsock.lock().unwrap();
+        match vsock.connect(port) {
+            Ok(connection) => connection,
+            Err(error) => return -error.raw_os_error().unwrap_or(libc::EIO),
+        }
+    };
+
+    match connection.wait() {
+        Ok(fd) => fd.into_raw_fd(),
+        Err(error) => -error.raw_os_error().unwrap_or(libc::EIO),
+    }
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_console_output(ctx_id: u32, c_filepath: *const c_char) -> i32 {
@@ -3200,6 +3229,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     }
 
+    let running_vsock = ctx_cfg.vmr.vsock.get().cloned();
+
     let (sender, _receiver) = unbounded();
 
     let _vmm = match vmm::builder::build_microvm(
@@ -3234,6 +3265,9 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     };
     RUNNING_VMM_STOPS.lock().unwrap().insert(ctx_id, stop_event);
+    if let Some(vsock) = running_vsock {
+        RUNNING_VSOCKS.lock().unwrap().insert(ctx_id, vsock);
+    }
     let _running_vmm_stop_guard = RunningVmmStopGuard(ctx_id);
 
     #[cfg(target_os = "macos")]
@@ -3330,6 +3364,12 @@ mod native_context_tests {
     #[test]
     fn vmm_stop_request_rejects_unknown_context() {
         assert_eq!(krun_request_vmm_stop(u32::MAX), -libc::ENOENT);
+    }
+
+    #[test]
+    fn vsock_connect_rejects_invalid_requests() {
+        assert_eq!(krun_vsock_connect(u32::MAX, 0), -libc::EINVAL);
+        assert_eq!(krun_vsock_connect(u32::MAX, 1024), -libc::ENOENT);
     }
 
     #[test]

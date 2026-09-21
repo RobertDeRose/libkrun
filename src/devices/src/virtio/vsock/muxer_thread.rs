@@ -107,36 +107,42 @@ impl MuxerThread {
         let mut should_signal = update.signal_queue;
 
         if let Some((peer_port, accept_fd, family, proxy_type)) = update.new_proxy {
-            let local_port: u32 = thread_rng.random_range(1024..u32::MAX);
-            let new_id: u64 = ((peer_port as u64) << 32) | (local_port as u64);
-            let new_proxy: Box<dyn Proxy> = match proxy_type {
-                NewProxyType::Tcp => Box::new(TsiStreamProxy::new_reverse(
-                    new_id,
-                    self.cid,
-                    id,
-                    family,
-                    local_port,
-                    peer_port,
-                    accept_fd,
-                    self.mem.clone(),
-                    self.queue.clone(),
-                    self.rxq.clone(),
-                )),
-                NewProxyType::Unix => Box::new(UnixProxy::new_reverse(
-                    new_id,
-                    self.cid,
-                    local_port,
-                    peer_port,
-                    accept_fd,
-                    self.mem.clone(),
-                    self.queue.clone(),
-                    self.rxq.clone(),
-                )),
+            let new_id = {
+                let mut proxy_map = self.proxy_map.write().unwrap();
+                let local_port = loop {
+                    let local_port = thread_rng.random_range(1024..u32::MAX);
+                    if !proxy_map.keys().any(|id| *id as u32 == local_port) {
+                        break local_port;
+                    }
+                };
+                let new_id: u64 = ((peer_port as u64) << 32) | (local_port as u64);
+                let new_proxy: Box<dyn Proxy> = match proxy_type {
+                    NewProxyType::Tcp => Box::new(TsiStreamProxy::new_reverse(
+                        new_id,
+                        self.cid,
+                        id,
+                        family,
+                        local_port,
+                        peer_port,
+                        accept_fd,
+                        self.mem.clone(),
+                        self.queue.clone(),
+                        self.rxq.clone(),
+                    )),
+                    NewProxyType::Unix => Box::new(UnixProxy::new_reverse(
+                        new_id,
+                        self.cid,
+                        local_port,
+                        peer_port,
+                        accept_fd,
+                        self.mem.clone(),
+                        self.queue.clone(),
+                        self.rxq.clone(),
+                    )),
+                };
+                proxy_map.insert(new_id, Mutex::new(new_proxy));
+                new_id
             };
-            self.proxy_map
-                .write()
-                .unwrap()
-                .insert(new_id, Mutex::new(new_proxy));
             if let Some(proxy) = self.proxy_map.read().unwrap().get(&new_id) {
                 proxy.lock().unwrap().push_op_request();
             };
