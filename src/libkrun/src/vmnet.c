@@ -32,6 +32,9 @@
 #ifndef KRUN_VMNET_TIMEOUT_MS
 #define KRUN_VMNET_TIMEOUT_MS 5000
 #endif
+#ifndef KRUN_VMNET_OFFLOAD_START_TIMEOUT_MS
+#define KRUN_VMNET_OFFLOAD_START_TIMEOUT_MS 15000
+#endif
 
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
 
@@ -92,10 +95,15 @@ static void completion_release(struct completion *completion)
     }
 }
 
-static bool wait_for(dispatch_semaphore_t done)
+static bool wait_for_ms(dispatch_semaphore_t done, int64_t timeout_ms)
 {
     return dispatch_semaphore_wait(
-        done, dispatch_time(DISPATCH_TIME_NOW, KRUN_VMNET_TIMEOUT_MS * NSEC_PER_MSEC)) == 0;
+        done, dispatch_time(DISPATCH_TIME_NOW, timeout_ms * NSEC_PER_MSEC)) == 0;
+}
+
+static bool wait_for(dispatch_semaphore_t done)
+{
+    return wait_for_ms(done, KRUN_VMNET_TIMEOUT_MS);
 }
 
 static const char *vmnet_status_name(vmnet_return_t status)
@@ -625,6 +633,7 @@ static int allocate_packet_batch(
 static int32_t start_interface(
     vmnet_network_ref network,
     xpc_object_t descriptor,
+    bool offload,
     int *out_fd,
     void **out_bridge)
     __attribute__((availability(macos, introduced = 26.0)));
@@ -632,6 +641,7 @@ static int32_t start_interface(
 static int32_t start_interface(
     vmnet_network_ref network,
     xpc_object_t descriptor,
+    bool offload,
     int *out_fd,
     void **out_bridge)
 {
@@ -691,7 +701,10 @@ static int32_t start_interface(
     } else {
         bridge->interface = vmnet_start_interface(descriptor, bridge->queue, started);
     }
-    bool completed = wait_for(completion->done);
+    int64_t start_timeout_ms = offload
+        ? KRUN_VMNET_OFFLOAD_START_TIMEOUT_MS
+        : KRUN_VMNET_TIMEOUT_MS;
+    bool completed = wait_for_ms(completion->done, start_timeout_ms);
     vmnet_return_t status = completed ? completion->status : VMNET_FAILURE;
     uint64_t max_packet_size = completed ? completion->max_packet_size : 0;
     uint64_t read_max_packets = completed ? completion->read_max_packets : 0;
@@ -782,7 +795,7 @@ static int32_t start_network(
     xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, offload);
     xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, offload);
     xpc_dictionary_set_bool(descriptor, vmnet_enable_virtio_header_key, offload);
-    return start_interface(network, descriptor, out_fd, out_bridge);
+    return start_interface(network, descriptor, offload, out_fd, out_bridge);
 }
 
 static int32_t start_shared(
@@ -832,7 +845,7 @@ static int32_t start_shared(
     xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, offload);
     xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, offload);
     xpc_dictionary_set_bool(descriptor, vmnet_enable_virtio_header_key, offload);
-    return start_interface(NULL, descriptor, out_fd, out_bridge);
+    return start_interface(NULL, descriptor, offload, out_fd, out_bridge);
 }
 #endif
 

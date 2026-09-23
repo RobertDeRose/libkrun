@@ -129,7 +129,9 @@ static interface_ref fake_start(xpc_object_t descriptor, dispatch_queue_t queue,
 {
     active_interface = is("null_interface_success") ? NULL : calloc(1, sizeof(struct fake_interface));
     if (active_interface) active_interface->queue = queue;
-    int64_t delay = is("late_start") ? 500 * NSEC_PER_MSEC : 0;
+    int64_t delay = (is("late_start") || is("late_offload_start"))
+        ? 500 * NSEC_PER_MSEC
+        : 0;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), queue, ^{
         assert(!descriptor->allocate_mac); // Descriptor must outlive asynchronous start.
         struct fake_xpc parameters = {
@@ -146,7 +148,7 @@ interface_ref vmnet_interface_start_with_network(vmnet_network_ref network, xpc_
 {
     assert(network == owned_network);
     assert(!descriptor->isolation);
-    bool offload = is("offload_serialized");
+    bool offload = is("offload_serialized") || is("late_offload_start");
     assert(!descriptor->allocate_mac);
     assert(descriptor->tso == offload);
     assert(descriptor->checksum == offload);
@@ -159,7 +161,7 @@ interface_ref vmnet_start_interface(xpc_object_t descriptor, dispatch_queue_t qu
     atomic_fetch_add(&shared_start_calls, 1);
     assert(descriptor->mode == VMNET_SHARED_MODE);
     assert(descriptor->isolation);
-    bool offload = is("offload");
+    bool offload = is("offload") || is("late_offload_start");
     assert(!descriptor->allocate_mac);
     assert(descriptor->tso == offload);
     assert(descriptor->checksum == offload);
@@ -297,7 +299,7 @@ int main(int argc, char **argv)
         return 0;
     }
     bool serialized = is("serialized") || is("serialized_not_authorized") || is("offload_serialized");
-    bool offload = is("offload") || is("offload_serialized");
+    bool offload = is("offload") || is("offload_serialized") || is("late_offload_start");
     int result = serialized ? krun_vmnet_start((void *)1, offload, &fd, &bridge)
                             : krun_vmnet_start_shared(
                                   "192.168.200.1", "255.255.255.0", offload, &fd, &bridge);
