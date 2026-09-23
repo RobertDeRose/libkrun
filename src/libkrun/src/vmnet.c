@@ -22,6 +22,7 @@
 
 #define KRUN_VMNET_MAX_FRAME_SIZE 65550
 #define KRUN_VMNET_SOCKET_RCVBUF (7 * 1024 * 1024)
+#define KRUN_VMNET_MAX_BATCH_PACKETS 64
 #ifndef KRUN_VMNET_TIMEOUT_MS
 #define KRUN_VMNET_TIMEOUT_MS 5000
 #endif
@@ -35,6 +36,8 @@ struct completion {
     dispatch_semaphore_t done;
     vmnet_return_t status;
     uint64_t max_packet_size;
+    uint64_t read_max_packets;
+    uint64_t write_max_packets;
 };
 
 struct krun_vmnet_bridge {
@@ -47,7 +50,14 @@ struct krun_vmnet_bridge {
     pthread_t tx_thread;
     bool tx_started;
     size_t max_packet_size;
-    uint8_t *tx_buffer;
+    size_t read_batch_size;
+    size_t write_batch_size;
+    uint8_t *rx_buffers;
+    struct iovec *rx_iovs;
+    struct vmpktdesc *rx_packets;
+    uint8_t *tx_buffers;
+    struct iovec *tx_iovs;
+    struct vmpktdesc *tx_packets;
     atomic_bool stopping;
 };
 
@@ -178,45 +188,103 @@ static int set_socket_options(int fd)
     return 0;
 }
 
+static void reset_packet_batch(
+    struct krun_vmnet_bridge *bridge,
+    struct iovec *iovs,
+    struct vmpktdesc *packets,
+    uint8_t *buffers,
+    size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        iovs[i].iov_base = buffers + i * bridge->max_packet_size;
+        iovs[i].iov_len = bridge->max_packet_size;
+        packets[i].vm_pkt_size = bridge->max_packet_size;
+        packets[i].vm_pkt_iov = &iovs[i];
+        packets[i].vm_pkt_iovcnt = 1;
+        packets[i].vm_flags = 0;
+    }
+}
+
 static void forward_packets_to_guest(struct krun_vmnet_bridge *bridge, xpc_object_t event)
 {
     if (atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
         return;
     }
     uint64_t available = xpc_dictionary_get_uint64(event, vmnet_estimated_packets_available_key);
-    // Check stopping between packets rather than capping the advertised batch:
+    // Check stopping between batches rather than capping the advertised total:
     // leaving queued frames unread can lose an edge-triggered notification.
     available = available == 0 ? 1 : available;
-    uint8_t *buffer = malloc(bridge->max_packet_size);
-    if (buffer == NULL) {
-        return;
+    while (available > 0 && !atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
+        size_t requested = available < bridge->read_batch_size
+            ? (size_t)available
+            : bridge->read_batch_size;
+        reset_packet_batch(
+            bridge, bridge->rx_iovs, bridge->rx_packets, bridge->rx_buffers, requested);
+        int count = (int)requested;
+        vmnet_return_t status = vmnet_read(bridge->interface, bridge->rx_packets, &count);
+        if (status != VMNET_SUCCESS || count <= 0 || (size_t)count > requested) {
+            break;
+        }
+        for (int i = 0; i < count; i++) {
+            struct vmpktdesc *packet = &bridge->rx_packets[i];
+            if (packet->vm_pkt_size > bridge->max_packet_size) {
+                return;
+            }
+            ssize_t written = send(
+                bridge->fd, packet->vm_pkt_iov->iov_base, packet->vm_pkt_size, 0);
+            if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS) {
+                return;
+            }
+        }
+        available -= (uint64_t)count;
     }
-    for (uint64_t i = 0; i < available; i++) {
-        if (atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
+}
+
+static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
+{
+    size_t count = 0;
+    while (count < bridge->write_batch_size
+           && !atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
+        reset_packet_batch(
+            bridge, &bridge->tx_iovs[count], &bridge->tx_packets[count],
+            bridge->tx_buffers + count * bridge->max_packet_size, 1);
+        struct msghdr message = {.msg_iov = &bridge->tx_iovs[count], .msg_iovlen = 1};
+        ssize_t length = recvmsg(bridge->fd, &message, 0);
+        if (length < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                atomic_store_explicit(&bridge->stopping, true, memory_order_relaxed);
+            }
             break;
         }
-        struct iovec iov = {.iov_base = buffer, .iov_len = bridge->max_packet_size};
-        struct vmpktdesc packet = {
-            .vm_pkt_size = bridge->max_packet_size, .vm_pkt_iov = &iov,
-            .vm_pkt_iovcnt = 1, .vm_flags = 0,
-        };
-        int count = 1;
-        vmnet_return_t status = vmnet_read(bridge->interface, &packet, &count);
-        if (status != VMNET_SUCCESS || count != 1 || packet.vm_pkt_size > bridge->max_packet_size) {
-            break;
+        if (length == 0 || (message.msg_flags & MSG_TRUNC) != 0) {
+            continue;
         }
-        ssize_t written = send(bridge->fd, buffer, packet.vm_pkt_size, 0);
-        if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS) {
-            break;
-        }
+        bridge->tx_iovs[count].iov_len = (size_t)length;
+        bridge->tx_packets[count].vm_pkt_size = (size_t)length;
+        count++;
     }
-    free(buffer);
+    return count;
+}
+
+static void write_packet_batch(struct krun_vmnet_bridge *bridge, size_t received)
+{
+    size_t offset = 0;
+    while (offset < received && !atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
+        int count = (int)(received - offset);
+        vmnet_return_t status = vmnet_write(bridge->interface, &bridge->tx_packets[offset], &count);
+        if (status != VMNET_SUCCESS || count <= 0 || (size_t)count > received - offset) {
+            break;
+        }
+        offset += (size_t)count;
+    }
 }
 
 static void *forward_packets_to_vmnet(void *opaque)
 {
     struct krun_vmnet_bridge *bridge = opaque;
-    uint8_t *buffer = bridge->tx_buffer;
     while (!atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
         struct pollfd pollfd = {.fd = bridge->fd, .events = POLLIN};
         int ready = poll(&pollfd, 1, 100);
@@ -233,28 +301,11 @@ static void *forward_packets_to_vmnet(void *opaque)
             break;
         }
         while (!atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
-            struct iovec iov = {.iov_base = buffer, .iov_len = bridge->max_packet_size};
-            struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
-            ssize_t length = recvmsg(bridge->fd, &message, 0);
-            if (length < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    atomic_store_explicit(&bridge->stopping, true, memory_order_relaxed);
-                }
+            size_t received = receive_packet_batch(bridge);
+            if (received == 0) {
                 break;
             }
-            if (length == 0 || (message.msg_flags & MSG_TRUNC) != 0) {
-                continue;
-            }
-            iov.iov_len = (size_t)length;
-            struct vmpktdesc packet = {
-                .vm_pkt_size = (size_t)length, .vm_pkt_iov = &iov,
-                .vm_pkt_iovcnt = 1, .vm_flags = 0,
-            };
-            int count = 1;
-            (void)vmnet_write(bridge->interface, &packet, &count);
+            write_packet_batch(bridge, received);
         }
     }
     dispatch_semaphore_signal(bridge->tx_done);
@@ -278,7 +329,12 @@ static void destroy_bridge(struct krun_vmnet_bridge *bridge)
     if (bridge->network != NULL) {
         CFRelease(bridge->network);
     }
-    free(bridge->tx_buffer);
+    free(bridge->rx_packets);
+    free(bridge->rx_iovs);
+    free(bridge->rx_buffers);
+    free(bridge->tx_packets);
+    free(bridge->tx_iovs);
+    free(bridge->tx_buffers);
     free(bridge);
 }
 
@@ -346,6 +402,36 @@ static bool stop_bridge(struct krun_vmnet_bridge *bridge)
     return true;
 }
 
+static size_t batch_size(uint64_t advertised)
+{
+    if (advertised == 0) {
+        return 1;
+    }
+    return advertised < KRUN_VMNET_MAX_BATCH_PACKETS
+        ? (size_t)advertised
+        : KRUN_VMNET_MAX_BATCH_PACKETS;
+}
+
+static int allocate_packet_batch(
+    struct krun_vmnet_bridge *bridge,
+    size_t count,
+    uint8_t **buffers,
+    struct iovec **iovs,
+    struct vmpktdesc **packets)
+{
+    if (count > SIZE_MAX / bridge->max_packet_size) {
+        return -ENOMEM;
+    }
+    *buffers = malloc(count * bridge->max_packet_size);
+    *iovs = calloc(count, sizeof(**iovs));
+    *packets = calloc(count, sizeof(**packets));
+    if (*buffers == NULL || *iovs == NULL || *packets == NULL) {
+        return -ENOMEM;
+    }
+    reset_packet_batch(bridge, *iovs, *packets, *buffers, count);
+    return 0;
+}
+
 // Takes ownership of network (when non-NULL) and descriptor, including on failure.
 static int32_t start_interface(
     vmnet_network_ref network,
@@ -404,6 +490,8 @@ static int32_t start_interface(
         completion->status = status;
         if (status == VMNET_SUCCESS && parameters != NULL) {
             completion->max_packet_size = xpc_dictionary_get_uint64(parameters, vmnet_max_packet_size_key);
+            completion->read_max_packets = xpc_dictionary_get_uint64(parameters, vmnet_read_max_packets_key);
+            completion->write_max_packets = xpc_dictionary_get_uint64(parameters, vmnet_write_max_packets_key);
         }
         dispatch_semaphore_signal(completion->done);
         completion_release(completion);
@@ -417,6 +505,8 @@ static int32_t start_interface(
     bool completed = wait_for(completion->done);
     vmnet_return_t status = completed ? completion->status : VMNET_FAILURE;
     uint64_t max_packet_size = completed ? completion->max_packet_size : 0;
+    uint64_t read_max_packets = completed ? completion->read_max_packets : 0;
+    uint64_t write_max_packets = completed ? completion->write_max_packets : 0;
     completion_release(completion);
     if (!completed) {
         close(sockets[0]);
@@ -440,11 +530,20 @@ static int32_t start_interface(
         return -EMSGSIZE;
     }
     bridge->max_packet_size = (size_t)max_packet_size;
-    bridge->tx_buffer = malloc(bridge->max_packet_size);
-    if (bridge->tx_buffer == NULL) {
+    bridge->read_batch_size = batch_size(read_max_packets);
+    bridge->write_batch_size = batch_size(write_max_packets);
+    result = allocate_packet_batch(
+        bridge, bridge->read_batch_size,
+        &bridge->rx_buffers, &bridge->rx_iovs, &bridge->rx_packets);
+    if (result == 0) {
+        result = allocate_packet_batch(
+            bridge, bridge->write_batch_size,
+            &bridge->tx_buffers, &bridge->tx_iovs, &bridge->tx_packets);
+    }
+    if (result != 0) {
         close(sockets[0]);
         (void)stop_bridge(bridge);
-        return -ENOMEM;
+        return result;
     }
     status = vmnet_interface_set_event_callback(
         bridge->interface, VMNET_INTERFACE_PACKETS_AVAILABLE, bridge->queue,

@@ -6,7 +6,8 @@ queues, Blocks, pthreads, and Unix datagram sockets. Run with `ASAN=1` for addre
 sanitization. Linux needs the Swift toolchain's libdispatch/BlocksRuntime; set
 `SWIFT_LIBRARY_PATH` when they are installed elsewhere. macOS uses system dispatch.
 
-These tests exercise raw frames in both directions, truncation rejection, static
+These tests exercise raw frames in both directions, advertised vmnet packet batching, partial
+write completion, batch-size capping, truncation rejection, static
 subnet validation, shared-interface descriptor construction, serialized-network
 compatibility, permission/start/event failures, resource release, and callbacks
 arriving after timed-out start/stop calls. Timeout paths deliberately

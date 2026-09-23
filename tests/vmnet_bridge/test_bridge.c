@@ -12,6 +12,8 @@ struct fake_xpc {
     bool tso;
     bool checksum;
     uint64_t size;
+    uint64_t read_max_packets;
+    uint64_t write_max_packets;
     uint64_t mode;
     char start[INET_ADDRSTRLEN];
     char end[INET_ADDRSTRLEN];
@@ -22,6 +24,9 @@ struct fake_network { struct in_addr address, mask; };
 struct fake_interface { void (^event)(interface_event_t, xpc_object_t); dispatch_queue_t queue; };
 static const char *scenario;
 static atomic_int writes;
+static atomic_int max_write_batch;
+static atomic_int max_read_batch;
+static atomic_int write_calls;
 static atomic_int reads_pending;
 static atomic_int network_releases;
 static atomic_int network_create_calls;
@@ -61,7 +66,13 @@ void xpc_dictionary_set_string(xpc_object_t object, const char *key, const char 
     strcpy(target, value);
 }
 uint64_t xpc_dictionary_get_uint64(xpc_object_t object, const char *key)
-{ (void)key; return object->size; }
+{
+    if (strcmp(key, "max_packet") == 0) return object->size;
+    if (strcmp(key, "read_max_packets") == 0) return object->read_max_packets;
+    if (strcmp(key, "write_max_packets") == 0) return object->write_max_packets;
+    if (strcmp(key, "estimated") == 0) return object->size;
+    abort();
+}
 void xpc_release(xpc_object_t object) { free(object); }
 vmnet_network_configuration_ref vmnet_network_configuration_create(int mode, vmnet_return_t *status)
 {
@@ -119,7 +130,11 @@ static interface_ref fake_start(xpc_object_t descriptor, dispatch_queue_t queue,
     int64_t delay = is("late_start") ? 500 * NSEC_PER_MSEC : 0;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), queue, ^{
         assert(!descriptor->allocate_mac); // Descriptor must outlive asynchronous start.
-        struct fake_xpc parameters = {.size = is("invalid_packet_size") ? 0 : 2048};
+        struct fake_xpc parameters = {
+            .size = is("invalid_packet_size") ? 0 : 2048,
+            .read_max_packets = is("batch_cap") ? 128 : 8,
+            .write_max_packets = is("batch_cap") ? 128 : 8,
+        };
         callback((is("start_failure") || is("permission")) ? VMNET_INVALID_ACCESS : VMNET_SUCCESS, &parameters);
     });
     return active_interface;
@@ -165,18 +180,36 @@ vmnet_return_t vmnet_stop_interface(interface_ref interface, dispatch_queue_t qu
 vmnet_return_t vmnet_read(interface_ref interface, struct vmpktdesc *packets, int *count)
 {
     (void)interface;
-    if (atomic_load(&reads_pending) > 0) {
-        atomic_fetch_sub(&reads_pending, 1);
-        memcpy(packets->vm_pkt_iov->iov_base, "native-reply", 12);
-        packets->vm_pkt_size = 12; *count = 1;
-    } else { *count = 0; }
+    int requested = *count;
+    int current = atomic_load(&max_read_batch);
+    while (requested > current
+           && !atomic_compare_exchange_weak(&max_read_batch, &current, requested)) {}
+    int pending = atomic_load(&reads_pending);
+    int returned = pending < requested ? pending : requested;
+    for (int i = 0; i < returned; i++) {
+        memcpy(packets[i].vm_pkt_iov->iov_base, "native-reply", 12);
+        packets[i].vm_pkt_size = 12;
+    }
+    if (returned > 0) atomic_fetch_sub(&reads_pending, returned);
+    *count = returned;
     return VMNET_SUCCESS;
 }
 vmnet_return_t vmnet_write(interface_ref interface, struct vmpktdesc *packets, int *count)
 {
     (void)interface;
-    assert(*count == 1 && packets->vm_pkt_size > 0);
-    atomic_fetch_add(&writes, 1);
+    assert(*count > 0 && *count <= 8);
+    for (int i = 0; i < *count; i++) assert(packets[i].vm_pkt_size > 0);
+    int current = atomic_load(&max_write_batch);
+    while (*count > current
+           && !atomic_compare_exchange_weak(&max_write_batch, &current, *count)) {}
+    if ((is("batched_io") || is("partial_write")) && *count == 1) usleep(5000);
+    int written = *count;
+    if (is("partial_write") && written > 1) {
+        written = 1;
+        *count = 1;
+    }
+    atomic_fetch_add(&write_calls, 1);
+    atomic_fetch_add(&writes, written);
     return VMNET_SUCCESS;
 }
 
@@ -228,6 +261,14 @@ int main(int argc, char **argv)
         if (is("late_start")) usleep(650000); // Exercise callback after caller returned; ASan must remain quiet.
     } else {
         assert(fd >= 0 && bridge != NULL);
+        struct krun_vmnet_bridge *native_bridge = bridge;
+        if (is("batch_cap")) {
+            assert(native_bridge->read_batch_size == KRUN_VMNET_MAX_BATCH_PACKETS);
+            assert(native_bridge->write_batch_size == KRUN_VMNET_MAX_BATCH_PACKETS);
+        } else {
+            assert(native_bridge->read_batch_size == 8);
+            assert(native_bridge->write_batch_size == 8);
+        }
         assert((fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0);
         assert((fcntl(fd, F_GETFL) & O_NONBLOCK) != 0);
         assert(send(fd, "native-frame", 12, 0) == 12);
@@ -240,6 +281,24 @@ int main(int argc, char **argv)
         });
         char data[32];
         assert(recv(fd, data, sizeof(data), 0) == 12 && memcmp(data, "native-reply", 12) == 0);
+        if (is("batched_io") || is("partial_write")) {
+            for (int i = 0; i < 16; i++) assert(send(fd, "batch-frame", 11, 0) == 11);
+            for (int i = 0; i < 200 && atomic_load(&writes) < 17; i++) usleep(1000);
+            assert(atomic_load(&writes) == 17);
+            assert(atomic_load(&max_write_batch) > 1);
+            if (is("partial_write")) assert(atomic_load(&write_calls) > 2);
+
+            atomic_store(&reads_pending, 4);
+            dispatch_sync(active_interface->queue, ^{
+                struct fake_xpc event = {.size = 4};
+                active_interface->event(VMNET_INTERFACE_PACKETS_AVAILABLE, &event);
+            });
+            assert(atomic_load(&max_read_batch) >= 4);
+            for (int i = 0; i < 4; i++) {
+                assert(recv(fd, data, sizeof(data), 0) == 12);
+                assert(memcmp(data, "native-reply", 12) == 0);
+            }
+        }
         if (is("truncated_frame")) {
             char huge[4096] = {0};
             assert(send(fd, huge, sizeof(huge), 0) == sizeof(huge));
