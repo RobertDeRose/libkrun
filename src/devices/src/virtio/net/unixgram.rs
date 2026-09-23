@@ -47,6 +47,7 @@ pub struct Unixgram {
     fd: OwnedFd,
     retries: u64,
     batched: bool,
+    virtio_header: bool,
     tx_batch: Vec<u8>,
     tx_count: usize,
     rx_datagram: Vec<u8>,
@@ -59,16 +60,16 @@ pub struct Unixgram {
 impl Unixgram {
     /// Create the backend with a pre-established connection to the userspace network proxy.
     pub fn new(fd: OwnedFd) -> Self {
-        Self::with_batching(fd, false)
+        Self::with_batching(fd, false, false)
     }
 
     /// Create the backend for libkrun's private native-vmnet socketpair.
     #[cfg(target_os = "macos")]
-    pub fn new_batched(fd: OwnedFd) -> Self {
-        Self::with_batching(fd, true)
+    pub fn new_batched(fd: OwnedFd, virtio_header: bool) -> Self {
+        Self::with_batching(fd, true, virtio_header)
     }
 
-    fn with_batching(fd: OwnedFd, batched: bool) -> Self {
+    fn with_batching(fd: OwnedFd, batched: bool, virtio_header: bool) -> Self {
         // Ensure the socket is in non-blocking mode.
         match fcntl(&fd, FcntlArg::F_GETFL) {
             Ok(flags) => match OFlag::from_bits(flags) {
@@ -103,6 +104,7 @@ impl Unixgram {
             fd,
             retries: 0,
             batched,
+            virtio_header,
             tx_batch,
             tx_count: 0,
             rx_datagram: vec![0; MAX_BUFFER_SIZE],
@@ -293,9 +295,18 @@ impl Unixgram {
     }
 
     fn copy_next_rx_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
-        let hdr_len = write_virtio_net_hdr(buf);
         let index = self.rx_index;
         let frame_length = self.rx_lengths[index];
+        let hdr_len = if self.virtio_header {
+            if frame_length < VNET_HDR_LEN {
+                self.rx_count = 0;
+                self.rx_index = 0;
+                return Err(ReadError::Internal(nix::Error::EINVAL));
+            }
+            0
+        } else {
+            write_virtio_net_hdr(buf)
+        };
         if frame_length > buf.len() - hdr_len {
             self.rx_count = 0;
             self.rx_index = 0;
@@ -336,7 +347,14 @@ impl NetBackend for Unixgram {
             if self.parse_rx_batch(frame_length) {
                 return self.copy_next_rx_frame(buf);
             }
-            let hdr_len = write_virtio_net_hdr(buf);
+            let hdr_len = if self.virtio_header {
+                if frame_length < VNET_HDR_LEN {
+                    return Err(ReadError::Internal(nix::Error::EINVAL));
+                }
+                0
+            } else {
+                write_virtio_net_hdr(buf)
+            };
             if frame_length > buf.len() - hdr_len {
                 return Err(ReadError::Internal(nix::Error::EMSGSIZE));
             }
@@ -362,7 +380,8 @@ impl NetBackend for Unixgram {
     /// Try to write a frame to the proxy.
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
         if self.batched {
-            return self.queue_batch_frame(&buf[hdr_len..]);
+            let start = if self.virtio_header { 0 } else { hdr_len };
+            return self.queue_batch_frame(&buf[start..]);
         }
         let result = self.send_datagram(&buf[hdr_len..]);
         if result.is_ok() {

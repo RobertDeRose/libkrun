@@ -62,10 +62,11 @@ impl NetWorker {
                 Box::new(Unixgram::new(owned_fd)) as Box<dyn NetBackend + Send>
             }
             #[cfg(target_os = "macos")]
-            VirtioNetBackend::VmnetFd(fd) => {
+            VirtioNetBackend::VmnetFd(fd, virtio_header) => {
                 // SAFETY: the native vmnet bridge created and transferred this socketpair fd.
                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-                Box::new(Unixgram::new_batched(owned_fd)) as Box<dyn NetBackend + Send>
+                Box::new(Unixgram::new_batched(owned_fd, virtio_header))
+                    as Box<dyn NetBackend + Send>
             }
             VirtioNetBackend::UnixgramPath(path, vfkit_magic) => {
                 Box::new(Unixgram::open(path, vfkit_magic)?) as Box<dyn NetBackend + Send>

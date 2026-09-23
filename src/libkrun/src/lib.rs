@@ -152,12 +152,14 @@ impl KrunfwBindings {
 extern "C" {
     fn krun_vmnet_start(
         network_serialization: *const c_void,
+        enable_offload: c_int,
         out_fd: *mut c_int,
         out_bridge: *mut *mut c_void,
     ) -> c_int;
     fn krun_vmnet_start_shared(
         gateway: *const c_char,
         netmask: *const c_char,
+        enable_offload: c_int,
         out_fd: *mut c_int,
         out_bridge: *mut *mut c_void,
     ) -> c_int;
@@ -1089,6 +1091,13 @@ const NET_ALL_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_HOST_TSO4
     | NET_FEATURE_HOST_TSO6
     | NET_FEATURE_HOST_UFO;
+#[cfg(feature = "net")]
+const NET_VMNET_OFFLOAD_FEATURES: u32 = NET_FEATURE_CSUM
+    | NET_FEATURE_GUEST_CSUM
+    | NET_FEATURE_GUEST_TSO4
+    | NET_FEATURE_GUEST_TSO6
+    | NET_FEATURE_HOST_TSO4
+    | NET_FEATURE_HOST_TSO6;
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
@@ -1216,7 +1225,7 @@ unsafe fn add_vmnet_backend(
     c_mac: *const u8,
     features: u32,
     flags: u32,
-    start: impl FnOnce(*mut c_int, *mut *mut c_void) -> c_int,
+    start: impl FnOnce(c_int, *mut c_int, *mut *mut c_void) -> c_int,
 ) -> i32 {
     if c_mac.is_null()
         || (features & !NET_ALL_FEATURES) != 0
@@ -1224,8 +1233,9 @@ unsafe fn add_vmnet_backend(
     {
         return -libc::EINVAL;
     }
-    // Raw Ethernet only: do not advertise unsupported virtio offloads.
-    if features != 0 {
+    // Native vmnet exposes checksum/TSO as one transport capability. Keep
+    // feature negotiation all-or-nothing so virtio and vmnet cannot disagree.
+    if features != 0 && features != NET_VMNET_OFFLOAD_FEATURES {
         return -libc::ENOTSUP;
     }
     if !CTX_MAP.lock().unwrap().contains_key(&ctx_id) {
@@ -1237,7 +1247,7 @@ unsafe fn add_vmnet_backend(
     }
     let mut fd = -1;
     let mut bridge = std::ptr::null_mut();
-    let result = start(&mut fd, &mut bridge);
+    let result = start((features != 0) as c_int, &mut fd, &mut bridge);
     if result != 0 {
         return result;
     }
@@ -1253,7 +1263,12 @@ unsafe fn add_vmnet_backend(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            create_virtio_net(cfg, VirtioNetBackend::VmnetFd(fd), mac, features);
+            create_virtio_net(
+                cfg,
+                VirtioNetBackend::VmnetFd(fd, features != 0),
+                mac,
+                features,
+            );
             cfg.vmnet_bridges.push(VmnetBridge(bridge));
             if flags & NET_FLAG_DHCP_CLIENT != 0 {
                 cfg.vmr.dhcp_client = true;
@@ -1281,8 +1296,8 @@ pub unsafe extern "C" fn krun_add_net_vmnet(
     if network_serialization.is_null() {
         return -libc::EINVAL;
     }
-    add_vmnet_backend(ctx_id, c_mac, features, flags, |fd, bridge| {
-        krun_vmnet_start(network_serialization, fd, bridge)
+    add_vmnet_backend(ctx_id, c_mac, features, flags, |offload, fd, bridge| {
+        krun_vmnet_start(network_serialization, offload, fd, bridge)
     })
 }
 
@@ -1301,8 +1316,8 @@ pub unsafe extern "C" fn krun_add_net_vmnet_shared(
     if gateway.is_null() || netmask.is_null() || flags != 0 {
         return -libc::EINVAL;
     }
-    add_vmnet_backend(ctx_id, c_mac, features, flags, |fd, bridge| {
-        krun_vmnet_start_shared(gateway, netmask, fd, bridge)
+    add_vmnet_backend(ctx_id, c_mac, features, flags, |offload, fd, bridge| {
+        krun_vmnet_start_shared(gateway, netmask, offload, fd, bridge)
     })
 }
 
