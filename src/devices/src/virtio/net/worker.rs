@@ -233,7 +233,7 @@ impl NetWorker {
         {
             Ok(()) => self.process_tx_loop(),
             Err(WriteError::PartialWrite | WriteError::NothingWritten) => {}
-            Err(e @ WriteError::Internal(_) | e @ WriteError::GuestMemory(_)) => {
+            Err(e @ WriteError::Internal(_)) => {
                 log::error!("Failed to finish write: {e:?}");
             }
             Err(e @ WriteError::ProcessNotRunning) => {
@@ -338,28 +338,6 @@ impl NetWorker {
                 next_desc = desc.next_descriptor();
             }
 
-            match self.backend.write_frame_from_guest(
-                VNET_HDR_LEN,
-                &self.mem,
-                &self.tx_iovec,
-            ) {
-                Ok(true) => {
-                    self.tx_frame_len = 0;
-                    tx_queue
-                        .add_used(&self.mem, head_index, 0)
-                        .map_err(TxError::QueueError)?;
-                    raise_irq = true;
-                    continue;
-                }
-                Ok(false) => {}
-                Err(WriteError::NothingWritten | WriteError::PartialWrite) => {
-                    tx_queue.undo_pop();
-                    result = Err(TxError::Backend(WriteError::NothingWritten));
-                    break;
-                }
-                Err(e) => return Err(TxError::Backend(e)),
-            }
-
             // Copy buffer from across multiple descriptors.
             let mut read_count = 0;
             for (desc_addr, desc_len) in self.tx_iovec.drain(..) {
@@ -416,11 +394,9 @@ impl NetWorker {
                     raise_irq = true;
                     break;
                 }
-                Err(
-                    e @ WriteError::Internal(_)
-                    | e @ WriteError::GuestMemory(_)
-                    | e @ WriteError::ProcessNotRunning,
-                ) => return Err(TxError::Backend(e)),
+                Err(e @ WriteError::Internal(_) | e @ WriteError::ProcessNotRunning) => {
+                    return Err(TxError::Backend(e))
+                }
             }
         }
 

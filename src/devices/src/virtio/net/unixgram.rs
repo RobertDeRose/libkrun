@@ -8,7 +8,6 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicU32, Ordering};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
 use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
 use super::{write_virtio_net_hdr, MAX_BUFFER_SIZE, VNET_HDR_LEN};
@@ -224,67 +223,6 @@ impl Unixgram {
         result
     }
 
-    fn queue_batch_guest_frame(
-        &mut self,
-        hdr_len: usize,
-        mem: &GuestMemoryMmap,
-        iovec: &[(GuestAddress, usize)],
-    ) -> Result<bool, WriteError> {
-        if !self.batched {
-            return Ok(false);
-        }
-
-        let total_len = iovec.iter().try_fold(0usize, |total, (_, len)| {
-            total.checked_add(*len).ok_or(WriteError::Internal(nix::Error::EINVAL))
-        })?;
-        if total_len < hdr_len || total_len > MAX_BUFFER_SIZE {
-            return Ok(false);
-        }
-
-        let frame_len = total_len - hdr_len;
-        if frame_len + VMNET_BATCH_HEADER_LEN + VMNET_BATCH_FRAME_HEADER_LEN
-            > VMNET_BATCH_MAX_DATAGRAM
-        {
-            return Ok(false);
-        }
-
-        if self.tx_count == VMNET_BATCH_MAX_FRAMES
-            || self.tx_batch.len() + VMNET_BATCH_FRAME_HEADER_LEN + frame_len
-                > VMNET_BATCH_MAX_DATAGRAM
-        {
-            self.flush_batch()?;
-        }
-
-        let original_len = self.tx_batch.len();
-        self.tx_batch
-            .extend_from_slice(&(frame_len as u32).to_be_bytes());
-        let payload_start = self.tx_batch.len();
-        self.tx_batch.resize(payload_start + frame_len, 0);
-
-        let mut skip = hdr_len;
-        let mut dst = payload_start;
-        for &(addr, len) in iovec {
-            if skip >= len {
-                skip -= len;
-                continue;
-            }
-
-            let offset = skip;
-            skip = 0;
-            let copy_len = len - offset;
-            let src = addr.unchecked_add(offset as u64);
-            if let Err(e) = mem.read_slice(&mut self.tx_batch[dst..dst + copy_len], src) {
-                self.tx_batch.truncate(original_len);
-                return Err(WriteError::GuestMemory(e));
-            }
-            dst += copy_len;
-        }
-
-        debug_assert_eq!(dst, payload_start + frame_len);
-        self.tx_count += 1;
-        Ok(true)
-    }
-
     fn queue_batch_frame(&mut self, frame: &[u8]) -> Result<(), WriteError> {
         // Preserve support for unusually large frames: a raw datagram has no
         // batch-envelope overhead and matches the historical transport. Batch
@@ -431,15 +369,6 @@ impl NetBackend for Unixgram {
             debug!("Written eth frame to proxy: {} bytes", buf.len() - hdr_len);
         }
         result
-    }
-
-    fn write_frame_from_guest(
-        &mut self,
-        hdr_len: usize,
-        mem: &GuestMemoryMmap,
-        iovec: &[(GuestAddress, usize)],
-    ) -> Result<bool, WriteError> {
-        self.queue_batch_guest_frame(hdr_len, mem, iovec)
     }
 
     fn has_unfinished_write(&self) -> bool {
