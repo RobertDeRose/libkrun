@@ -16,7 +16,6 @@ enum { VMNET_SHARED_MODE = 1, VMNET_INTERFACE_PACKETS_AVAILABLE = 1 };
 #define vmnet_enable_isolation_key "isolation"
 #define vmnet_enable_tso_key "tso"
 #define vmnet_enable_checksum_offload_key "checksum"
-#define vmnet_enable_virtio_header_key "virtio_header"
 #define vmnet_max_packet_size_key "max_packet"
 #define vmnet_read_max_packets_key "read_max_packets"
 #define vmnet_write_max_packets_key "write_max_packets"

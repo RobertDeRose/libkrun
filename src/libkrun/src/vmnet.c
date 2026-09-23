@@ -20,7 +20,7 @@
 #include <vmnet/vmnet.h>
 #include <xpc/xpc.h>
 
-#define KRUN_VMNET_MAX_FRAME_SIZE 65562
+#define KRUN_VMNET_MAX_FRAME_SIZE 65550
 #define KRUN_VMNET_SOCKET_RCVBUF (7 * 1024 * 1024)
 #define KRUN_VMNET_MAX_BATCH_PACKETS 64
 #define KRUN_VMNET_SOCKET_BATCH_MAGIC "KRUNVMN1"
@@ -31,9 +31,6 @@
 #define KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM (60 * 1024)
 #ifndef KRUN_VMNET_TIMEOUT_MS
 #define KRUN_VMNET_TIMEOUT_MS 5000
-#endif
-#ifndef KRUN_VMNET_OFFLOAD_START_TIMEOUT_MS
-#define KRUN_VMNET_OFFLOAD_START_TIMEOUT_MS 15000
 #endif
 
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
@@ -95,15 +92,10 @@ static void completion_release(struct completion *completion)
     }
 }
 
-static bool wait_for_ms(dispatch_semaphore_t done, int64_t timeout_ms)
-{
-    return dispatch_semaphore_wait(
-        done, dispatch_time(DISPATCH_TIME_NOW, timeout_ms * NSEC_PER_MSEC)) == 0;
-}
-
 static bool wait_for(dispatch_semaphore_t done)
 {
-    return wait_for_ms(done, KRUN_VMNET_TIMEOUT_MS);
+    return dispatch_semaphore_wait(
+        done, dispatch_time(DISPATCH_TIME_NOW, KRUN_VMNET_TIMEOUT_MS * NSEC_PER_MSEC)) == 0;
 }
 
 static const char *vmnet_status_name(vmnet_return_t status)
@@ -633,7 +625,6 @@ static int allocate_packet_batch(
 static int32_t start_interface(
     vmnet_network_ref network,
     xpc_object_t descriptor,
-    bool offload,
     int *out_fd,
     void **out_bridge)
     __attribute__((availability(macos, introduced = 26.0)));
@@ -641,7 +632,6 @@ static int32_t start_interface(
 static int32_t start_interface(
     vmnet_network_ref network,
     xpc_object_t descriptor,
-    bool offload,
     int *out_fd,
     void **out_bridge)
 {
@@ -701,10 +691,7 @@ static int32_t start_interface(
     } else {
         bridge->interface = vmnet_start_interface(descriptor, bridge->queue, started);
     }
-    int64_t start_timeout_ms = offload
-        ? KRUN_VMNET_OFFLOAD_START_TIMEOUT_MS
-        : KRUN_VMNET_TIMEOUT_MS;
-    bool completed = wait_for_ms(completion->done, start_timeout_ms);
+    bool completed = wait_for(completion->done);
     vmnet_return_t status = completed ? completion->status : VMNET_FAILURE;
     uint64_t max_packet_size = completed ? completion->max_packet_size : 0;
     uint64_t read_max_packets = completed ? completion->read_max_packets : 0;
@@ -778,12 +765,10 @@ static int32_t start_interface(
     return 0;
 }
 
-static int32_t start_network(
-    vmnet_network_ref network, bool isolated, bool offload, int *out_fd, void **out_bridge)
+static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_fd, void **out_bridge)
     __attribute__((availability(macos, introduced = 26.0)));
 
-static int32_t start_network(
-    vmnet_network_ref network, bool isolated, bool offload, int *out_fd, void **out_bridge)
+static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_fd, void **out_bridge)
 {
     xpc_object_t descriptor = xpc_dictionary_create(NULL, NULL, 0);
     if (descriptor == NULL) {
@@ -792,18 +777,15 @@ static int32_t start_network(
     }
     xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, false);
     xpc_dictionary_set_bool(descriptor, vmnet_enable_isolation_key, isolated);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, offload);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, offload);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_virtio_header_key, offload);
-    return start_interface(network, descriptor, offload, out_fd, out_bridge);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, false);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, false);
+    return start_interface(network, descriptor, out_fd, out_bridge);
 }
 
-static int32_t start_shared(
-    const char *gateway, const char *netmask, bool offload, int *out_fd, void **out_bridge)
+static int32_t start_shared(const char *gateway, const char *netmask, int *out_fd, void **out_bridge)
     __attribute__((availability(macos, introduced = 26.0)));
 
-static int32_t start_shared(
-    const char *gateway, const char *netmask, bool offload, int *out_fd, void **out_bridge)
+static int32_t start_shared(const char *gateway, const char *netmask, int *out_fd, void **out_bridge)
 {
     struct in_addr address, mask;
     if (inet_pton(AF_INET, gateway, &address) != 1 || inet_pton(AF_INET, netmask, &mask) != 1) {
@@ -842,15 +824,13 @@ static int32_t start_shared(
     xpc_dictionary_set_string(descriptor, vmnet_subnet_mask_key, netmask);
     xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, false);
     xpc_dictionary_set_bool(descriptor, vmnet_enable_isolation_key, true);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, offload);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, offload);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_virtio_header_key, offload);
-    return start_interface(NULL, descriptor, offload, out_fd, out_bridge);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, false);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, false);
+    return start_interface(NULL, descriptor, out_fd, out_bridge);
 }
 #endif
 
-int32_t krun_vmnet_start(
-    const void *network_serialization, int enable_offload, int *out_fd, void **out_bridge)
+int32_t krun_vmnet_start(const void *network_serialization, int *out_fd, void **out_bridge)
 {
     if (network_serialization == NULL || out_fd == NULL || out_bridge == NULL) {
         return -EINVAL;
@@ -867,14 +847,13 @@ int32_t krun_vmnet_start(
             }
             return vmnet_framework_error("vmnet_network_create_with_serialization", status);
         }
-        return start_network(network, false, enable_offload != 0, out_fd, out_bridge);
+        return start_network(network, false, out_fd, out_bridge);
     }
 #endif
     return -ENOTSUP;
 }
 
-int32_t krun_vmnet_start_shared(
-    const char *gateway, const char *netmask, int enable_offload, int *out_fd, void **out_bridge)
+int32_t krun_vmnet_start_shared(const char *gateway, const char *netmask, int *out_fd, void **out_bridge)
 {
     if (gateway == NULL || netmask == NULL || out_fd == NULL || out_bridge == NULL) {
         return -EINVAL;
@@ -883,7 +862,7 @@ int32_t krun_vmnet_start_shared(
     *out_bridge = NULL;
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
     if (__builtin_available(macOS 26.0, *)) {
-        return start_shared(gateway, netmask, enable_offload != 0, out_fd, out_bridge);
+        return start_shared(gateway, netmask, out_fd, out_bridge);
     }
 #endif
     return -ENOTSUP;

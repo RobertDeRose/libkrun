@@ -11,7 +11,6 @@ struct fake_xpc {
     bool allocate_mac;
     bool tso;
     bool checksum;
-    bool virtio_header;
     uint64_t size;
     uint64_t read_max_packets;
     uint64_t write_max_packets;
@@ -49,7 +48,6 @@ void xpc_dictionary_set_bool(xpc_object_t object, const char *key, bool value)
     else if (strcmp(key, "allocate_mac") == 0) object->allocate_mac = value;
     else if (strcmp(key, "tso") == 0) object->tso = value;
     else if (strcmp(key, "checksum") == 0) object->checksum = value;
-    else if (strcmp(key, "virtio_header") == 0) object->virtio_header = value;
     else abort();
 }
 void xpc_dictionary_set_uint64(xpc_object_t object, const char *key, uint64_t value)
@@ -129,9 +127,7 @@ static interface_ref fake_start(xpc_object_t descriptor, dispatch_queue_t queue,
 {
     active_interface = is("null_interface_success") ? NULL : calloc(1, sizeof(struct fake_interface));
     if (active_interface) active_interface->queue = queue;
-    int64_t delay = (is("late_start") || is("late_offload_start"))
-        ? 500 * NSEC_PER_MSEC
-        : 0;
+    int64_t delay = is("late_start") ? 500 * NSEC_PER_MSEC : 0;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), queue, ^{
         assert(!descriptor->allocate_mac); // Descriptor must outlive asynchronous start.
         struct fake_xpc parameters = {
@@ -148,11 +144,7 @@ interface_ref vmnet_interface_start_with_network(vmnet_network_ref network, xpc_
 {
     assert(network == owned_network);
     assert(!descriptor->isolation);
-    bool offload = is("offload_serialized") || is("late_offload_start");
-    assert(!descriptor->allocate_mac);
-    assert(descriptor->tso == offload);
-    assert(descriptor->checksum == offload);
-    assert(descriptor->virtio_header == offload);
+    assert(!descriptor->allocate_mac && !descriptor->tso && !descriptor->checksum);
     return fake_start(descriptor, queue, callback);
 }
 interface_ref vmnet_start_interface(xpc_object_t descriptor, dispatch_queue_t queue,
@@ -161,11 +153,7 @@ interface_ref vmnet_start_interface(xpc_object_t descriptor, dispatch_queue_t qu
     atomic_fetch_add(&shared_start_calls, 1);
     assert(descriptor->mode == VMNET_SHARED_MODE);
     assert(descriptor->isolation);
-    bool offload = is("offload") || is("late_offload_start");
-    assert(!descriptor->allocate_mac);
-    assert(descriptor->tso == offload);
-    assert(descriptor->checksum == offload);
-    assert(descriptor->virtio_header == offload);
+    assert(!descriptor->allocate_mac && !descriptor->tso && !descriptor->checksum);
     assert(strcmp(descriptor->start, "192.168.200.1") == 0);
     assert(strcmp(descriptor->end, "192.168.200.254") == 0);
     assert(strcmp(descriptor->mask, "255.255.255.0") == 0);
@@ -274,8 +262,8 @@ int main(int argc, char **argv)
     if (is("shared_pair")) {
         int fd2 = -1;
         void *bridge2 = NULL;
-        assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.0", 0, &fd, &bridge) == 0);
-        assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.0", 0, &fd2, &bridge2) == 0);
+        assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.0", &fd, &bridge) == 0);
+        assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.0", &fd2, &bridge2) == 0);
         assert(atomic_load(&shared_start_calls) == 2);
         assert(atomic_load(&network_create_calls) == 0);
         close(fd);
@@ -286,23 +274,21 @@ int main(int argc, char **argv)
         return 0;
     }
     if (is("invalid_arguments")) {
-        assert(krun_vmnet_start_shared(NULL, "255.255.255.0", 0, &fd, &bridge) == -EINVAL);
+        assert(krun_vmnet_start_shared(NULL, "255.255.255.0", &fd, &bridge) == -EINVAL);
         const char *bad_gateway[] = {"garbage", "192.168.200.0", "192.168.200.255", "256.1.1.1"};
         for (unsigned i = 0; i < sizeof(bad_gateway) / sizeof(bad_gateway[0]); i++) {
-            assert(krun_vmnet_start_shared(bad_gateway[i], "255.255.255.0", 0, &fd, &bridge) == -EINVAL);
+            assert(krun_vmnet_start_shared(bad_gateway[i], "255.255.255.0", &fd, &bridge) == -EINVAL);
             assert(fd == -1 && bridge == NULL);
         }
-        assert(krun_vmnet_start_shared("192.168.200.1", "255.0.255.0", 0, &fd, &bridge) == -EINVAL);
-        assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.255", 0, &fd, &bridge) == -EINVAL);
-        assert(krun_vmnet_start_shared("192.168.200.1", "0.0.0.0", 0, &fd, &bridge) == -EINVAL);
+        assert(krun_vmnet_start_shared("192.168.200.1", "255.0.255.0", &fd, &bridge) == -EINVAL);
+        assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.255", &fd, &bridge) == -EINVAL);
+        assert(krun_vmnet_start_shared("192.168.200.1", "0.0.0.0", &fd, &bridge) == -EINVAL);
         puts("PASS: invalid_arguments");
         return 0;
     }
-    bool serialized = is("serialized") || is("serialized_not_authorized") || is("offload_serialized");
-    bool offload = is("offload") || is("offload_serialized") || is("late_offload_start");
-    int result = serialized ? krun_vmnet_start((void *)1, offload, &fd, &bridge)
-                            : krun_vmnet_start_shared(
-                                  "192.168.200.1", "255.255.255.0", offload, &fd, &bridge);
+    bool serialized = is("serialized") || is("serialized_not_authorized");
+    int result = serialized ? krun_vmnet_start((void *)1, &fd, &bridge)
+                            : krun_vmnet_start_shared("192.168.200.1", "255.255.255.0", &fd, &bridge);
     if (is("permission") || is("start_failure")) assert(result == -EACCES);
     else if (is("serialized_not_authorized")) assert(result == -EPERM);
     else if (is("null_interface_success") || is("event_failure")) assert(result == -EIO);

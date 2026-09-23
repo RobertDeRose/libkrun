@@ -4,7 +4,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 build="$(mktemp -d)"
 trap 'rm -rf "$build"' EXIT
 cc="${CC:-clang}"
-flags=(-fblocks -std=c11 -D_DEFAULT_SOURCE -DKRUN_VMNET_TIMEOUT_MS=200 -DKRUN_VMNET_OFFLOAD_START_TIMEOUT_MS=700   -Wall -Wextra -Werror)
+flags=(-fblocks -std=c11 -D_DEFAULT_SOURCE -DKRUN_VMNET_TIMEOUT_MS=200   -Wall -Wextra -Werror)
 libs=(-lpthread)
 
 select_macos_sdk() {
@@ -72,7 +72,7 @@ if [[ "${ASAN:-0}" == 1 ]]; then
 fi
 "$cc" -I"$root/tests/vmnet_bridge/include" "${flags[@]}" \
   "$root/tests/vmnet_bridge/test_bridge.c" "${libs[@]}" -o "$build/test-bridge"
-for scenario in success offload offload_serialized late_offload_start batched_io partial_write batch_cap shared_pair serialized serialized_not_authorized invalid_arguments permission \
+for scenario in success batched_io partial_write batch_cap shared_pair serialized serialized_not_authorized invalid_arguments permission \
   null_interface_success start_failure invalid_packet_size event_failure \
   truncated_frame late_start late_stop stop_submit_failure; do
   "$build/test-bridge" "$scenario"
