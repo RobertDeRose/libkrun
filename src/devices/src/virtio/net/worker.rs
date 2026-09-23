@@ -345,7 +345,7 @@ impl NetWorker {
                 }
                 Err(_) => {
                     log::trace!("Cannot process tx because of unfinished partial write!");
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
