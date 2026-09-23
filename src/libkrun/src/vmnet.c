@@ -232,7 +232,7 @@ static void store_u16_be(uint8_t *data, uint16_t value)
     memcpy(data, &value, sizeof(value));
 }
 
-static void store_u32_be(uint8_t *data, uint32_t value)
+static void __attribute__((unused)) store_u32_be(uint8_t *data, uint32_t value)
 {
     value = htonl(value);
     memcpy(data, &value, sizeof(value));
