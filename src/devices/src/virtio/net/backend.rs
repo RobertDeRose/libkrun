@@ -42,6 +42,9 @@ pub trait NetBackend {
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError>;
     fn has_unfinished_write(&self) -> bool;
     fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError>;
+    fn flush_writes(&mut self) -> Result<(), WriteError> {
+        Ok(())
+    }
     fn raw_socket_fd(&self) -> RawFd;
 
     /// Delay in microseconds before retrying after NothingWritten.

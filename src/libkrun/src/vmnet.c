@@ -23,6 +23,12 @@
 #define KRUN_VMNET_MAX_FRAME_SIZE 65550
 #define KRUN_VMNET_SOCKET_RCVBUF (7 * 1024 * 1024)
 #define KRUN_VMNET_MAX_BATCH_PACKETS 64
+#define KRUN_VMNET_SOCKET_BATCH_MAGIC "KRUNVMN1"
+#define KRUN_VMNET_SOCKET_BATCH_MAGIC_SIZE 8
+#define KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES 32
+#define KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE 12
+#define KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE 4
+#define KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM (60 * 1024)
 #ifndef KRUN_VMNET_TIMEOUT_MS
 #define KRUN_VMNET_TIMEOUT_MS 5000
 #endif
@@ -58,6 +64,7 @@ struct krun_vmnet_bridge {
     uint8_t *tx_buffers;
     struct iovec *tx_iovs;
     struct vmpktdesc *tx_packets;
+    uint8_t *socket_rx_buffer;
     atomic_bool stopping;
 };
 
@@ -205,6 +212,173 @@ static void reset_packet_batch(
     }
 }
 
+static uint16_t load_u16_be(const uint8_t *data)
+{
+    uint16_t value;
+    memcpy(&value, data, sizeof(value));
+    return ntohs(value);
+}
+
+static uint32_t load_u32_be(const uint8_t *data)
+{
+    uint32_t value;
+    memcpy(&value, data, sizeof(value));
+    return ntohl(value);
+}
+
+static void store_u16_be(uint8_t *data, uint16_t value)
+{
+    value = htons(value);
+    memcpy(data, &value, sizeof(value));
+}
+
+static void store_u32_be(uint8_t *data, uint32_t value)
+{
+    value = htonl(value);
+    memcpy(data, &value, sizeof(value));
+}
+
+static bool send_guest_packet_group(
+    struct krun_vmnet_bridge *bridge,
+    struct vmpktdesc *packets,
+    size_t count)
+{
+    if (count == 0) {
+        return true;
+    }
+    if (count == 1
+        && packets[0].vm_pkt_size + KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE
+               + KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE
+            > KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM) {
+        ssize_t written = send(
+            bridge->fd, packets[0].vm_pkt_iov->iov_base, packets[0].vm_pkt_size, 0);
+        return written == (ssize_t)packets[0].vm_pkt_size
+            || errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS;
+    }
+
+    uint8_t header[KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE] = {0};
+    uint32_t lengths[KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES];
+    memcpy(header, KRUN_VMNET_SOCKET_BATCH_MAGIC, KRUN_VMNET_SOCKET_BATCH_MAGIC_SIZE);
+    store_u16_be(header + 8, (uint16_t)count);
+
+    struct iovec iovs[1 + KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES * 2];
+    iovs[0].iov_base = header;
+    iovs[0].iov_len = sizeof(header);
+    size_t total = sizeof(header);
+    for (size_t i = 0; i < count; i++) {
+        lengths[i] = htonl((uint32_t)packets[i].vm_pkt_size);
+        iovs[1 + i * 2].iov_base = &lengths[i];
+        iovs[1 + i * 2].iov_len = sizeof(lengths[i]);
+        iovs[2 + i * 2] = *packets[i].vm_pkt_iov;
+        iovs[2 + i * 2].iov_len = packets[i].vm_pkt_size;
+        total += sizeof(lengths[i]) + packets[i].vm_pkt_size;
+    }
+    struct msghdr message = {
+        .msg_iov = iovs,
+        .msg_iovlen = (int)(1 + count * 2),
+    };
+    ssize_t written = sendmsg(bridge->fd, &message, 0);
+    return written == (ssize_t)total
+        || errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS;
+}
+
+static void send_guest_packet_batch(
+    struct krun_vmnet_bridge *bridge,
+    struct vmpktdesc *packets,
+    size_t count)
+{
+    size_t offset = 0;
+    while (offset < count) {
+        size_t group_count = 0;
+        size_t group_size = KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE;
+        while (offset + group_count < count
+               && group_count < KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES) {
+            size_t packet_size = packets[offset + group_count].vm_pkt_size;
+            if (packet_size > bridge->max_packet_size) {
+                return;
+            }
+            if (group_count > 0
+                && group_size + KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE + packet_size
+                    > KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM) {
+                break;
+            }
+            if (group_count == 0
+                && packet_size + KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE
+                       + KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE
+                    > KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM) {
+                if (!send_guest_packet_group(bridge, &packets[offset], 1)) {
+                    return;
+                }
+                offset++;
+                group_count = 0;
+                break;
+            }
+            group_size += KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE + packet_size;
+            group_count++;
+        }
+        if (group_count == 0) {
+            continue;
+        }
+        if (!send_guest_packet_group(bridge, &packets[offset], group_count)) {
+            return;
+        }
+        offset += group_count;
+    }
+}
+
+static int decode_socket_batch(
+    struct krun_vmnet_bridge *bridge,
+    const uint8_t *data,
+    size_t length,
+    size_t base,
+    size_t capacity,
+    size_t *out_count)
+{
+    *out_count = 0;
+    if (length > KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM
+        || length < KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE
+               + KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE
+        || memcmp(data, KRUN_VMNET_SOCKET_BATCH_MAGIC,
+                  KRUN_VMNET_SOCKET_BATCH_MAGIC_SIZE) != 0) {
+        return 0;
+    }
+    size_t count = load_u16_be(data + 8);
+    if (count == 0 || count > KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES
+        || count > capacity - base
+        || data[10] != 0 || data[11] != 0) {
+        return -1;
+    }
+    size_t offset = KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE;
+    for (size_t i = 0; i < count; i++) {
+        if (offset + KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE > length) {
+            return -1;
+        }
+        size_t frame_length = load_u32_be(data + offset);
+        offset += KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE;
+        if (frame_length == 0 || frame_length > bridge->max_packet_size
+            || offset + frame_length > length) {
+            return -1;
+        }
+        size_t slot = base + i;
+        memcpy(
+            bridge->tx_buffers + slot * bridge->max_packet_size,
+            data + offset,
+            frame_length);
+        bridge->tx_iovs[slot].iov_base = bridge->tx_buffers + slot * bridge->max_packet_size;
+        bridge->tx_iovs[slot].iov_len = frame_length;
+        bridge->tx_packets[slot].vm_pkt_size = frame_length;
+        bridge->tx_packets[slot].vm_pkt_iov = &bridge->tx_iovs[slot];
+        bridge->tx_packets[slot].vm_pkt_iovcnt = 1;
+        bridge->tx_packets[slot].vm_flags = 0;
+        offset += frame_length;
+    }
+    if (offset != length) {
+        return -1;
+    }
+    *out_count = count;
+    return 1;
+}
+
 static void forward_packets_to_guest(struct krun_vmnet_bridge *bridge, xpc_object_t event)
 {
     if (atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
@@ -225,17 +399,7 @@ static void forward_packets_to_guest(struct krun_vmnet_bridge *bridge, xpc_objec
         if (status != VMNET_SUCCESS || count <= 0 || (size_t)count > requested) {
             break;
         }
-        for (int i = 0; i < count; i++) {
-            struct vmpktdesc *packet = &bridge->rx_packets[i];
-            if (packet->vm_pkt_size > bridge->max_packet_size) {
-                return;
-            }
-            ssize_t written = send(
-                bridge->fd, packet->vm_pkt_iov->iov_base, packet->vm_pkt_size, 0);
-            if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS) {
-                return;
-            }
-        }
+        send_guest_packet_batch(bridge, bridge->rx_packets, (size_t)count);
         available -= (uint64_t)count;
     }
 }
@@ -243,12 +407,13 @@ static void forward_packets_to_guest(struct krun_vmnet_bridge *bridge, xpc_objec
 static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
 {
     size_t count = 0;
-    while (count < bridge->write_batch_size
+    while (count < KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES
            && !atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
-        reset_packet_batch(
-            bridge, &bridge->tx_iovs[count], &bridge->tx_packets[count],
-            bridge->tx_buffers + count * bridge->max_packet_size, 1);
-        struct msghdr message = {.msg_iov = &bridge->tx_iovs[count], .msg_iovlen = 1};
+        struct iovec iov = {
+            .iov_base = bridge->socket_rx_buffer,
+            .iov_len = KRUN_VMNET_MAX_FRAME_SIZE,
+        };
+        struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
         ssize_t length = recvmsg(bridge->fd, &message, 0);
         if (length < 0) {
             if (errno == EINTR) {
@@ -262,6 +427,25 @@ static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
         if (length == 0 || (message.msg_flags & MSG_TRUNC) != 0) {
             continue;
         }
+
+        size_t decoded = 0;
+        int batch = decode_socket_batch(
+            bridge, bridge->socket_rx_buffer, (size_t)length, count,
+            KRUN_VMNET_MAX_BATCH_PACKETS, &decoded);
+        if (batch < 0) {
+            continue;
+        }
+        if (batch > 0) {
+            count += decoded;
+            return count;
+        }
+        if ((size_t)length > bridge->max_packet_size) {
+            continue;
+        }
+        reset_packet_batch(
+            bridge, &bridge->tx_iovs[count], &bridge->tx_packets[count],
+            bridge->tx_buffers + count * bridge->max_packet_size, 1);
+        memcpy(bridge->tx_iovs[count].iov_base, bridge->socket_rx_buffer, (size_t)length);
         bridge->tx_iovs[count].iov_len = (size_t)length;
         bridge->tx_packets[count].vm_pkt_size = (size_t)length;
         count++;
@@ -273,9 +457,13 @@ static void write_packet_batch(struct krun_vmnet_bridge *bridge, size_t received
 {
     size_t offset = 0;
     while (offset < received && !atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
-        int count = (int)(received - offset);
+        size_t requested = received - offset;
+        if (requested > bridge->write_batch_size) {
+            requested = bridge->write_batch_size;
+        }
+        int count = (int)requested;
         vmnet_return_t status = vmnet_write(bridge->interface, &bridge->tx_packets[offset], &count);
-        if (status != VMNET_SUCCESS || count <= 0 || (size_t)count > received - offset) {
+        if (status != VMNET_SUCCESS || count <= 0 || (size_t)count > requested) {
             break;
         }
         offset += (size_t)count;
@@ -335,6 +523,7 @@ static void destroy_bridge(struct krun_vmnet_bridge *bridge)
     free(bridge->tx_packets);
     free(bridge->tx_iovs);
     free(bridge->tx_buffers);
+    free(bridge->socket_rx_buffer);
     free(bridge);
 }
 
@@ -537,8 +726,14 @@ static int32_t start_interface(
         &bridge->rx_buffers, &bridge->rx_iovs, &bridge->rx_packets);
     if (result == 0) {
         result = allocate_packet_batch(
-            bridge, bridge->write_batch_size,
+            bridge, KRUN_VMNET_MAX_BATCH_PACKETS,
             &bridge->tx_buffers, &bridge->tx_iovs, &bridge->tx_packets);
+    }
+    if (result == 0) {
+        bridge->socket_rx_buffer = malloc(KRUN_VMNET_MAX_FRAME_SIZE);
+        if (bridge->socket_rx_buffer == NULL) {
+            result = -ENOMEM;
+        }
     }
     if (result != 0) {
         close(sockets[0]);

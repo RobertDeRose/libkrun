@@ -1253,7 +1253,7 @@ unsafe fn add_vmnet_backend(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            create_virtio_net(cfg, VirtioNetBackend::UnixgramFd(fd), mac, features);
+            create_virtio_net(cfg, VirtioNetBackend::VmnetFd(fd), mac, features);
             cfg.vmnet_bridges.push(VmnetBridge(bridge));
             if flags & NET_FLAG_DHCP_CLIENT != 0 {
                 cfg.vmr.dhcp_client = true;

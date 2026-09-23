@@ -64,6 +64,8 @@ pub enum VirtioNetBackend {
     UnixstreamFd(RawFd),
     UnixstreamPath(PathBuf),
     UnixgramFd(RawFd),
+    #[cfg(target_os = "macos")]
+    VmnetFd(RawFd),
     UnixgramPath(PathBuf, bool),
     #[cfg(target_os = "linux")]
     Tap(String),

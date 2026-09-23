@@ -61,6 +61,12 @@ impl NetWorker {
                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
                 Box::new(Unixgram::new(owned_fd)) as Box<dyn NetBackend + Send>
             }
+            #[cfg(target_os = "macos")]
+            VirtioNetBackend::VmnetFd(fd) => {
+                // SAFETY: the native vmnet bridge created and transferred this socketpair fd.
+                let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                Box::new(Unixgram::new_batched(owned_fd)) as Box<dyn NetBackend + Send>
+            }
             VirtioNetBackend::UnixgramPath(path, vfkit_magic) => {
                 Box::new(Unixgram::open(path, vfkit_magic)?) as Box<dyn NetBackend + Send>
             }
@@ -299,14 +305,20 @@ impl NetWorker {
     fn process_tx(&mut self) -> result::Result<(), TxError> {
         let tx_queue = &mut self.tx_q.queue;
 
-        if self.backend.has_unfinished_write()
-            && self
+        if self.backend.has_unfinished_write() {
+            match self
                 .backend
                 .try_finish_write(VNET_HDR_LEN, &self.tx_frame_buf[..self.tx_frame_len])
-                .is_err()
-        {
-            log::trace!("Cannot process tx because of unfinished partial write!");
-            return Ok(());
+            {
+                Ok(()) => {}
+                Err(WriteError::NothingWritten) => {
+                    return Err(TxError::Backend(WriteError::NothingWritten));
+                }
+                Err(_) => {
+                    log::trace!("Cannot process tx because of unfinished partial write!");
+                    return Ok(());
+                }
+            }
         }
 
         let mut raise_irq = false;
@@ -385,6 +397,12 @@ impl NetWorker {
                 Err(e @ WriteError::Internal(_) | e @ WriteError::ProcessNotRunning) => {
                     return Err(TxError::Backend(e))
                 }
+            }
+        }
+
+        if result.is_ok() {
+            if let Err(e) = self.backend.flush_writes() {
+                result = Err(TxError::Backend(e));
             }
         }
 

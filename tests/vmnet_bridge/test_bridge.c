@@ -213,6 +213,46 @@ vmnet_return_t vmnet_write(interface_ref interface, struct vmpktdesc *packets, i
     return VMNET_SUCCESS;
 }
 
+static void send_wire_batch(int fd, const char *payload, size_t payload_len, size_t count)
+{
+    assert(count > 0 && count <= KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES);
+    size_t length = KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE
+        + count * (KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE + payload_len);
+    assert(length <= KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM);
+    uint8_t *data = calloc(1, length);
+    assert(data != NULL);
+    memcpy(data, KRUN_VMNET_SOCKET_BATCH_MAGIC, KRUN_VMNET_SOCKET_BATCH_MAGIC_SIZE);
+    store_u16_be(data + 8, (uint16_t)count);
+    size_t offset = KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE;
+    for (size_t i = 0; i < count; i++) {
+        store_u32_be(data + offset, (uint32_t)payload_len);
+        offset += KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE;
+        memcpy(data + offset, payload, payload_len);
+        offset += payload_len;
+    }
+    assert(send(fd, data, length, 0) == (ssize_t)length);
+    free(data);
+}
+
+static void recv_wire_batch(int fd, const char *payload, size_t payload_len, size_t expected_count)
+{
+    uint8_t data[KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM];
+    ssize_t length = recv(fd, data, sizeof(data), 0);
+    assert(length > 0);
+    assert((size_t)length >= KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE);
+    assert(memcmp(data, KRUN_VMNET_SOCKET_BATCH_MAGIC, KRUN_VMNET_SOCKET_BATCH_MAGIC_SIZE) == 0);
+    assert(load_u16_be(data + 8) == expected_count);
+    size_t offset = KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE;
+    for (size_t i = 0; i < expected_count; i++) {
+        assert(load_u32_be(data + offset) == payload_len);
+        offset += KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE;
+        assert(offset + payload_len <= (size_t)length);
+        assert(memcmp(data + offset, payload, payload_len) == 0);
+        offset += payload_len;
+    }
+    assert(offset == (size_t)length);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -279,10 +319,10 @@ int main(int argc, char **argv)
             struct fake_xpc event = {.size = 1};
             active_interface->event(VMNET_INTERFACE_PACKETS_AVAILABLE, &event);
         });
-        char data[32];
-        assert(recv(fd, data, sizeof(data), 0) == 12 && memcmp(data, "native-reply", 12) == 0);
+        recv_wire_batch(fd, "native-reply", 12, 1);
         if (is("batched_io") || is("partial_write")) {
-            for (int i = 0; i < 16; i++) assert(send(fd, "batch-frame", 11, 0) == 11);
+            send_wire_batch(fd, "batch-frame", 11, 8);
+            send_wire_batch(fd, "batch-frame", 11, 8);
             for (int i = 0; i < 200 && atomic_load(&writes) < 17; i++) usleep(1000);
             assert(atomic_load(&writes) == 17);
             assert(atomic_load(&max_write_batch) > 1);
@@ -294,10 +334,7 @@ int main(int argc, char **argv)
                 active_interface->event(VMNET_INTERFACE_PACKETS_AVAILABLE, &event);
             });
             assert(atomic_load(&max_read_batch) >= 4);
-            for (int i = 0; i < 4; i++) {
-                assert(recv(fd, data, sizeof(data), 0) == 12);
-                assert(memcmp(data, "native-reply", 12) == 0);
-            }
+            recv_wire_batch(fd, "native-reply", 12, 4);
         }
         if (is("truncated_frame")) {
             char huge[4096] = {0};
