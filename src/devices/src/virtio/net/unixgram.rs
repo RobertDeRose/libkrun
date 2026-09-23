@@ -38,7 +38,7 @@ const SOCKET_RCVBUF: usize = DEFAULT_SOCKET_BUF_SIZE;
 // The native vmnet backend uses a private socketpair. Batch only that private
 // transport; krun_add_net_unixgram() retains its one-frame-per-datagram ABI.
 const VMNET_BATCH_MAGIC: [u8; 8] = *b"KRUNVMN1";
-pub(super) const VMNET_BATCH_MAX_FRAMES: usize = 32;
+const VMNET_BATCH_MAX_FRAMES: usize = 32;
 const VMNET_BATCH_HEADER_LEN: usize = 12;
 const VMNET_BATCH_FRAME_HEADER_LEN: usize = 4;
 const VMNET_BATCH_MAX_DATAGRAM: usize = 60 * 1024;

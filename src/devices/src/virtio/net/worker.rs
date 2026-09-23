@@ -2,8 +2,6 @@ use crate::virtio::net::backend::ConnectError;
 #[cfg(target_os = "linux")]
 use crate::virtio::net::tap::Tap;
 use crate::virtio::net::unixgram::Unixgram;
-#[cfg(target_os = "macos")]
-use crate::virtio::net::unixgram::VMNET_BATCH_MAX_FRAMES;
 use crate::virtio::net::unixstream::Unixstream;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE};
 use crate::virtio::{DeviceQueue, InterruptTransport};
@@ -36,7 +34,6 @@ pub struct NetWorker {
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
-    tx_burst_limit: usize,
 }
 
 impl NetWorker {
@@ -48,15 +45,6 @@ impl NetWorker {
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
     ) -> Result<Self, ConnectError> {
-        #[cfg(target_os = "macos")]
-        let tx_burst_limit = if matches!(&cfg_backend, VirtioNetBackend::VmnetFd(_)) {
-            VMNET_BATCH_MAX_FRAMES
-        } else {
-            usize::MAX
-        };
-        #[cfg(not(target_os = "macos"))]
-        let tx_burst_limit = usize::MAX;
-
         let backend = match cfg_backend {
             VirtioNetBackend::UnixstreamFd(fd) => {
                 // SAFETY: we need to trust that the library user has configured
@@ -104,7 +92,6 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
-            tx_burst_limit,
         })
     }
 
@@ -299,39 +286,23 @@ impl NetWorker {
         loop {
             self.tx_q.queue.disable_notification(&self.mem).unwrap();
 
-            let mut hit_burst_limit = false;
             self.tx_has_deferred_frame = match self.process_tx() {
-                Ok(hit_limit) => {
-                    hit_burst_limit = hit_limit;
-                    false
-                }
                 Err(TxError::Backend(WriteError::NothingWritten)) => true,
                 Err(e) => {
                     log::error!("Failed to process tx: {e:?}");
                     false
                 }
+                _ => false,
             };
 
             let has_new_entries = self.tx_q.queue.enable_notification(&self.mem).unwrap();
             if self.tx_has_deferred_frame || !has_new_entries {
                 break;
             }
-
-            // Native vmnet shares one worker between guest TX and backend RX. Under sustained
-            // guest-to-host traffic, draining the entire TX queue here can delay processing
-            // inbound TCP ACKs long enough to throttle the guest. Yield after one private
-            // socket batch and reschedule the remaining TX work through the queue event so
-            // pending backend events can run first.
-            if hit_burst_limit {
-                if let Err(e) = self.tx_q.event.write(1) {
-                    log::error!("Failed to reschedule tx queue after vmnet burst: {e:?}");
-                }
-                break;
-            }
         }
     }
 
-    fn process_tx(&mut self) -> result::Result<bool, TxError> {
+    fn process_tx(&mut self) -> result::Result<(), TxError> {
         let tx_queue = &mut self.tx_q.queue;
 
         if self.backend.has_unfinished_write() {
@@ -345,20 +316,15 @@ impl NetWorker {
                 }
                 Err(_) => {
                     log::trace!("Cannot process tx because of unfinished partial write!");
-                    return Ok(false);
+                    return Ok(());
                 }
             }
         }
 
         let mut raise_irq = false;
         let mut result = Ok(());
-        let mut processed = 0usize;
 
-        while processed < self.tx_burst_limit {
-            let Some(head) = tx_queue.pop(&self.mem) else {
-                break;
-            };
-            processed += 1;
+        while let Some(head) = tx_queue.pop(&self.mem) {
             let head_index = head.index;
             let mut next_desc = Some(head);
 
@@ -446,7 +412,7 @@ impl NetWorker {
                 .map_err(TxError::DeviceError)?;
         }
 
-        result.map(|_| processed == self.tx_burst_limit)
+        result
     }
 
     // Copies a single frame from `self.rx_frame_buf` into the guest.
