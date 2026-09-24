@@ -4,9 +4,11 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -46,6 +48,26 @@ struct completion {
     uint64_t write_max_packets;
 };
 
+struct vmnet_tx_profile {
+    uint64_t poll_wakeups;
+    uint64_t receive_batches;
+    uint64_t recvmsg_calls;
+    uint64_t recvmsg_ns;
+    uint64_t socket_datagrams;
+    uint64_t socket_datagram_bytes;
+    uint64_t socket_batch_datagrams;
+    uint64_t socket_raw_datagrams;
+    uint64_t socket_frames;
+    uint64_t socket_payload_bytes;
+    uint64_t vmnet_write_calls;
+    uint64_t vmnet_write_ns;
+    uint64_t vmnet_write_requested_frames;
+    uint64_t vmnet_write_frames;
+    uint64_t vmnet_write_bytes;
+    uint64_t vmnet_write_partial_calls;
+    uint64_t vmnet_write_failures;
+};
+
 struct krun_vmnet_bridge {
     interface_ref interface;
     vmnet_network_ref network;
@@ -65,8 +87,26 @@ struct krun_vmnet_bridge {
     struct iovec *tx_iovs;
     struct vmpktdesc *tx_packets;
     uint8_t *socket_rx_buffer;
+    struct vmnet_tx_profile tx_profile;
     atomic_bool stopping;
 };
+
+static uint64_t monotonic_ns(void)
+{
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) {
+        return 0;
+    }
+    return (uint64_t)value.tv_sec * 1000000000ULL + (uint64_t)value.tv_nsec;
+}
+
+static void add_elapsed_ns(uint64_t *total, uint64_t started)
+{
+    uint64_t finished = monotonic_ns();
+    if (started != 0 && finished >= started) {
+        *total += finished - started;
+    }
+}
 
 static struct completion *completion_create(void)
 {
@@ -414,7 +454,10 @@ static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
             .iov_len = KRUN_VMNET_MAX_FRAME_SIZE,
         };
         struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
+        uint64_t recv_started = monotonic_ns();
         ssize_t length = recvmsg(bridge->fd, &message, 0);
+        bridge->tx_profile.recvmsg_calls++;
+        add_elapsed_ns(&bridge->tx_profile.recvmsg_ns, recv_started);
         if (length < 0) {
             if (errno == EINTR) {
                 continue;
@@ -427,6 +470,8 @@ static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
         if (length == 0 || (message.msg_flags & MSG_TRUNC) != 0) {
             continue;
         }
+        bridge->tx_profile.socket_datagrams++;
+        bridge->tx_profile.socket_datagram_bytes += (uint64_t)length;
 
         size_t decoded = 0;
         int batch = decode_socket_batch(
@@ -436,6 +481,12 @@ static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
             continue;
         }
         if (batch > 0) {
+            bridge->tx_profile.socket_batch_datagrams++;
+            bridge->tx_profile.socket_frames += decoded;
+            for (size_t i = 0; i < decoded; i++) {
+                bridge->tx_profile.socket_payload_bytes +=
+                    bridge->tx_packets[count + i].vm_pkt_size;
+            }
             count += decoded;
             return count;
         }
@@ -448,6 +499,9 @@ static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
         memcpy(bridge->tx_iovs[count].iov_base, bridge->socket_rx_buffer, (size_t)length);
         bridge->tx_iovs[count].iov_len = (size_t)length;
         bridge->tx_packets[count].vm_pkt_size = (size_t)length;
+        bridge->tx_profile.socket_raw_datagrams++;
+        bridge->tx_profile.socket_frames++;
+        bridge->tx_profile.socket_payload_bytes += (uint64_t)length;
         count++;
     }
     return count;
@@ -462,9 +516,22 @@ static void write_packet_batch(struct krun_vmnet_bridge *bridge, size_t received
             requested = bridge->write_batch_size;
         }
         int count = (int)requested;
+        bridge->tx_profile.vmnet_write_calls++;
+        bridge->tx_profile.vmnet_write_requested_frames += requested;
+        uint64_t write_started = monotonic_ns();
         vmnet_return_t status = vmnet_write(bridge->interface, &bridge->tx_packets[offset], &count);
+        add_elapsed_ns(&bridge->tx_profile.vmnet_write_ns, write_started);
         if (status != VMNET_SUCCESS || count <= 0 || (size_t)count > requested) {
+            bridge->tx_profile.vmnet_write_failures++;
             break;
+        }
+        if ((size_t)count < requested) {
+            bridge->tx_profile.vmnet_write_partial_calls++;
+        }
+        bridge->tx_profile.vmnet_write_frames += (uint64_t)count;
+        for (int i = 0; i < count; i++) {
+            bridge->tx_profile.vmnet_write_bytes +=
+                bridge->tx_packets[offset + (size_t)i].vm_pkt_size;
         }
         offset += (size_t)count;
     }
@@ -488,11 +555,13 @@ static void *forward_packets_to_vmnet(void *opaque)
         if ((pollfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
             break;
         }
+        bridge->tx_profile.poll_wakeups++;
         while (!atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
             size_t received = receive_packet_batch(bridge);
             if (received == 0) {
                 break;
             }
+            bridge->tx_profile.receive_batches++;
             write_packet_batch(bridge, received);
         }
     }
@@ -500,8 +569,55 @@ static void *forward_packets_to_vmnet(void *opaque)
     return NULL;
 }
 
+static void print_tx_profile(const struct krun_vmnet_bridge *bridge)
+{
+    const struct vmnet_tx_profile *profile = &bridge->tx_profile;
+    if (profile->socket_frames == 0) {
+        return;
+    }
+    double frames_per_datagram = profile->socket_datagrams == 0
+        ? 0.0
+        : (double)profile->socket_frames / (double)profile->socket_datagrams;
+    double frames_per_write = profile->vmnet_write_calls == 0
+        ? 0.0
+        : (double)profile->vmnet_write_frames / (double)profile->vmnet_write_calls;
+    fprintf(
+        stderr,
+        "libkrun: vmnet tx profile "
+        "write_batch_size=%zu poll_wakeups=%" PRIu64 " receive_batches=%" PRIu64 " "
+        "recvmsg_calls=%" PRIu64 " recvmsg_ms=%.3f socket_datagrams=%" PRIu64 " "
+        "socket_batch_datagrams=%" PRIu64 " socket_raw_datagrams=%" PRIu64 " "
+        "socket_frames=%" PRIu64 " socket_payload_bytes=%" PRIu64 " "
+        "socket_datagram_bytes=%" PRIu64 " frames_per_datagram=%.3f "
+        "vmnet_write_calls=%" PRIu64 " vmnet_write_requested_frames=%" PRIu64 " "
+        "vmnet_write_frames=%" PRIu64 " vmnet_write_bytes=%" PRIu64 " "
+        "vmnet_write_ms=%.3f frames_per_vmnet_write=%.3f "
+        "vmnet_write_partial_calls=%" PRIu64 " vmnet_write_failures=%" PRIu64 "\n",
+        bridge->write_batch_size,
+        profile->poll_wakeups,
+        profile->receive_batches,
+        profile->recvmsg_calls,
+        (double)profile->recvmsg_ns / 1000000.0,
+        profile->socket_datagrams,
+        profile->socket_batch_datagrams,
+        profile->socket_raw_datagrams,
+        profile->socket_frames,
+        profile->socket_payload_bytes,
+        profile->socket_datagram_bytes,
+        frames_per_datagram,
+        profile->vmnet_write_calls,
+        profile->vmnet_write_requested_frames,
+        profile->vmnet_write_frames,
+        profile->vmnet_write_bytes,
+        (double)profile->vmnet_write_ns / 1000000.0,
+        frames_per_write,
+        profile->vmnet_write_partial_calls,
+        profile->vmnet_write_failures);
+}
+
 static void destroy_bridge(struct krun_vmnet_bridge *bridge)
 {
+    print_tx_profile(bridge);
     if (bridge->fd >= 0) {
         close(bridge->fd);
     }
