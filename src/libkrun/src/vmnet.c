@@ -48,6 +48,49 @@ struct completion {
     uint64_t write_max_packets;
 };
 
+struct vmnet_rx_profile {
+    uint64_t event_callbacks;
+    uint64_t advertised_packets;
+    uint64_t advertised_packets_max;
+    uint64_t event_gap_samples;
+    uint64_t event_gap_ns;
+    uint64_t event_gap_max_ns;
+    uint64_t last_event_ns;
+    uint64_t vmnet_read_calls;
+    uint64_t vmnet_read_ns;
+    uint64_t vmnet_read_requested_frames;
+    uint64_t vmnet_read_frames;
+    uint64_t vmnet_read_bytes;
+    uint64_t vmnet_read_max_frames;
+    uint64_t vmnet_read_failures;
+    uint64_t tcp_ack_only_frames;
+    uint64_t ack_read_batches;
+    uint64_t ack_read_max_frames;
+    uint64_t ack_batch_gap_samples;
+    uint64_t ack_batch_gap_ns;
+    uint64_t ack_batch_gap_max_ns;
+    uint64_t ack_batch_gap_ge_100us;
+    uint64_t ack_batch_gap_ge_250us;
+    uint64_t ack_batch_gap_ge_500us;
+    uint64_t ack_batch_gap_ge_1ms;
+    uint64_t last_ack_batch_ns;
+    uint64_t socket_send_calls;
+    uint64_t socket_send_ns;
+    uint64_t socket_send_frames;
+    uint64_t socket_send_bytes;
+    uint64_t socket_send_batch_calls;
+    uint64_t socket_send_raw_calls;
+    uint64_t socket_send_ack_calls;
+    uint64_t socket_send_ack_frames;
+    uint64_t socket_send_ack_ns;
+    uint64_t socket_send_backpressure;
+    uint64_t socket_send_eagain;
+    uint64_t socket_send_enobufs;
+    uint64_t socket_send_failures;
+    uint64_t socket_dropped_frames;
+    uint64_t socket_dropped_ack_only;
+};
+
 struct vmnet_tx_profile {
     uint64_t poll_wakeups;
     uint64_t receive_batches;
@@ -87,6 +130,7 @@ struct krun_vmnet_bridge {
     struct iovec *tx_iovs;
     struct vmpktdesc *tx_packets;
     uint8_t *socket_rx_buffer;
+    struct vmnet_rx_profile rx_profile;
     struct vmnet_tx_profile tx_profile;
     atomic_bool stopping;
 };
@@ -105,6 +149,27 @@ static void add_elapsed_ns(uint64_t *total, uint64_t started)
     uint64_t finished = monotonic_ns();
     if (started != 0 && finished >= started) {
         *total += finished - started;
+    }
+}
+
+static void record_thresholds(
+    uint64_t value,
+    uint64_t *over_100us,
+    uint64_t *over_250us,
+    uint64_t *over_500us,
+    uint64_t *over_1ms)
+{
+    if (value >= 100000ULL) {
+        (*over_100us)++;
+    }
+    if (value >= 250000ULL) {
+        (*over_250us)++;
+    }
+    if (value >= 500000ULL) {
+        (*over_500us)++;
+    }
+    if (value >= 1000000ULL) {
+        (*over_1ms)++;
     }
 }
 
@@ -278,6 +343,150 @@ static void __attribute__((unused)) store_u32_be(uint8_t *data, uint32_t value)
     memcpy(data, &value, sizeof(value));
 }
 
+static bool packet_is_tcp_ack_only(const uint8_t *frame, size_t length)
+{
+    enum {
+        ETHERTYPE_IPV4 = 0x0800,
+        ETHERTYPE_IPV6 = 0x86dd,
+        ETHERTYPE_VLAN = 0x8100,
+        ETHERTYPE_QINQ = 0x88a8,
+        IPPROTO_TCP_VALUE = 6,
+        TCP_FIN = 0x01,
+        TCP_SYN = 0x02,
+        TCP_RST = 0x04,
+        TCP_ACK = 0x10,
+    };
+
+    if (length < 14) {
+        return false;
+    }
+
+    size_t l3_offset = 14;
+    uint16_t ethertype = load_u16_be(frame + 12);
+    for (int i = 0; i < 2; i++) {
+        if (ethertype != ETHERTYPE_VLAN && ethertype != ETHERTYPE_QINQ) {
+            break;
+        }
+        if (length < l3_offset + 4) {
+            return false;
+        }
+        ethertype = load_u16_be(frame + l3_offset + 2);
+        l3_offset += 4;
+    }
+
+    size_t tcp_offset;
+    size_t tcp_length;
+    if (ethertype == ETHERTYPE_IPV4) {
+        if (length < l3_offset + 20 || frame[l3_offset + 9] != IPPROTO_TCP_VALUE) {
+            return false;
+        }
+        size_t ihl = (size_t)(frame[l3_offset] & 0x0f) * 4;
+        if (ihl < 20 || length < l3_offset + ihl) {
+            return false;
+        }
+        uint16_t fragment = load_u16_be(frame + l3_offset + 6);
+        if ((fragment & 0x1fff) != 0) {
+            return false;
+        }
+        size_t total_length = load_u16_be(frame + l3_offset + 2);
+        size_t available = length - l3_offset;
+        if (total_length > available) {
+            total_length = available;
+        }
+        if (total_length < ihl) {
+            return false;
+        }
+        tcp_offset = l3_offset + ihl;
+        tcp_length = total_length - ihl;
+    } else if (ethertype == ETHERTYPE_IPV6) {
+        if (length < l3_offset + 40 || frame[l3_offset + 6] != IPPROTO_TCP_VALUE) {
+            return false;
+        }
+        tcp_offset = l3_offset + 40;
+        size_t payload_length = load_u16_be(frame + l3_offset + 4);
+        size_t available = length - tcp_offset;
+        tcp_length = payload_length < available ? payload_length : available;
+    } else {
+        return false;
+    }
+
+    if (tcp_length < 20 || length < tcp_offset + 20) {
+        return false;
+    }
+    size_t tcp_header_length = (size_t)(frame[tcp_offset + 12] >> 4) * 4;
+    if (tcp_header_length < 20 || tcp_header_length > tcp_length) {
+        return false;
+    }
+    uint8_t flags = frame[tcp_offset + 13];
+    return (flags & TCP_ACK) != 0
+        && (flags & (TCP_FIN | TCP_SYN | TCP_RST)) == 0
+        && tcp_length == tcp_header_length;
+}
+
+static size_t count_tcp_ack_only(struct vmpktdesc *packets, size_t count)
+{
+    size_t result = 0;
+    for (size_t i = 0; i < count; i++) {
+        const uint8_t *frame = packets[i].vm_pkt_iov->iov_base;
+        if (packet_is_tcp_ack_only(frame, packets[i].vm_pkt_size)) {
+            result++;
+        }
+    }
+    return result;
+}
+
+static bool finish_guest_socket_send(
+    struct krun_vmnet_bridge *bridge,
+    struct vmpktdesc *packets,
+    size_t count,
+    size_t bytes,
+    bool batch,
+    ssize_t written,
+    int error,
+    uint64_t started)
+{
+    struct vmnet_rx_profile *profile = &bridge->rx_profile;
+    profile->socket_send_calls++;
+    profile->socket_send_frames += count;
+    profile->socket_send_bytes += bytes;
+    if (batch) {
+        profile->socket_send_batch_calls++;
+    } else {
+        profile->socket_send_raw_calls++;
+    }
+    uint64_t finished = monotonic_ns();
+    uint64_t elapsed = started != 0 && finished >= started ? finished - started : 0;
+    profile->socket_send_ns += elapsed;
+
+    size_t ack_only = count_tcp_ack_only(packets, count);
+    if (ack_only > 0) {
+        profile->socket_send_ack_calls++;
+        profile->socket_send_ack_frames += ack_only;
+        profile->socket_send_ack_ns += elapsed;
+    }
+
+    if (written == (ssize_t)bytes) {
+        return true;
+    }
+
+    profile->socket_send_failures++;
+    if (error == EAGAIN || error == EWOULDBLOCK || error == ENOBUFS) {
+        // Preserve the existing best-effort behavior, but make packet loss at
+        // this private boundary visible. In particular, dropped ACKs can pace
+        // guest TX without causing guest data retransmissions.
+        profile->socket_send_backpressure++;
+        if (error == ENOBUFS) {
+            profile->socket_send_enobufs++;
+        } else {
+            profile->socket_send_eagain++;
+        }
+        profile->socket_dropped_frames += count;
+        profile->socket_dropped_ack_only += ack_only;
+        return true;
+    }
+    return false;
+}
+
 static bool send_guest_packet_group(
     struct krun_vmnet_bridge *bridge,
     struct vmpktdesc *packets,
@@ -290,10 +499,19 @@ static bool send_guest_packet_group(
         && packets[0].vm_pkt_size + KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE
                + KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE
             > KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM) {
+        uint64_t started = monotonic_ns();
         ssize_t written = send(
             bridge->fd, packets[0].vm_pkt_iov->iov_base, packets[0].vm_pkt_size, 0);
-        return written == (ssize_t)packets[0].vm_pkt_size
-            || errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS;
+        int error = written < 0 ? errno : 0;
+        return finish_guest_socket_send(
+            bridge,
+            packets,
+            1,
+            packets[0].vm_pkt_size,
+            false,
+            written,
+            error,
+            started);
     }
 
     uint8_t header[KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE] = {0};
@@ -317,9 +535,11 @@ static bool send_guest_packet_group(
         .msg_iov = iovs,
         .msg_iovlen = (int)(1 + count * 2),
     };
+    uint64_t started = monotonic_ns();
     ssize_t written = sendmsg(bridge->fd, &message, 0);
-    return written == (ssize_t)total
-        || errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS;
+    int error = written < 0 ? errno : 0;
+    return finish_guest_socket_send(
+        bridge, packets, count, total, true, written, error, started);
 }
 
 static void send_guest_packet_batch(
@@ -424,7 +644,26 @@ static void forward_packets_to_guest(struct krun_vmnet_bridge *bridge, xpc_objec
     if (atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
         return;
     }
+
+    struct vmnet_rx_profile *profile = &bridge->rx_profile;
+    uint64_t now = monotonic_ns();
+    profile->event_callbacks++;
+    if (profile->last_event_ns != 0 && now >= profile->last_event_ns) {
+        uint64_t gap = now - profile->last_event_ns;
+        profile->event_gap_samples++;
+        profile->event_gap_ns += gap;
+        if (gap > profile->event_gap_max_ns) {
+            profile->event_gap_max_ns = gap;
+        }
+    }
+    profile->last_event_ns = now;
+
     uint64_t available = xpc_dictionary_get_uint64(event, vmnet_estimated_packets_available_key);
+    profile->advertised_packets += available;
+    if (available > profile->advertised_packets_max) {
+        profile->advertised_packets_max = available;
+    }
+
     // Check stopping between batches rather than capping the advertised total:
     // leaving queued frames unread can lose an edge-triggered notification.
     available = available == 0 ? 1 : available;
@@ -435,9 +674,51 @@ static void forward_packets_to_guest(struct krun_vmnet_bridge *bridge, xpc_objec
         reset_packet_batch(
             bridge, bridge->rx_iovs, bridge->rx_packets, bridge->rx_buffers, requested);
         int count = (int)requested;
+        profile->vmnet_read_calls++;
+        profile->vmnet_read_requested_frames += requested;
+        uint64_t read_started = monotonic_ns();
         vmnet_return_t status = vmnet_read(bridge->interface, bridge->rx_packets, &count);
+        add_elapsed_ns(&profile->vmnet_read_ns, read_started);
         if (status != VMNET_SUCCESS || count <= 0 || (size_t)count > requested) {
+            profile->vmnet_read_failures++;
             break;
+        }
+
+        profile->vmnet_read_frames += (uint64_t)count;
+        if ((uint64_t)count > profile->vmnet_read_max_frames) {
+            profile->vmnet_read_max_frames = (uint64_t)count;
+        }
+        uint64_t ack_frames = 0;
+        for (int i = 0; i < count; i++) {
+            profile->vmnet_read_bytes += bridge->rx_packets[i].vm_pkt_size;
+            if (packet_is_tcp_ack_only(
+                    bridge->rx_packets[i].vm_pkt_iov->iov_base,
+                    bridge->rx_packets[i].vm_pkt_size)) {
+                profile->tcp_ack_only_frames++;
+                ack_frames++;
+            }
+        }
+        if (ack_frames > 0) {
+            uint64_t ack_now = monotonic_ns();
+            profile->ack_read_batches++;
+            if (ack_frames > profile->ack_read_max_frames) {
+                profile->ack_read_max_frames = ack_frames;
+            }
+            if (profile->last_ack_batch_ns != 0 && ack_now >= profile->last_ack_batch_ns) {
+                uint64_t gap = ack_now - profile->last_ack_batch_ns;
+                profile->ack_batch_gap_samples++;
+                profile->ack_batch_gap_ns += gap;
+                if (gap > profile->ack_batch_gap_max_ns) {
+                    profile->ack_batch_gap_max_ns = gap;
+                }
+                record_thresholds(
+                    gap,
+                    &profile->ack_batch_gap_ge_100us,
+                    &profile->ack_batch_gap_ge_250us,
+                    &profile->ack_batch_gap_ge_500us,
+                    &profile->ack_batch_gap_ge_1ms);
+            }
+            profile->last_ack_batch_ns = ack_now;
         }
         send_guest_packet_batch(bridge, bridge->rx_packets, (size_t)count);
         available -= (uint64_t)count;
@@ -569,6 +850,88 @@ static void *forward_packets_to_vmnet(void *opaque)
     return NULL;
 }
 
+static void print_rx_profile(const struct krun_vmnet_bridge *bridge)
+{
+    const struct vmnet_rx_profile *profile = &bridge->rx_profile;
+    if (profile->vmnet_read_frames == 0 && profile->socket_send_calls == 0) {
+        return;
+    }
+    double event_gap_avg_us = profile->event_gap_samples == 0
+        ? 0.0
+        : (double)profile->event_gap_ns / (double)profile->event_gap_samples / 1000.0;
+    double frames_per_read = profile->vmnet_read_calls == 0
+        ? 0.0
+        : (double)profile->vmnet_read_frames / (double)profile->vmnet_read_calls;
+    double frames_per_send = profile->socket_send_calls == 0
+        ? 0.0
+        : (double)profile->socket_send_frames / (double)profile->socket_send_calls;
+    double ack_batch_gap_avg_us = profile->ack_batch_gap_samples == 0
+        ? 0.0
+        : (double)profile->ack_batch_gap_ns / (double)profile->ack_batch_gap_samples / 1000.0;
+    fprintf(
+        stderr,
+        "libkrun: vmnet rx feedback profile "
+        "read_batch_size=%zu event_callbacks=%" PRIu64 " advertised_packets=%" PRIu64 " "
+        "advertised_packets_max=%" PRIu64 " event_gap_samples=%" PRIu64 " "
+        "event_gap_avg_us=%.3f event_gap_max_us=%.3f vmnet_read_calls=%" PRIu64 " "
+        "vmnet_read_requested_frames=%" PRIu64 " vmnet_read_frames=%" PRIu64 " "
+        "vmnet_read_bytes=%" PRIu64 " vmnet_read_max_frames=%" PRIu64 " "
+        "vmnet_read_ms=%.3f frames_per_vmnet_read=%.3f vmnet_read_failures=%" PRIu64 " "
+        "tcp_ack_only_frames=%" PRIu64 " ack_read_batches=%" PRIu64 " ack_read_max_frames=%" PRIu64 " "
+        "ack_batch_gap_samples=%" PRIu64 " ack_batch_gap_avg_us=%.3f ack_batch_gap_max_us=%.3f "
+        "ack_batch_gap_ge_100us=%" PRIu64 " ack_batch_gap_ge_250us=%" PRIu64 " "
+        "ack_batch_gap_ge_500us=%" PRIu64 " ack_batch_gap_ge_1ms=%" PRIu64 " "
+        "socket_send_calls=%" PRIu64 " "
+        "socket_send_batch_calls=%" PRIu64 " socket_send_raw_calls=%" PRIu64 " "
+        "socket_send_frames=%" PRIu64 " socket_send_bytes=%" PRIu64 " "
+        "socket_send_ms=%.3f frames_per_socket_send=%.3f socket_send_ack_calls=%" PRIu64 " "
+        "socket_send_ack_frames=%" PRIu64 " socket_send_ack_ms=%.3f socket_send_backpressure=%" PRIu64 " "
+        "socket_send_eagain=%" PRIu64 " socket_send_enobufs=%" PRIu64 " "
+        "socket_send_failures=%" PRIu64 " socket_dropped_frames=%" PRIu64 " "
+        "socket_dropped_ack_only=%" PRIu64 "\n",
+        bridge->read_batch_size,
+        profile->event_callbacks,
+        profile->advertised_packets,
+        profile->advertised_packets_max,
+        profile->event_gap_samples,
+        event_gap_avg_us,
+        (double)profile->event_gap_max_ns / 1000.0,
+        profile->vmnet_read_calls,
+        profile->vmnet_read_requested_frames,
+        profile->vmnet_read_frames,
+        profile->vmnet_read_bytes,
+        profile->vmnet_read_max_frames,
+        (double)profile->vmnet_read_ns / 1000000.0,
+        frames_per_read,
+        profile->vmnet_read_failures,
+        profile->tcp_ack_only_frames,
+        profile->ack_read_batches,
+        profile->ack_read_max_frames,
+        profile->ack_batch_gap_samples,
+        ack_batch_gap_avg_us,
+        (double)profile->ack_batch_gap_max_ns / 1000.0,
+        profile->ack_batch_gap_ge_100us,
+        profile->ack_batch_gap_ge_250us,
+        profile->ack_batch_gap_ge_500us,
+        profile->ack_batch_gap_ge_1ms,
+        profile->socket_send_calls,
+        profile->socket_send_batch_calls,
+        profile->socket_send_raw_calls,
+        profile->socket_send_frames,
+        profile->socket_send_bytes,
+        (double)profile->socket_send_ns / 1000000.0,
+        frames_per_send,
+        profile->socket_send_ack_calls,
+        profile->socket_send_ack_frames,
+        (double)profile->socket_send_ack_ns / 1000000.0,
+        profile->socket_send_backpressure,
+        profile->socket_send_eagain,
+        profile->socket_send_enobufs,
+        profile->socket_send_failures,
+        profile->socket_dropped_frames,
+        profile->socket_dropped_ack_only);
+}
+
 static void print_tx_profile(const struct krun_vmnet_bridge *bridge)
 {
     const struct vmnet_tx_profile *profile = &bridge->tx_profile;
@@ -617,6 +980,7 @@ static void print_tx_profile(const struct krun_vmnet_bridge *bridge)
 
 static void destroy_bridge(struct krun_vmnet_bridge *bridge)
 {
+    print_rx_profile(bridge);
     print_tx_profile(bridge);
     if (bridge->fd >= 0) {
         close(bridge->fd);
