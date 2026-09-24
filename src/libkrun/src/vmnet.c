@@ -346,15 +346,15 @@ static void __attribute__((unused)) store_u32_be(uint8_t *data, uint32_t value)
 static bool packet_is_tcp_ack_only(const uint8_t *frame, size_t length)
 {
     enum {
-        ETHERTYPE_IPV4 = 0x0800,
-        ETHERTYPE_IPV6 = 0x86dd,
-        ETHERTYPE_VLAN = 0x8100,
-        ETHERTYPE_QINQ = 0x88a8,
-        IPPROTO_TCP_VALUE = 6,
-        TCP_FIN = 0x01,
-        TCP_SYN = 0x02,
-        TCP_RST = 0x04,
-        TCP_ACK = 0x10,
+        TRACE_ETHERTYPE_IPV4 = 0x0800,
+        TRACE_ETHERTYPE_IPV6 = 0x86dd,
+        TRACE_ETHERTYPE_VLAN = 0x8100,
+        TRACE_ETHERTYPE_QINQ = 0x88a8,
+        TRACE_IPPROTO_TCP = 6,
+        TRACE_TCP_FIN = 0x01,
+        TRACE_TCP_SYN = 0x02,
+        TRACE_TCP_RST = 0x04,
+        TRACE_TCP_ACK = 0x10,
     };
 
     if (length < 14) {
@@ -364,7 +364,7 @@ static bool packet_is_tcp_ack_only(const uint8_t *frame, size_t length)
     size_t l3_offset = 14;
     uint16_t ethertype = load_u16_be(frame + 12);
     for (int i = 0; i < 2; i++) {
-        if (ethertype != ETHERTYPE_VLAN && ethertype != ETHERTYPE_QINQ) {
+        if (ethertype != TRACE_ETHERTYPE_VLAN && ethertype != TRACE_ETHERTYPE_QINQ) {
             break;
         }
         if (length < l3_offset + 4) {
@@ -376,8 +376,8 @@ static bool packet_is_tcp_ack_only(const uint8_t *frame, size_t length)
 
     size_t tcp_offset;
     size_t tcp_length;
-    if (ethertype == ETHERTYPE_IPV4) {
-        if (length < l3_offset + 20 || frame[l3_offset + 9] != IPPROTO_TCP_VALUE) {
+    if (ethertype == TRACE_ETHERTYPE_IPV4) {
+        if (length < l3_offset + 20 || frame[l3_offset + 9] != TRACE_IPPROTO_TCP) {
             return false;
         }
         size_t ihl = (size_t)(frame[l3_offset] & 0x0f) * 4;
@@ -398,8 +398,8 @@ static bool packet_is_tcp_ack_only(const uint8_t *frame, size_t length)
         }
         tcp_offset = l3_offset + ihl;
         tcp_length = total_length - ihl;
-    } else if (ethertype == ETHERTYPE_IPV6) {
-        if (length < l3_offset + 40 || frame[l3_offset + 6] != IPPROTO_TCP_VALUE) {
+    } else if (ethertype == TRACE_ETHERTYPE_IPV6) {
+        if (length < l3_offset + 40 || frame[l3_offset + 6] != TRACE_IPPROTO_TCP) {
             return false;
         }
         tcp_offset = l3_offset + 40;
@@ -418,8 +418,8 @@ static bool packet_is_tcp_ack_only(const uint8_t *frame, size_t length)
         return false;
     }
     uint8_t flags = frame[tcp_offset + 13];
-    return (flags & TCP_ACK) != 0
-        && (flags & (TCP_FIN | TCP_SYN | TCP_RST)) == 0
+    return (flags & TRACE_TCP_ACK) != 0
+        && (flags & (TRACE_TCP_FIN | TRACE_TCP_SYN | TRACE_TCP_RST)) == 0
         && tcp_length == tcp_header_length;
 }
 
