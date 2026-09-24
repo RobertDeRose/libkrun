@@ -407,8 +407,7 @@ static void forward_packets_to_guest(struct krun_vmnet_bridge *bridge, xpc_objec
 static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
 {
     size_t count = 0;
-    // Leave room for one full private socket batch before each recvmsg().
-    while (count <= KRUN_VMNET_MAX_BATCH_PACKETS - KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES
+    while (count < KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES
            && !atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
         struct iovec iov = {
             .iov_base = bridge->socket_rx_buffer,
@@ -438,10 +437,7 @@ static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
         }
         if (batch > 0) {
             count += decoded;
-            if (count >= bridge->write_batch_size) {
-                return count;
-            }
-            continue;
+            return count;
         }
         if ((size_t)length > bridge->max_packet_size) {
             continue;
@@ -453,9 +449,6 @@ static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
         bridge->tx_iovs[count].iov_len = (size_t)length;
         bridge->tx_packets[count].vm_pkt_size = (size_t)length;
         count++;
-        if (count >= bridge->write_batch_size) {
-            break;
-        }
     }
     return count;
 }
