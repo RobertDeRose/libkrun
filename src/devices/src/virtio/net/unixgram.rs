@@ -10,6 +10,7 @@ use std::process;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
+use super::offload::{complete_checksum, TcpV4GsoPacket, VirtioTxHeader};
 use super::{write_virtio_net_hdr, MAX_BUFFER_SIZE, VNET_HDR_LEN};
 
 const VFKIT_MAGIC: [u8; 4] = *b"VFKT";
@@ -47,6 +48,9 @@ pub struct Unixgram {
     fd: OwnedFd,
     retries: u64,
     batched: bool,
+    software_tx_offload: bool,
+    tx_offload: Option<TcpV4GsoPacket>,
+    tx_offload_buf: Vec<u8>,
     tx_batch: Vec<u8>,
     tx_count: usize,
     rx_datagram: Vec<u8>,
@@ -59,16 +63,16 @@ pub struct Unixgram {
 impl Unixgram {
     /// Create the backend with a pre-established connection to the userspace network proxy.
     pub fn new(fd: OwnedFd) -> Self {
-        Self::with_batching(fd, false)
+        Self::with_batching(fd, false, false)
     }
 
     /// Create the backend for libkrun's private native-vmnet socketpair.
     #[cfg(target_os = "macos")]
-    pub fn new_batched(fd: OwnedFd) -> Self {
-        Self::with_batching(fd, true)
+    pub fn new_batched(fd: OwnedFd, software_tx_offload: bool) -> Self {
+        Self::with_batching(fd, true, software_tx_offload)
     }
 
-    fn with_batching(fd: OwnedFd, batched: bool) -> Self {
+    fn with_batching(fd: OwnedFd, batched: bool, software_tx_offload: bool) -> Self {
         // Ensure the socket is in non-blocking mode.
         match fcntl(&fd, FcntlArg::F_GETFL) {
             Ok(flags) => match OFlag::from_bits(flags) {
@@ -103,6 +107,9 @@ impl Unixgram {
             fd,
             retries: 0,
             batched,
+            software_tx_offload,
+            tx_offload: None,
+            tx_offload_buf: Vec::with_capacity(MAX_BUFFER_SIZE),
             tx_batch,
             tx_count: 0,
             rx_datagram: vec![0; MAX_BUFFER_SIZE],
@@ -249,6 +256,92 @@ impl Unixgram {
         Ok(())
     }
 
+    fn drain_tx_offload(&mut self) -> Result<(), (WriteError, bool)> {
+        let mut progressed = false;
+
+        while self.tx_offload.is_some() {
+            let mut segment = std::mem::take(&mut self.tx_offload_buf);
+            let payload_len = match self
+                .tx_offload
+                .as_ref()
+                .expect("checked above")
+                .build_next_segment(&mut segment)
+            {
+                Ok(payload_len) => payload_len,
+                Err(()) => {
+                    self.tx_offload_buf = segment;
+                    return Err((WriteError::Internal(nix::Error::EINVAL), progressed));
+                }
+            };
+
+            let result = self.queue_batch_frame(&segment);
+            self.tx_offload_buf = segment;
+            match result {
+                Ok(()) => {
+                    progressed = true;
+                    let packet = self.tx_offload.as_mut().expect("checked above");
+                    packet.advance(payload_len);
+                    if packet.is_complete() {
+                        self.tx_offload = None;
+                    }
+                }
+                Err(error) => return Err((error, progressed)),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn write_offloaded_frame(
+        &mut self,
+        virtio_header: &[u8],
+        frame: &[u8],
+    ) -> Result<(), WriteError> {
+        let header = VirtioTxHeader::parse(virtio_header)
+            .map_err(|()| WriteError::Internal(nix::Error::EINVAL))?;
+
+        if header.is_plain() {
+            return self.queue_batch_frame(frame);
+        }
+
+        if header.gso_type() == 0 {
+            let mut completed = std::mem::take(&mut self.tx_offload_buf);
+            let result = complete_checksum(frame, header, &mut completed)
+                .map_err(|()| WriteError::Internal(nix::Error::EINVAL))
+                .and_then(|()| self.queue_batch_frame(&completed));
+            self.tx_offload_buf = completed;
+            return result;
+        }
+
+        if self.tx_offload.is_some() {
+            return Err(WriteError::Internal(nix::Error::EBUSY));
+        }
+
+        self.tx_offload = Some(
+            TcpV4GsoPacket::new(frame, header)
+                .map_err(|()| WriteError::Internal(nix::Error::EINVAL))?,
+        );
+        match self.drain_tx_offload() {
+            Ok(()) => Ok(()),
+            Err((error, false)) => {
+                self.tx_offload = None;
+                Err(error)
+            }
+            Err((WriteError::NothingWritten, true)) => Err(WriteError::PartialWrite),
+            Err((error, true)) => Err(error),
+        }
+    }
+
+    fn finish_batched_writes(&mut self) -> Result<(), WriteError> {
+        if self.tx_offload.is_some() {
+            match self.drain_tx_offload() {
+                Ok(()) => {}
+                Err((error, _)) => return Err(error),
+            }
+        }
+        self.flush_batch()
+    }
+
     fn parse_rx_batch(&mut self, length: usize) -> bool {
         if length > VMNET_BATCH_MAX_DATAGRAM
             || length < VMNET_BATCH_HEADER_LEN + VMNET_BATCH_FRAME_HEADER_LEN
@@ -362,6 +455,9 @@ impl NetBackend for Unixgram {
     /// Try to write a frame to the proxy.
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
         if self.batched {
+            if self.software_tx_offload {
+                return self.write_offloaded_frame(&buf[..hdr_len], &buf[hdr_len..]);
+            }
             return self.queue_batch_frame(&buf[hdr_len..]);
         }
         let result = self.send_datagram(&buf[hdr_len..]);
@@ -372,12 +468,12 @@ impl NetBackend for Unixgram {
     }
 
     fn has_unfinished_write(&self) -> bool {
-        self.batched && self.tx_count > 0
+        self.batched && (self.tx_count > 0 || self.tx_offload.is_some())
     }
 
     fn try_finish_write(&mut self, _hdr_len: usize, _buf: &[u8]) -> Result<(), WriteError> {
         if self.batched {
-            self.flush_batch()
+            self.finish_batched_writes()
         } else {
             // The raw unixgram backend doesn't do partial writes.
             Ok(())
@@ -386,7 +482,7 @@ impl NetBackend for Unixgram {
 
     fn flush_writes(&mut self) -> Result<(), WriteError> {
         if self.batched {
-            self.flush_batch()
+            self.finish_batched_writes()
         } else {
             Ok(())
         }

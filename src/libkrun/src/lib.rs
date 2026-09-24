@@ -1089,6 +1089,8 @@ const NET_ALL_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_HOST_TSO4
     | NET_FEATURE_HOST_TSO6
     | NET_FEATURE_HOST_UFO;
+#[cfg(feature = "net")]
+const NET_VMNET_SOFTWARE_TX_FEATURES: u32 = NET_FEATURE_CSUM | NET_FEATURE_HOST_TSO4;
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
@@ -1224,8 +1226,9 @@ unsafe fn add_vmnet_backend(
     {
         return -libc::EINVAL;
     }
-    // Raw Ethernet only: do not advertise unsupported virtio offloads.
-    if features != 0 {
+    // vmnet remains a raw-Ethernet transport. The bounded guest-TX feature
+    // set is completed in software before frames reach the native bridge.
+    if features != 0 && features != NET_VMNET_SOFTWARE_TX_FEATURES {
         return -libc::ENOTSUP;
     }
     if !CTX_MAP.lock().unwrap().contains_key(&ctx_id) {
@@ -3399,6 +3402,17 @@ mod native_context_tests {
                     0,
                 ),
                 -libc::ENOTSUP
+            );
+            assert_eq!(
+                krun_add_net_vmnet_shared(
+                    u32::MAX,
+                    c"192.168.200.1".as_ptr(),
+                    c"255.255.255.0".as_ptr(),
+                    mac.as_ptr(),
+                    NET_VMNET_SOFTWARE_TX_FEATURES,
+                    0,
+                ),
+                -libc::ENOENT
             );
         }
         assert_eq!(krun_free_ctx(context), KRUN_SUCCESS);

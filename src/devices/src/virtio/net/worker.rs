@@ -18,6 +18,8 @@ use std::time::Instant;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+#[cfg(target_os = "macos")]
+use virtio_bindings::virtio_net::VIRTIO_NET_F_CSUM;
 
 const VMNET_TX_PROFILE_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -134,7 +136,7 @@ impl NetWorker {
         tx_q: DeviceQueue,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
-        _vnet_features: u64,
+        vnet_features: u64,
         cfg_backend: VirtioNetBackend,
     ) -> Result<Self, ConnectError> {
         #[cfg(target_os = "macos")]
@@ -162,14 +164,17 @@ impl NetWorker {
             VirtioNetBackend::VmnetFd(fd) => {
                 // SAFETY: the native vmnet bridge created and transferred this socketpair fd.
                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-                Box::new(Unixgram::new_batched(owned_fd)) as Box<dyn NetBackend + Send>
+                let software_tx_offload =
+                    vnet_features & (1 << VIRTIO_NET_F_CSUM) != 0;
+                Box::new(Unixgram::new_batched(owned_fd, software_tx_offload))
+                    as Box<dyn NetBackend + Send>
             }
             VirtioNetBackend::UnixgramPath(path, vfkit_magic) => {
                 Box::new(Unixgram::open(path, vfkit_magic)?) as Box<dyn NetBackend + Send>
             }
             #[cfg(target_os = "linux")]
             VirtioNetBackend::Tap(tap_name) => {
-                Box::new(Tap::new(tap_name, _vnet_features)?) as Box<dyn NetBackend + Send>
+                Box::new(Tap::new(tap_name, vnet_features)?) as Box<dyn NetBackend + Send>
             }
         };
 

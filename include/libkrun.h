@@ -426,6 +426,9 @@ int32_t krun_add_virtiofs4(uint32_t ctx_id, const char *c_tag,
 #define NET_FEATURE_HOST_TSO6 1 << 12
 #define NET_FEATURE_HOST_UFO 1 << 14
 
+/* Native vmnet guest-TX offloads completed by libkrun in software. */
+#define VMNET_SOFTWARE_TX_FEATURES (NET_FEATURE_CSUM | NET_FEATURE_HOST_TSO4)
+
 /* These are the features enabled by krun_set_passt_fd and krun_set_gvproxy_path. */
 #define COMPAT_NET_FEATURES NET_FEATURE_CSUM | NET_FEATURE_GUEST_CSUM | \
                             NET_FEATURE_GUEST_TSO4 | NET_FEATURE_GUEST_UFO | \
@@ -527,15 +530,16 @@ int32_t krun_add_net_unixgram(uint32_t ctx_id,
  * is executing and does not retain it.
  *
  * This backend requires macOS 26 or later. Other platforms return
- * -ENOTSUP. The backend currently transports raw Ethernet frames only,
- * so "features" must be zero. NET_FLAG_DHCP_CLIENT is the only accepted
- * flag.
+ * -ENOTSUP. vmnet always transports raw Ethernet frames. "features" may
+ * be zero or VMNET_SOFTWARE_TX_FEATURES; with the latter, libkrun completes
+ * guest TX checksums and TCPv4 segmentation in software before vmnet.
+ * NET_FLAG_DHCP_CLIENT is the only accepted flag.
  *
  * Arguments:
  *  "ctx_id"                - the configuration context ID.
  *  "network_serialization" - opaque serialized vmnet network object.
  *  "c_mac"                 - MAC address as an array of 6 uint8_t entries.
- *  "features"              - virtio-net features; must be zero.
+ *  "features"              - zero or VMNET_SOFTWARE_TX_FEATURES.
  *  "flags"                 - generic flags for the network interface.
  *
  * Returns:
@@ -557,7 +561,7 @@ int32_t krun_add_net_vmnet(uint32_t ctx_id,
  * configured statically by the caller and does not run a DHCP client; vmnet's
  * shared-mode DHCP service may remain available for other interfaces. MAC allocation
  * is disabled and c_mac supplies the six-byte unicast MAC used by virtio-net.
- * features and flags must both be zero (raw Ethernet; no offload or DHCP client).
+ * features may be zero or VMNET_SOFTWARE_TX_FEATURES; flags must be zero.
  *
  * macOS 26+ and a net-enabled build are required. The caller needs vmnet setup
  * permission for this call, but may permanently drop privileges before booting
