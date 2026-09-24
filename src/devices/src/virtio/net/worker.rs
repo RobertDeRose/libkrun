@@ -14,9 +14,100 @@ use super::VNET_HDR_LEN;
 use std::os::fd::RawFd;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::thread;
+use std::time::Instant;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+const VMNET_TX_PROFILE_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct TxProfile {
+    enabled: bool,
+    sample: u64,
+    bytes: u64,
+    queue_events: u64,
+    timer_events: u64,
+    backend_writable_events: u64,
+    tx_loop_calls: u64,
+    tx_loop_ns: u128,
+    process_tx_calls: u64,
+    process_tx_ns: u128,
+    descriptor_chains: u64,
+    descriptors: u64,
+    guest_read_calls: u64,
+    guest_read_ns: u128,
+    backend_write_calls: u64,
+    backend_write_ns: u128,
+    flush_calls: u64,
+    flush_ns: u128,
+    deferred_stalls: u64,
+    irq_signals: u64,
+    max_chains_per_process_tx: u64,
+}
+
+impl TxProfile {
+    fn new(enabled: bool) -> Self {
+        Self { enabled, ..Self::default() }
+    }
+
+    fn add_elapsed(total: &mut u128, started: Instant) {
+        *total += started.elapsed().as_nanos();
+    }
+
+    fn maybe_print(&mut self) {
+        if !self.enabled || self.bytes < VMNET_TX_PROFILE_INTERVAL_BYTES {
+            return;
+        }
+
+        let chains_per_process_tx = if self.process_tx_calls == 0 {
+            0.0
+        } else {
+            self.descriptor_chains as f64 / self.process_tx_calls as f64
+        };
+        let descriptors_per_chain = if self.descriptor_chains == 0 {
+            0.0
+        } else {
+            self.descriptors as f64 / self.descriptor_chains as f64
+        };
+
+        eprintln!(
+            "libkrun: virtio-net tx profile sample={} bytes={} queue_events={} timer_events={} \
+backend_writable_events={} tx_loop_calls={} tx_loop_ms={:.3} process_tx_calls={} \
+process_tx_ms={:.3} descriptor_chains={} descriptors={} chains_per_process_tx={:.3} \
+descriptors_per_chain={:.3} max_chains_per_process_tx={} guest_read_calls={} guest_read_ms={:.3} \
+backend_write_calls={} backend_write_ms={:.3} flush_calls={} flush_ms={:.3} \
+deferred_stalls={} irq_signals={}",
+            self.sample,
+            self.bytes,
+            self.queue_events,
+            self.timer_events,
+            self.backend_writable_events,
+            self.tx_loop_calls,
+            self.tx_loop_ns as f64 / 1_000_000.0,
+            self.process_tx_calls,
+            self.process_tx_ns as f64 / 1_000_000.0,
+            self.descriptor_chains,
+            self.descriptors,
+            chains_per_process_tx,
+            descriptors_per_chain,
+            self.max_chains_per_process_tx,
+            self.guest_read_calls,
+            self.guest_read_ns as f64 / 1_000_000.0,
+            self.backend_write_calls,
+            self.backend_write_ns as f64 / 1_000_000.0,
+            self.flush_calls,
+            self.flush_ns as f64 / 1_000_000.0,
+            self.deferred_stalls,
+            self.irq_signals,
+        );
+
+        let next_sample = self.sample + 1;
+        let enabled = self.enabled;
+        *self = Self::new(enabled);
+        self.sample = next_sample;
+    }
+}
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
@@ -34,6 +125,7 @@ pub struct NetWorker {
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
+    tx_profile: TxProfile,
 }
 
 impl NetWorker {
@@ -45,6 +137,11 @@ impl NetWorker {
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
     ) -> Result<Self, ConnectError> {
+        #[cfg(target_os = "macos")]
+        let profile_vmnet_tx = matches!(&cfg_backend, VirtioNetBackend::VmnetFd(_));
+        #[cfg(not(target_os = "macos"))]
+        let profile_vmnet_tx = false;
+
         let backend = match cfg_backend {
             VirtioNetBackend::UnixstreamFd(fd) => {
                 // SAFETY: we need to trust that the library user has configured
@@ -92,6 +189,7 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
+            tx_profile: TxProfile::new(profile_vmnet_tx),
         })
     }
 
@@ -163,6 +261,9 @@ impl NetWorker {
                             }
                             #[cfg(target_os = "macos")]
                             _ if event_set.is_empty() && source == TX_TIMER_FD => {
+                                if self.tx_profile.enabled {
+                                    self.tx_profile.timer_events += 1;
+                                }
                                 self.process_tx_loop();
                             }
                             _ => {
@@ -206,6 +307,9 @@ impl NetWorker {
     }
 
     pub(crate) fn process_tx_queue_event(&mut self) {
+        if self.tx_profile.enabled {
+            self.tx_profile.queue_events += 1;
+        }
         match self.tx_q.event.read() {
             Ok(_) => self.process_tx_loop(),
             Err(e) => {
@@ -227,6 +331,9 @@ impl NetWorker {
     }
 
     pub(crate) fn process_backend_socket_writeable(&mut self) {
+        if self.tx_profile.enabled {
+            self.tx_profile.backend_writable_events += 1;
+        }
         match self
             .backend
             .try_finish_write(VNET_HDR_LEN, &self.tx_frame_buf[..self.tx_frame_len])
@@ -283,11 +390,33 @@ impl NetWorker {
     }
 
     fn process_tx_loop(&mut self) {
+        let loop_started = self.tx_profile.enabled.then(Instant::now);
+        if self.tx_profile.enabled {
+            self.tx_profile.tx_loop_calls += 1;
+        }
+
         loop {
             self.tx_q.queue.disable_notification(&self.mem).unwrap();
 
-            self.tx_has_deferred_frame = match self.process_tx() {
-                Err(TxError::Backend(WriteError::NothingWritten)) => true,
+            let process_started = self.tx_profile.enabled.then(Instant::now);
+            let chains_before = self.tx_profile.descriptor_chains;
+            let result = self.process_tx();
+            if let Some(started) = process_started {
+                self.tx_profile.process_tx_calls += 1;
+                TxProfile::add_elapsed(&mut self.tx_profile.process_tx_ns, started);
+                self.tx_profile.max_chains_per_process_tx = self
+                    .tx_profile
+                    .max_chains_per_process_tx
+                    .max(self.tx_profile.descriptor_chains - chains_before);
+            }
+
+            self.tx_has_deferred_frame = match result {
+                Err(TxError::Backend(WriteError::NothingWritten)) => {
+                    if self.tx_profile.enabled {
+                        self.tx_profile.deferred_stalls += 1;
+                    }
+                    true
+                }
                 Err(e) => {
                     log::error!("Failed to process tx: {e:?}");
                     false
@@ -299,6 +428,11 @@ impl NetWorker {
             if self.tx_has_deferred_frame || !has_new_entries {
                 break;
             }
+        }
+
+        if let Some(started) = loop_started {
+            TxProfile::add_elapsed(&mut self.tx_profile.tx_loop_ns, started);
+            self.tx_profile.maybe_print();
         }
     }
 
@@ -325,11 +459,17 @@ impl NetWorker {
         let mut result = Ok(());
 
         while let Some(head) = tx_queue.pop(&self.mem) {
+            if self.tx_profile.enabled {
+                self.tx_profile.descriptor_chains += 1;
+            }
             let head_index = head.index;
             let mut next_desc = Some(head);
 
             self.tx_iovec.clear();
             while let Some(desc) = next_desc {
+                if self.tx_profile.enabled {
+                    self.tx_profile.descriptors += 1;
+                }
                 if desc.is_write_only() {
                     self.tx_iovec.clear();
                     break;
@@ -339,6 +479,7 @@ impl NetWorker {
             }
 
             // Copy buffer from across multiple descriptors.
+            let guest_read_started = self.tx_profile.enabled.then(Instant::now);
             let mut read_count = 0;
             for (desc_addr, desc_len) in self.tx_iovec.drain(..) {
                 let limit = cmp::min(read_count + desc_len, self.tx_frame_buf.len());
@@ -358,12 +499,25 @@ impl NetWorker {
                 }
             }
 
+            if let Some(started) = guest_read_started {
+                self.tx_profile.guest_read_calls += 1;
+                TxProfile::add_elapsed(&mut self.tx_profile.guest_read_ns, started);
+            }
+
             self.tx_frame_len = read_count;
-            match self
+            let backend_write_started = self.tx_profile.enabled.then(Instant::now);
+            let write_result = self
                 .backend
-                .write_frame(VNET_HDR_LEN, &mut self.tx_frame_buf[..read_count])
-            {
+                .write_frame(VNET_HDR_LEN, &mut self.tx_frame_buf[..read_count]);
+            if let Some(started) = backend_write_started {
+                self.tx_profile.backend_write_calls += 1;
+                TxProfile::add_elapsed(&mut self.tx_profile.backend_write_ns, started);
+            }
+            match write_result {
                 Ok(()) => {
+                    if self.tx_profile.enabled {
+                        self.tx_profile.bytes += read_count as u64;
+                    }
                     self.tx_frame_len = 0;
                     tx_queue
                         .add_used(&self.mem, head_index, 0)
@@ -401,12 +555,21 @@ impl NetWorker {
         }
 
         if result.is_ok() {
-            if let Err(e) = self.backend.flush_writes() {
+            let flush_started = self.tx_profile.enabled.then(Instant::now);
+            let flush_result = self.backend.flush_writes();
+            if let Some(started) = flush_started {
+                self.tx_profile.flush_calls += 1;
+                TxProfile::add_elapsed(&mut self.tx_profile.flush_ns, started);
+            }
+            if let Err(e) = flush_result {
                 result = Err(TxError::Backend(e));
             }
         }
 
         if raise_irq && tx_queue.needs_notification(&self.mem).unwrap() {
+            if self.tx_profile.enabled {
+                self.tx_profile.irq_signals += 1;
+            }
             self.interrupt
                 .try_signal_used_queue()
                 .map_err(TxError::DeviceError)?;
