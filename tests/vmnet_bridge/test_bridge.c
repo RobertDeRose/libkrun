@@ -27,6 +27,7 @@ static atomic_int writes;
 static atomic_int max_write_batch;
 static atomic_int max_read_batch;
 static atomic_int write_calls;
+static atomic_bool release_first_write;
 static atomic_int reads_pending;
 static atomic_int network_releases;
 static atomic_int network_create_calls;
@@ -133,7 +134,7 @@ static interface_ref fake_start(xpc_object_t descriptor, dispatch_queue_t queue,
         struct fake_xpc parameters = {
             .size = is("invalid_packet_size") ? 0 : 2048,
             .read_max_packets = is("batch_cap") ? 128 : 8,
-            .write_max_packets = is("batch_cap") ? 128 : 8,
+            .write_max_packets = (is("batch_cap") || is("batch_coalesce")) ? 128 : 8,
         };
         callback((is("start_failure") || is("permission")) ? VMNET_INVALID_ACCESS : VMNET_SUCCESS, &parameters);
     });
@@ -197,7 +198,7 @@ vmnet_return_t vmnet_read(interface_ref interface, struct vmpktdesc *packets, in
 vmnet_return_t vmnet_write(interface_ref interface, struct vmpktdesc *packets, int *count)
 {
     (void)interface;
-    assert(*count > 0 && *count <= 8);
+    assert(*count > 0 && *count <= ((is("batch_cap") || is("batch_coalesce")) ? 64 : 8));
     for (int i = 0; i < *count; i++) assert(packets[i].vm_pkt_size > 0);
     int current = atomic_load(&max_write_batch);
     while (*count > current
@@ -208,8 +209,11 @@ vmnet_return_t vmnet_write(interface_ref interface, struct vmpktdesc *packets, i
         written = 1;
         *count = 1;
     }
-    atomic_fetch_add(&write_calls, 1);
+    int call = atomic_fetch_add(&write_calls, 1) + 1;
     atomic_fetch_add(&writes, written);
+    if (is("batch_coalesce") && call == 1) {
+        while (!atomic_load(&release_first_write)) usleep(100);
+    }
     return VMNET_SUCCESS;
 }
 
@@ -305,6 +309,9 @@ int main(int argc, char **argv)
         if (is("batch_cap")) {
             assert(native_bridge->read_batch_size == KRUN_VMNET_MAX_BATCH_PACKETS);
             assert(native_bridge->write_batch_size == KRUN_VMNET_MAX_BATCH_PACKETS);
+        } else if (is("batch_coalesce")) {
+            assert(native_bridge->read_batch_size == 8);
+            assert(native_bridge->write_batch_size == KRUN_VMNET_MAX_BATCH_PACKETS);
         } else {
             assert(native_bridge->read_batch_size == 8);
             assert(native_bridge->write_batch_size == 8);
@@ -320,6 +327,15 @@ int main(int argc, char **argv)
             active_interface->event(VMNET_INTERFACE_PACKETS_AVAILABLE, &event);
         });
         recv_wire_batch(fd, "native-reply", 12, 1);
+        if (is("batch_coalesce")) {
+            send_wire_batch(fd, "batch-frame", 11, 32);
+            send_wire_batch(fd, "batch-frame", 11, 32);
+            atomic_store(&release_first_write, true);
+            for (int i = 0; i < 200 && atomic_load(&writes) < 65; i++) usleep(1000);
+            assert(atomic_load(&writes) == 65);
+            assert(atomic_load(&max_write_batch) == KRUN_VMNET_MAX_BATCH_PACKETS);
+            assert(atomic_load(&write_calls) == 2);
+        }
         if (is("batched_io") || is("partial_write")) {
             send_wire_batch(fd, "batch-frame", 11, 8);
             send_wire_batch(fd, "batch-frame", 11, 8);
