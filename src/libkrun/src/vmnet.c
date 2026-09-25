@@ -409,9 +409,18 @@ static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
     size_t count = 0;
     while (count < KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES
            && !atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
+        // Native TSO makes raw datagrams large enough that the extra copy from
+        // socket_rx_buffer into the vmnet TX slot is measurable. Receive
+        // directly into that slot when it is also large enough for a possible
+        // private batch datagram. Batched datagrams still use the scratch
+        // buffer for decoding so the wire format and decoder stay unchanged.
+        bool direct = bridge->max_packet_size >= KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM;
+        uint8_t *packet_buffer = bridge->tx_buffers + count * bridge->max_packet_size;
+        uint8_t *receive_buffer = direct ? packet_buffer : bridge->socket_rx_buffer;
+        size_t receive_capacity = direct ? bridge->max_packet_size : KRUN_VMNET_MAX_FRAME_SIZE;
         struct iovec iov = {
-            .iov_base = bridge->socket_rx_buffer,
-            .iov_len = KRUN_VMNET_MAX_FRAME_SIZE,
+            .iov_base = receive_buffer,
+            .iov_len = receive_capacity,
         };
         struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
         ssize_t length = recvmsg(bridge->fd, &message, 0);
@@ -428,9 +437,18 @@ static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
             continue;
         }
 
+        const uint8_t *data = receive_buffer;
+        if (direct && (size_t)length <= KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM
+            && (size_t)length >= KRUN_VMNET_SOCKET_BATCH_MAGIC_SIZE
+            && memcmp(receive_buffer, KRUN_VMNET_SOCKET_BATCH_MAGIC,
+                      KRUN_VMNET_SOCKET_BATCH_MAGIC_SIZE) == 0) {
+            memcpy(bridge->socket_rx_buffer, receive_buffer, (size_t)length);
+            data = bridge->socket_rx_buffer;
+        }
+
         size_t decoded = 0;
         int batch = decode_socket_batch(
-            bridge, bridge->socket_rx_buffer, (size_t)length, count,
+            bridge, data, (size_t)length, count,
             KRUN_VMNET_MAX_BATCH_PACKETS, &decoded);
         if (batch < 0) {
             continue;
@@ -444,8 +462,10 @@ static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
         }
         reset_packet_batch(
             bridge, &bridge->tx_iovs[count], &bridge->tx_packets[count],
-            bridge->tx_buffers + count * bridge->max_packet_size, 1);
-        memcpy(bridge->tx_iovs[count].iov_base, bridge->socket_rx_buffer, (size_t)length);
+            packet_buffer, 1);
+        if (!direct) {
+            memcpy(packet_buffer, bridge->socket_rx_buffer, (size_t)length);
+        }
         bridge->tx_iovs[count].iov_len = (size_t)length;
         bridge->tx_packets[count].vm_pkt_size = (size_t)length;
         count++;

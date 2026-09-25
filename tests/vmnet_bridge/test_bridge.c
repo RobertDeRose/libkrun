@@ -133,7 +133,8 @@ static interface_ref fake_start(xpc_object_t descriptor, dispatch_queue_t queue,
         assert(!descriptor->allocate_mac); // Descriptor must outlive asynchronous start.
         struct fake_xpc parameters = {
             .size = is("invalid_packet_size") ? 0
-                : (is("offload") || is("serialized_offload") ? KRUN_VMNET_MAX_FRAME_SIZE : 2048),
+                : (is("offload") || is("offload_batched_io") || is("serialized_offload")
+                    ? KRUN_VMNET_MAX_FRAME_SIZE : 2048),
             .read_max_packets = is("batch_cap") ? 128 : 8,
             .write_max_packets = is("batch_cap") ? 128 : 8,
         };
@@ -157,7 +158,7 @@ interface_ref vmnet_start_interface(xpc_object_t descriptor, dispatch_queue_t qu
     atomic_fetch_add(&shared_start_calls, 1);
     assert(descriptor->mode == VMNET_SHARED_MODE);
     assert(descriptor->isolation);
-    bool offload = is("offload");
+    bool offload = is("offload") || is("offload_batched_io");
     assert(!descriptor->allocate_mac);
     assert(descriptor->tso == offload && descriptor->checksum == offload);
     assert(strcmp(descriptor->start, "192.168.200.1") == 0);
@@ -215,7 +216,7 @@ vmnet_return_t vmnet_write(interface_ref interface, struct vmpktdesc *packets, i
     int current = atomic_load(&max_write_batch);
     while (*count > current
            && !atomic_compare_exchange_weak(&max_write_batch, &current, *count)) {}
-    if ((is("batched_io") || is("partial_write")) && *count == 1) usleep(5000);
+    if ((is("batched_io") || is("offload_batched_io") || is("partial_write")) && *count == 1) usleep(5000);
     int written = *count;
     if (is("partial_write") && written > 1) {
         written = 1;
@@ -303,7 +304,7 @@ int main(int argc, char **argv)
     }
     bool serialized = is("serialized") || is("serialized_not_authorized")
         || is("serialized_offload");
-    int enable_offload = is("offload") || is("serialized_offload");
+    int enable_offload = is("offload") || is("offload_batched_io") || is("serialized_offload");
     int result = serialized ? krun_vmnet_start((void *)1, enable_offload, &fd, &bridge)
                             : krun_vmnet_start_shared(
                                   "192.168.200.1", "255.255.255.0", enable_offload, &fd, &bridge);
@@ -348,11 +349,12 @@ int main(int argc, char **argv)
             active_interface->event(VMNET_INTERFACE_PACKETS_AVAILABLE, &event);
         });
         recv_wire_batch(fd, "native-reply", 12, 1);
-        if (is("batched_io") || is("partial_write")) {
+        if (is("batched_io") || is("offload_batched_io") || is("partial_write")) {
             send_wire_batch(fd, "batch-frame", 11, 8);
             send_wire_batch(fd, "batch-frame", 11, 8);
-            for (int i = 0; i < 200 && atomic_load(&writes) < 17; i++) usleep(1000);
-            assert(atomic_load(&writes) == 17);
+            int expected_writes = enable_offload ? 18 : 17;
+            for (int i = 0; i < 200 && atomic_load(&writes) < expected_writes; i++) usleep(1000);
+            assert(atomic_load(&writes) == expected_writes);
             assert(atomic_load(&max_write_batch) > 1);
             if (is("partial_write")) assert(atomic_load(&write_calls) > 2);
 
