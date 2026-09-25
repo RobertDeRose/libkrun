@@ -273,22 +273,29 @@ int main(int argc, char **argv)
     if (is("socket_recv_batch")) {
         int sockets[2];
         assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) == 0);
-        assert(send(sockets[0], "one", 3, 0) == 3);
-        assert(send(sockets[0], "two", 3, 0) == 3);
+        static const char payloads[KRUN_VMNET_SOCKET_RECV_BATCH][4] = {
+            "one", "two", "tri", "for",
+        };
+        for (size_t i = 0; i < KRUN_VMNET_SOCKET_RECV_BATCH; i++) {
+            assert(send(sockets[0], payloads[i], 3, 0) == 3);
+        }
 
-        uint8_t buffers[2][8] = {{0}};
-        struct iovec iovs[2] = {
-            {.iov_base = buffers[0], .iov_len = sizeof(buffers[0])},
-            {.iov_base = buffers[1], .iov_len = sizeof(buffers[1])},
-        };
-        struct krun_msghdr_x messages[2] = {
-            {.msg_iov = &iovs[0], .msg_iovlen = 1},
-            {.msg_iov = &iovs[1], .msg_iovlen = 1},
-        };
-        assert(receive_socket_datagrams(sockets[1], messages, 2) == 2);
-        assert(messages[0].msg_datalen == 3 && messages[1].msg_datalen == 3);
-        assert(memcmp(buffers[0], "one", 3) == 0);
-        assert(memcmp(buffers[1], "two", 3) == 0);
+        uint8_t buffers[KRUN_VMNET_SOCKET_RECV_BATCH][8] = {{0}};
+        struct iovec iovs[KRUN_VMNET_SOCKET_RECV_BATCH] = {0};
+        struct krun_msghdr_x messages[KRUN_VMNET_SOCKET_RECV_BATCH] = {0};
+        for (size_t i = 0; i < KRUN_VMNET_SOCKET_RECV_BATCH; i++) {
+            iovs[i].iov_base = buffers[i];
+            iovs[i].iov_len = sizeof(buffers[i]);
+            messages[i].msg_iov = &iovs[i];
+            messages[i].msg_iovlen = 1;
+        }
+        assert(receive_socket_datagrams(
+                   sockets[1], messages, KRUN_VMNET_SOCKET_RECV_BATCH)
+               == KRUN_VMNET_SOCKET_RECV_BATCH);
+        for (size_t i = 0; i < KRUN_VMNET_SOCKET_RECV_BATCH; i++) {
+            assert(messages[i].msg_datalen == 3);
+            assert(memcmp(buffers[i], payloads[i], 3) == 0);
+        }
         close(sockets[0]);
         close(sockets[1]);
         puts("PASS: socket_recv_batch");

@@ -26,15 +26,13 @@
 #define KRUN_VMNET_SOCKET_BATCH_MAGIC "KRUNVMN1"
 #define KRUN_VMNET_SOCKET_BATCH_MAGIC_SIZE 8
 #define KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES 32
-#define KRUN_VMNET_SOCKET_RECV_BATCH 2
+#define KRUN_VMNET_SOCKET_RECV_BATCH 4
 #define KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE 12
 #define KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE 4
 #define KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM (60 * 1024)
 
-_Static_assert(
-    KRUN_VMNET_SOCKET_RECV_BATCH * KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES
-        <= KRUN_VMNET_MAX_BATCH_PACKETS,
-    "socket receive batch can overflow vmnet TX packet storage");
+#define KRUN_VMNET_TX_PACKET_CAPACITY \
+    (KRUN_VMNET_SOCKET_RECV_BATCH * KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES)
 #ifndef KRUN_VMNET_TIMEOUT_MS
 #define KRUN_VMNET_TIMEOUT_MS 5000
 #endif
@@ -501,7 +499,7 @@ static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
 
         size_t decoded = 0;
         int batch = decode_socket_batch(
-            bridge, data, length, count, KRUN_VMNET_MAX_BATCH_PACKETS, &decoded);
+            bridge, data, length, count, KRUN_VMNET_TX_PACKET_CAPACITY, &decoded);
         if (batch < 0) {
             continue;
         }
@@ -796,7 +794,7 @@ static int32_t start_interface(
         &bridge->rx_buffers, &bridge->rx_iovs, &bridge->rx_packets);
     if (result == 0) {
         result = allocate_packet_batch(
-            bridge, KRUN_VMNET_MAX_BATCH_PACKETS,
+            bridge, KRUN_VMNET_TX_PACKET_CAPACITY,
             &bridge->tx_buffers, &bridge->tx_iovs, &bridge->tx_packets);
     }
     if (result == 0) {
