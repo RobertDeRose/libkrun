@@ -1092,7 +1092,12 @@ const NET_ALL_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_HOST_TSO6
     | NET_FEATURE_HOST_UFO;
 #[cfg(feature = "net")]
-const NET_VMNET_NATIVE_TX_FEATURES: u32 = NET_FEATURE_CSUM | NET_FEATURE_HOST_TSO4;
+const NET_VMNET_NATIVE_TCP_FEATURES: u32 = NET_FEATURE_CSUM
+    | NET_FEATURE_GUEST_CSUM
+    | NET_FEATURE_GUEST_TSO4
+    | NET_FEATURE_GUEST_TSO6
+    | NET_FEATURE_HOST_TSO4
+    | NET_FEATURE_HOST_TSO6;
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
@@ -1228,10 +1233,10 @@ unsafe fn add_vmnet_backend(
     {
         return -libc::EINVAL;
     }
-    // Native vmnet can consume large raw TCP frames and finish their checksums.
-    // Keep the guest feature set intentionally TX-only so this experiment does
-    // not change the already-good host-to-guest path.
-    if features != 0 && features != NET_VMNET_NATIVE_TX_FEATURES {
+    // Native vmnet TSO is bidirectional: vmnet_read() may return large TCP
+    // frames as well as vmnet_write() accepting them. Advertise matching guest
+    // receive offloads so Linux provisions virtio RX buffers for those frames.
+    if features != 0 && features != NET_VMNET_NATIVE_TCP_FEATURES {
         return -libc::ENOTSUP;
     }
     if !CTX_MAP.lock().unwrap().contains_key(&ctx_id) {
@@ -1287,7 +1292,7 @@ pub unsafe extern "C" fn krun_add_net_vmnet(
     if network_serialization.is_null() {
         return -libc::EINVAL;
     }
-    let enable_offload = (features == NET_VMNET_NATIVE_TX_FEATURES) as c_int;
+    let enable_offload = (features == NET_VMNET_NATIVE_TCP_FEATURES) as c_int;
     add_vmnet_backend(ctx_id, c_mac, features, flags, |fd, bridge| {
         krun_vmnet_start(network_serialization, enable_offload, fd, bridge)
     })
@@ -1308,7 +1313,7 @@ pub unsafe extern "C" fn krun_add_net_vmnet_shared(
     if gateway.is_null() || netmask.is_null() || flags != 0 {
         return -libc::EINVAL;
     }
-    let enable_offload = (features == NET_VMNET_NATIVE_TX_FEATURES) as c_int;
+    let enable_offload = (features == NET_VMNET_NATIVE_TCP_FEATURES) as c_int;
     add_vmnet_backend(ctx_id, c_mac, features, flags, |fd, bridge| {
         krun_vmnet_start_shared(gateway, netmask, enable_offload, fd, bridge)
     })
@@ -3414,7 +3419,7 @@ mod native_context_tests {
                     c"192.168.200.1".as_ptr(),
                     c"255.255.255.0".as_ptr(),
                     mac.as_ptr(),
-                    NET_VMNET_NATIVE_TX_FEATURES,
+                    NET_VMNET_NATIVE_TCP_FEATURES,
                     0,
                 ),
                 -libc::ENOENT
