@@ -27,6 +27,7 @@ static atomic_int writes;
 static atomic_int max_write_batch;
 static atomic_int max_read_batch;
 static atomic_int write_calls;
+static atomic_int max_write_packet_size;
 static atomic_int reads_pending;
 static atomic_int network_releases;
 static atomic_int network_create_calls;
@@ -131,7 +132,8 @@ static interface_ref fake_start(xpc_object_t descriptor, dispatch_queue_t queue,
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), queue, ^{
         assert(!descriptor->allocate_mac); // Descriptor must outlive asynchronous start.
         struct fake_xpc parameters = {
-            .size = is("invalid_packet_size") ? 0 : 2048,
+            .size = is("invalid_packet_size") ? 0
+                : (is("offload") || is("serialized_offload") ? KRUN_VMNET_MAX_FRAME_SIZE : 2048),
             .read_max_packets = is("batch_cap") ? 128 : 8,
             .write_max_packets = is("batch_cap") ? 128 : 8,
         };
@@ -144,7 +146,9 @@ interface_ref vmnet_interface_start_with_network(vmnet_network_ref network, xpc_
 {
     assert(network == owned_network);
     assert(!descriptor->isolation);
-    assert(!descriptor->allocate_mac && !descriptor->tso && !descriptor->checksum);
+    bool offload = is("serialized_offload");
+    assert(!descriptor->allocate_mac);
+    assert(descriptor->tso == offload && descriptor->checksum == offload);
     return fake_start(descriptor, queue, callback);
 }
 interface_ref vmnet_start_interface(xpc_object_t descriptor, dispatch_queue_t queue,
@@ -153,7 +157,9 @@ interface_ref vmnet_start_interface(xpc_object_t descriptor, dispatch_queue_t qu
     atomic_fetch_add(&shared_start_calls, 1);
     assert(descriptor->mode == VMNET_SHARED_MODE);
     assert(descriptor->isolation);
-    assert(!descriptor->allocate_mac && !descriptor->tso && !descriptor->checksum);
+    bool offload = is("offload");
+    assert(!descriptor->allocate_mac);
+    assert(descriptor->tso == offload && descriptor->checksum == offload);
     assert(strcmp(descriptor->start, "192.168.200.1") == 0);
     assert(strcmp(descriptor->end, "192.168.200.254") == 0);
     assert(strcmp(descriptor->mask, "255.255.255.0") == 0);
@@ -198,7 +204,14 @@ vmnet_return_t vmnet_write(interface_ref interface, struct vmpktdesc *packets, i
 {
     (void)interface;
     assert(*count > 0 && *count <= 8);
-    for (int i = 0; i < *count; i++) assert(packets[i].vm_pkt_size > 0);
+    for (int i = 0; i < *count; i++) {
+        assert(packets[i].vm_pkt_size > 0);
+        int size = (int)packets[i].vm_pkt_size;
+        int current_size = atomic_load(&max_write_packet_size);
+        while (size > current_size
+               && !atomic_compare_exchange_weak(
+                   &max_write_packet_size, &current_size, size)) {}
+    }
     int current = atomic_load(&max_write_batch);
     while (*count > current
            && !atomic_compare_exchange_weak(&max_write_batch, &current, *count)) {}
@@ -262,8 +275,8 @@ int main(int argc, char **argv)
     if (is("shared_pair")) {
         int fd2 = -1;
         void *bridge2 = NULL;
-        assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.0", &fd, &bridge) == 0);
-        assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.0", &fd2, &bridge2) == 0);
+        assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.0", 0, &fd, &bridge) == 0);
+        assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.0", 0, &fd2, &bridge2) == 0);
         assert(atomic_load(&shared_start_calls) == 2);
         assert(atomic_load(&network_create_calls) == 0);
         close(fd);
@@ -274,21 +287,26 @@ int main(int argc, char **argv)
         return 0;
     }
     if (is("invalid_arguments")) {
-        assert(krun_vmnet_start_shared(NULL, "255.255.255.0", &fd, &bridge) == -EINVAL);
+        assert(krun_vmnet_start_shared(NULL, "255.255.255.0", 0, &fd, &bridge) == -EINVAL);
         const char *bad_gateway[] = {"garbage", "192.168.200.0", "192.168.200.255", "256.1.1.1"};
         for (unsigned i = 0; i < sizeof(bad_gateway) / sizeof(bad_gateway[0]); i++) {
-            assert(krun_vmnet_start_shared(bad_gateway[i], "255.255.255.0", &fd, &bridge) == -EINVAL);
+            assert(krun_vmnet_start_shared(bad_gateway[i], "255.255.255.0", 0, &fd, &bridge) == -EINVAL);
             assert(fd == -1 && bridge == NULL);
         }
-        assert(krun_vmnet_start_shared("192.168.200.1", "255.0.255.0", &fd, &bridge) == -EINVAL);
-        assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.255", &fd, &bridge) == -EINVAL);
-        assert(krun_vmnet_start_shared("192.168.200.1", "0.0.0.0", &fd, &bridge) == -EINVAL);
+        assert(krun_vmnet_start_shared("192.168.200.1", "255.0.255.0", 0, &fd, &bridge) == -EINVAL);
+        assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.255", 0, &fd, &bridge) == -EINVAL);
+        assert(krun_vmnet_start_shared("192.168.200.1", "0.0.0.0", 0, &fd, &bridge) == -EINVAL);
+        assert(krun_vmnet_start_shared(
+            "192.168.200.1", "255.255.255.0", 2, &fd, &bridge) == -EINVAL);
         puts("PASS: invalid_arguments");
         return 0;
     }
-    bool serialized = is("serialized") || is("serialized_not_authorized");
-    int result = serialized ? krun_vmnet_start((void *)1, &fd, &bridge)
-                            : krun_vmnet_start_shared("192.168.200.1", "255.255.255.0", &fd, &bridge);
+    bool serialized = is("serialized") || is("serialized_not_authorized")
+        || is("serialized_offload");
+    int enable_offload = is("offload") || is("serialized_offload");
+    int result = serialized ? krun_vmnet_start((void *)1, enable_offload, &fd, &bridge)
+                            : krun_vmnet_start_shared(
+                                  "192.168.200.1", "255.255.255.0", enable_offload, &fd, &bridge);
     if (is("permission") || is("start_failure")) assert(result == -EACCES);
     else if (is("serialized_not_authorized")) assert(result == -EPERM);
     else if (is("null_interface_success") || is("event_failure")) assert(result == -EIO);
@@ -314,6 +332,16 @@ int main(int argc, char **argv)
         assert(send(fd, "native-frame", 12, 0) == 12);
         for (int i = 0; i < 100 && atomic_load(&writes) == 0; i++) usleep(1000);
         assert(atomic_load(&writes) == 1);
+        if (enable_offload) {
+            size_t large_size = 64 * 1024;
+            uint8_t *large = calloc(1, large_size);
+            assert(large != NULL);
+            assert(send(fd, large, large_size, 0) == (ssize_t)large_size);
+            free(large);
+            for (int i = 0; i < 100 && atomic_load(&writes) < 2; i++) usleep(1000);
+            assert(atomic_load(&writes) == 2);
+            assert(atomic_load(&max_write_packet_size) == (int)large_size);
+        }
         atomic_store(&reads_pending, 1);
         dispatch_sync(active_interface->queue, ^{
             struct fake_xpc event = {.size = 1};

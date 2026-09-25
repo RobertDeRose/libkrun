@@ -1245,10 +1245,12 @@ static int32_t start_interface(
     return 0;
 }
 
-static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_fd, void **out_bridge)
+static int32_t start_network(
+    vmnet_network_ref network, bool isolated, bool enable_offload, int *out_fd, void **out_bridge)
     __attribute__((availability(macos, introduced = 26.0)));
 
-static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_fd, void **out_bridge)
+static int32_t start_network(
+    vmnet_network_ref network, bool isolated, bool enable_offload, int *out_fd, void **out_bridge)
 {
     xpc_object_t descriptor = xpc_dictionary_create(NULL, NULL, 0);
     if (descriptor == NULL) {
@@ -1257,15 +1259,17 @@ static int32_t start_network(vmnet_network_ref network, bool isolated, int *out_
     }
     xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, false);
     xpc_dictionary_set_bool(descriptor, vmnet_enable_isolation_key, isolated);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, false);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, false);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, enable_offload);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, enable_offload);
     return start_interface(network, descriptor, out_fd, out_bridge);
 }
 
-static int32_t start_shared(const char *gateway, const char *netmask, int *out_fd, void **out_bridge)
+static int32_t start_shared(
+    const char *gateway, const char *netmask, bool enable_offload, int *out_fd, void **out_bridge)
     __attribute__((availability(macos, introduced = 26.0)));
 
-static int32_t start_shared(const char *gateway, const char *netmask, int *out_fd, void **out_bridge)
+static int32_t start_shared(
+    const char *gateway, const char *netmask, bool enable_offload, int *out_fd, void **out_bridge)
 {
     struct in_addr address, mask;
     if (inet_pton(AF_INET, gateway, &address) != 1 || inet_pton(AF_INET, netmask, &mask) != 1) {
@@ -1304,15 +1308,17 @@ static int32_t start_shared(const char *gateway, const char *netmask, int *out_f
     xpc_dictionary_set_string(descriptor, vmnet_subnet_mask_key, netmask);
     xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, false);
     xpc_dictionary_set_bool(descriptor, vmnet_enable_isolation_key, true);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, false);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, false);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, enable_offload);
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, enable_offload);
     return start_interface(NULL, descriptor, out_fd, out_bridge);
 }
 #endif
 
-int32_t krun_vmnet_start(const void *network_serialization, int *out_fd, void **out_bridge)
+int32_t krun_vmnet_start(
+    const void *network_serialization, int enable_offload, int *out_fd, void **out_bridge)
 {
-    if (network_serialization == NULL || out_fd == NULL || out_bridge == NULL) {
+    if (network_serialization == NULL || (enable_offload != 0 && enable_offload != 1)
+        || out_fd == NULL || out_bridge == NULL) {
         return -EINVAL;
     }
     *out_fd = -1;
@@ -1327,22 +1333,24 @@ int32_t krun_vmnet_start(const void *network_serialization, int *out_fd, void **
             }
             return vmnet_framework_error("vmnet_network_create_with_serialization", status);
         }
-        return start_network(network, false, out_fd, out_bridge);
+        return start_network(network, false, enable_offload != 0, out_fd, out_bridge);
     }
 #endif
     return -ENOTSUP;
 }
 
-int32_t krun_vmnet_start_shared(const char *gateway, const char *netmask, int *out_fd, void **out_bridge)
+int32_t krun_vmnet_start_shared(
+    const char *gateway, const char *netmask, int enable_offload, int *out_fd, void **out_bridge)
 {
-    if (gateway == NULL || netmask == NULL || out_fd == NULL || out_bridge == NULL) {
+    if (gateway == NULL || netmask == NULL || (enable_offload != 0 && enable_offload != 1)
+        || out_fd == NULL || out_bridge == NULL) {
         return -EINVAL;
     }
     *out_fd = -1;
     *out_bridge = NULL;
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
     if (__builtin_available(macOS 26.0, *)) {
-        return start_shared(gateway, netmask, out_fd, out_bridge);
+        return start_shared(gateway, netmask, enable_offload != 0, out_fd, out_bridge);
     }
 #endif
     return -ENOTSUP;
