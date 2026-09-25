@@ -5,8 +5,6 @@ use nix::sys::socket::{
 };
 use nix::unistd::unlink;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-#[cfg(target_os = "macos")]
-use std::ptr;
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -44,32 +42,6 @@ const VMNET_BATCH_MAX_FRAMES: usize = 32;
 const VMNET_BATCH_HEADER_LEN: usize = 12;
 const VMNET_BATCH_FRAME_HEADER_LEN: usize = 4;
 const VMNET_BATCH_MAX_DATAGRAM: usize = 60 * 1024;
-#[cfg(target_os = "macos")]
-const VMNET_RAW_SEND_BATCH: usize = 2;
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MsgHdrX {
-    msg_name: *mut libc::c_void,
-    msg_namelen: libc::socklen_t,
-    msg_iov: *mut libc::iovec,
-    msg_iovlen: libc::c_int,
-    msg_control: *mut libc::c_void,
-    msg_controllen: libc::socklen_t,
-    msg_flags: libc::c_int,
-    msg_datalen: usize,
-}
-
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn sendmsg_x(
-        socket: libc::c_int,
-        messages: *mut MsgHdrX,
-        count: libc::c_uint,
-        flags: libc::c_int,
-    ) -> libc::ssize_t;
-}
 
 pub struct Unixgram {
     fd: OwnedFd,
@@ -77,10 +49,6 @@ pub struct Unixgram {
     batched: bool,
     tx_batch: Vec<u8>,
     tx_count: usize,
-    #[cfg(target_os = "macos")]
-    tx_raw_datagrams: [Vec<u8>; VMNET_RAW_SEND_BATCH],
-    #[cfg(target_os = "macos")]
-    tx_raw_count: usize,
     rx_datagram: Vec<u8>,
     rx_offsets: [usize; VMNET_BATCH_MAX_FRAMES],
     rx_lengths: [usize; VMNET_BATCH_MAX_FRAMES],
@@ -131,25 +99,12 @@ impl Unixgram {
 
         let mut tx_batch = Vec::with_capacity(VMNET_BATCH_MAX_DATAGRAM);
         tx_batch.resize(VMNET_BATCH_HEADER_LEN, 0);
-        #[cfg(target_os = "macos")]
-        let tx_raw_datagrams = if batched {
-            [
-                Vec::with_capacity(SOCKET_SNDBUF),
-                Vec::with_capacity(SOCKET_SNDBUF),
-            ]
-        } else {
-            [Vec::new(), Vec::new()]
-        };
         Self {
             fd,
             retries: 0,
             batched,
             tx_batch,
             tx_count: 0,
-            #[cfg(target_os = "macos")]
-            tx_raw_datagrams,
-            #[cfg(target_os = "macos")]
-            tx_raw_count: 0,
             rx_datagram: vec![0; MAX_BUFFER_SIZE],
             rx_offsets: [0; VMNET_BATCH_MAX_FRAMES],
             rx_lengths: [0; VMNET_BATCH_MAX_FRAMES],
@@ -250,120 +205,6 @@ impl Unixgram {
         self.finish_send(result, data.len())
     }
 
-    #[cfg(target_os = "macos")]
-    fn send_raw_datagrams(&self) -> Result<usize, nix::Error> {
-        let mut iovs = [
-            libc::iovec {
-                iov_base: ptr::null_mut(),
-                iov_len: 0,
-            };
-            VMNET_RAW_SEND_BATCH
-        ];
-        let empty = MsgHdrX {
-            msg_name: ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: ptr::null_mut(),
-            msg_iovlen: 0,
-            msg_control: ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-            msg_datalen: 0,
-        };
-        let mut messages = [empty; VMNET_RAW_SEND_BATCH];
-
-        for i in 0..self.tx_raw_count {
-            iovs[i].iov_base = self.tx_raw_datagrams[i].as_ptr() as *mut libc::c_void;
-            iovs[i].iov_len = self.tx_raw_datagrams[i].len();
-            messages[i].msg_iov = &mut iovs[i];
-            messages[i].msg_iovlen = 1;
-            messages[i].msg_datalen = self.tx_raw_datagrams[i].len();
-        }
-
-        loop {
-            let sent = unsafe {
-                sendmsg_x(
-                    self.fd.as_raw_fd(),
-                    messages.as_mut_ptr(),
-                    self.tx_raw_count as libc::c_uint,
-                    libc::MSG_DONTWAIT,
-                )
-            };
-            if sent >= 0 {
-                return Ok(sent as usize);
-            }
-            let error = nix::errno::Errno::last();
-            if error != nix::errno::Errno::EINTR {
-                return Err(error);
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn consume_sent_raw_datagrams(&mut self, sent: usize) {
-        let count = self.tx_raw_count;
-        if sent == 0 || sent > count {
-            return;
-        }
-        for i in 0..count - sent {
-            self.tx_raw_datagrams.swap(i, i + sent);
-        }
-        for datagram in &mut self.tx_raw_datagrams[count - sent..count] {
-            datagram.clear();
-        }
-        self.tx_raw_count -= sent;
-    }
-
-    #[cfg(target_os = "macos")]
-    fn flush_raw_datagrams(&mut self) -> Result<(), WriteError> {
-        if self.tx_raw_count == 0 {
-            return Ok(());
-        }
-
-        let expected = self.tx_raw_count;
-        match self.send_raw_datagrams() {
-            Ok(sent) if sent == expected => {
-                self.consume_sent_raw_datagrams(sent);
-                if self.retries > 0 {
-                    info!(
-                        "write_frame: ENOBUFS resolved after {} retries",
-                        self.retries
-                    );
-                    self.retries = 0;
-                }
-                Ok(())
-            }
-            Ok(sent) if sent < expected => {
-                self.consume_sent_raw_datagrams(sent);
-                Err(WriteError::NothingWritten)
-            }
-            Ok(_) => Err(WriteError::PartialWrite),
-            Err(nix::Error::ENOBUFS) => {
-                if self.retries == 0 {
-                    info!("write_frame: ENOBUFS");
-                }
-                self.retries += 1;
-                Err(WriteError::NothingWritten)
-            }
-            #[allow(unreachable_patterns)]
-            Err(nix::Error::EAGAIN | nix::Error::EWOULDBLOCK) => {
-                Err(WriteError::NothingWritten)
-            }
-            Err(e) => Err(WriteError::Internal(e)),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn queue_raw_datagram(&mut self, frame: &[u8]) -> Result<(), WriteError> {
-        if self.tx_raw_count == VMNET_RAW_SEND_BATCH {
-            self.flush_raw_datagrams()?;
-        }
-        let datagram = &mut self.tx_raw_datagrams[self.tx_raw_count];
-        datagram.clear();
-        datagram.extend_from_slice(frame);
-        self.tx_raw_count += 1;
-        Ok(())
-    }
-
     fn flush_batch(&mut self) -> Result<(), WriteError> {
         if self.tx_count == 0 {
             return Ok(());
@@ -391,14 +232,9 @@ impl Unixgram {
             > VMNET_BATCH_MAX_DATAGRAM
         {
             self.flush_batch()?;
-            #[cfg(target_os = "macos")]
-            return self.queue_raw_datagram(frame);
-            #[cfg(not(target_os = "macos"))]
             return self.send_datagram(frame);
         }
 
-        #[cfg(target_os = "macos")]
-        self.flush_raw_datagrams()?;
         if self.tx_count == VMNET_BATCH_MAX_FRAMES
             || self.tx_batch.len() + VMNET_BATCH_FRAME_HEADER_LEN + frame.len()
                 > VMNET_BATCH_MAX_DATAGRAM
@@ -536,35 +372,24 @@ impl NetBackend for Unixgram {
     }
 
     fn has_unfinished_write(&self) -> bool {
-        if !self.batched {
-            return false;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            self.tx_count > 0 || self.tx_raw_count > 0
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.tx_count > 0
-        }
+        self.batched && self.tx_count > 0
     }
 
     fn try_finish_write(&mut self, _hdr_len: usize, _buf: &[u8]) -> Result<(), WriteError> {
         if self.batched {
-            self.flush_batch()?;
-            #[cfg(target_os = "macos")]
-            self.flush_raw_datagrams()?;
+            self.flush_batch()
+        } else {
+            // The raw unixgram backend doesn't do partial writes.
+            Ok(())
         }
-        Ok(())
     }
 
     fn flush_writes(&mut self) -> Result<(), WriteError> {
         if self.batched {
-            self.flush_batch()?;
-            #[cfg(target_os = "macos")]
-            self.flush_raw_datagrams()?;
+            self.flush_batch()
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     fn raw_socket_fd(&self) -> RawFd {
