@@ -27,6 +27,7 @@ static atomic_int writes;
 static atomic_int max_write_batch;
 static atomic_int max_read_batch;
 static atomic_int write_calls;
+static atomic_bool release_first_write;
 static atomic_int max_write_packet_size;
 static atomic_int reads_pending;
 static atomic_int network_releases;
@@ -133,9 +134,10 @@ static interface_ref fake_start(xpc_object_t descriptor, dispatch_queue_t queue,
         assert(!descriptor->allocate_mac); // Descriptor must outlive asynchronous start.
         struct fake_xpc parameters = {
             .size = is("invalid_packet_size") ? 0
-                : (is("offload") || is("serialized_offload") ? KRUN_VMNET_MAX_FRAME_SIZE : 2048),
+                : (is("offload") || is("serialized_offload") || is("gso_coalesce")
+                    ? KRUN_VMNET_MAX_FRAME_SIZE : 2048),
             .read_max_packets = is("batch_cap") ? 128 : 8,
-            .write_max_packets = is("batch_cap") ? 128 : 8,
+            .write_max_packets = (is("batch_cap") || is("gso_coalesce")) ? 128 : 8,
         };
         callback((is("start_failure") || is("permission")) ? VMNET_INVALID_ACCESS : VMNET_SUCCESS, &parameters);
     });
@@ -157,7 +159,7 @@ interface_ref vmnet_start_interface(xpc_object_t descriptor, dispatch_queue_t qu
     atomic_fetch_add(&shared_start_calls, 1);
     assert(descriptor->mode == VMNET_SHARED_MODE);
     assert(descriptor->isolation);
-    bool offload = is("offload");
+    bool offload = is("offload") || is("gso_coalesce");
     assert(!descriptor->allocate_mac);
     assert(descriptor->tso == offload && descriptor->checksum == offload);
     assert(strcmp(descriptor->start, "192.168.200.1") == 0);
@@ -203,7 +205,7 @@ vmnet_return_t vmnet_read(interface_ref interface, struct vmpktdesc *packets, in
 vmnet_return_t vmnet_write(interface_ref interface, struct vmpktdesc *packets, int *count)
 {
     (void)interface;
-    assert(*count > 0 && *count <= 8);
+    assert(*count > 0 && *count <= ((is("batch_cap") || is("gso_coalesce")) ? 64 : 8));
     for (int i = 0; i < *count; i++) {
         assert(packets[i].vm_pkt_size > 0);
         int size = (int)packets[i].vm_pkt_size;
@@ -221,8 +223,11 @@ vmnet_return_t vmnet_write(interface_ref interface, struct vmpktdesc *packets, i
         written = 1;
         *count = 1;
     }
-    atomic_fetch_add(&write_calls, 1);
+    int call = atomic_fetch_add(&write_calls, 1) + 1;
     atomic_fetch_add(&writes, written);
+    if (is("gso_coalesce") && call == 1) {
+        while (!atomic_load(&release_first_write)) usleep(100);
+    }
     return VMNET_SUCCESS;
 }
 
@@ -303,7 +308,7 @@ int main(int argc, char **argv)
     }
     bool serialized = is("serialized") || is("serialized_not_authorized")
         || is("serialized_offload");
-    int enable_offload = is("offload") || is("serialized_offload");
+    int enable_offload = is("offload") || is("serialized_offload") || is("gso_coalesce");
     int result = serialized ? krun_vmnet_start((void *)1, enable_offload, &fd, &bridge)
                             : krun_vmnet_start_shared(
                                   "192.168.200.1", "255.255.255.0", enable_offload, &fd, &bridge);
@@ -323,6 +328,9 @@ int main(int argc, char **argv)
         if (is("batch_cap")) {
             assert(native_bridge->read_batch_size == KRUN_VMNET_MAX_BATCH_PACKETS);
             assert(native_bridge->write_batch_size == KRUN_VMNET_MAX_BATCH_PACKETS);
+        } else if (is("gso_coalesce")) {
+            assert(native_bridge->read_batch_size == 8);
+            assert(native_bridge->write_batch_size == KRUN_VMNET_MAX_BATCH_PACKETS);
         } else {
             assert(native_bridge->read_batch_size == 8);
             assert(native_bridge->write_batch_size == 8);
@@ -332,7 +340,7 @@ int main(int argc, char **argv)
         assert(send(fd, "native-frame", 12, 0) == 12);
         for (int i = 0; i < 100 && atomic_load(&writes) == 0; i++) usleep(1000);
         assert(atomic_load(&writes) == 1);
-        if (enable_offload) {
+        if (enable_offload && !is("gso_coalesce")) {
             size_t large_size = 64 * 1024;
             uint8_t *large = calloc(1, large_size);
             assert(large != NULL);
@@ -348,6 +356,23 @@ int main(int argc, char **argv)
             active_interface->event(VMNET_INTERFACE_PACKETS_AVAILABLE, &event);
         });
         recv_wire_batch(fd, "native-reply", 12, 1);
+        if (is("gso_coalesce")) {
+            const size_t large_size = 64 * 1024;
+            const int sndbuf = 1024 * 1024;
+            assert(setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) == 0);
+            uint8_t *large = calloc(1, large_size);
+            assert(large != NULL);
+            for (int i = 0; i < 4; i++) {
+                assert(send(fd, large, large_size, 0) == (ssize_t)large_size);
+            }
+            free(large);
+            atomic_store(&release_first_write, true);
+            for (int i = 0; i < 200 && atomic_load(&writes) < 5; i++) usleep(1000);
+            assert(atomic_load(&writes) == 5);
+            assert(atomic_load(&max_write_packet_size) == (int)large_size);
+            assert(atomic_load(&max_write_batch) == 4);
+            assert(atomic_load(&write_calls) == 2);
+        }
         if (is("batched_io") || is("partial_write")) {
             send_wire_batch(fd, "batch-frame", 11, 8);
             send_wire_batch(fd, "batch-frame", 11, 8);
