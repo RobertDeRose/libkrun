@@ -4,10 +4,12 @@ use nix::sys::socket::{
     SockFlag, SockType, UnixAddr,
 };
 use nix::unistd::unlink;
+use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
 use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
 use super::offload::{complete_checksum, TcpV4GsoPacket, VirtioTxHeader};
@@ -44,13 +46,61 @@ const VMNET_BATCH_HEADER_LEN: usize = 12;
 const VMNET_BATCH_FRAME_HEADER_LEN: usize = 4;
 const VMNET_BATCH_MAX_DATAGRAM: usize = 60 * 1024;
 
+// Keep a bounded amount of guest-owned GSO work in host memory so virtio TX
+// descriptors can be completed before software segmentation. This is an
+// experiment to isolate descriptor-completion pacing; the actual packets sent
+// to the native vmnet bridge remain identical to the synchronous path.
+const VMNET_GSO_STAGE_MAX_PACKETS: usize = 16;
+const VMNET_GSO_PROFILE_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct GsoStageProfile {
+    staged_packets: u64,
+    staged_bytes: u64,
+    queue_full: u64,
+    ordering_blocks: u64,
+    deferred_flushes: u64,
+    stage_ns: u128,
+    drain_calls: u64,
+    drain_ns: u128,
+    drained_segments: u64,
+    max_depth: usize,
+}
+
+impl GsoStageProfile {
+    fn maybe_print(&mut self) {
+        if self.staged_bytes < VMNET_GSO_PROFILE_INTERVAL_BYTES {
+            return;
+        }
+        eprintln!(
+            concat!(
+                "libkrun: vmnet staged gso profile staged_packets={} staged_bytes={} ",
+                "queue_full={} ordering_blocks={} deferred_flushes={} stage_ms={:.3} ",
+                "drain_calls={} drain_ms={:.3} drained_segments={} max_depth={}"
+            ),
+            self.staged_packets,
+            self.staged_bytes,
+            self.queue_full,
+            self.ordering_blocks,
+            self.deferred_flushes,
+            self.stage_ns as f64 / 1_000_000.0,
+            self.drain_calls,
+            self.drain_ns as f64 / 1_000_000.0,
+            self.drained_segments,
+            self.max_depth,
+        );
+        *self = Self::default();
+    }
+}
+
 pub struct Unixgram {
     fd: OwnedFd,
     retries: u64,
     batched: bool,
     software_tx_offload: bool,
-    tx_offload: Option<TcpV4GsoPacket>,
+    tx_staged_gso: VecDeque<TcpV4GsoPacket>,
     tx_offload_buf: Vec<u8>,
+    gso_stage_profile: GsoStageProfile,
     tx_batch: Vec<u8>,
     tx_count: usize,
     rx_datagram: Vec<u8>,
@@ -108,8 +158,9 @@ impl Unixgram {
             retries: 0,
             batched,
             software_tx_offload,
-            tx_offload: None,
+            tx_staged_gso: VecDeque::with_capacity(VMNET_GSO_STAGE_MAX_PACKETS),
             tx_offload_buf: Vec::with_capacity(MAX_BUFFER_SIZE),
+            gso_stage_profile: GsoStageProfile::default(),
             tx_batch,
             tx_count: 0,
             rx_datagram: vec![0; MAX_BUFFER_SIZE],
@@ -256,39 +307,43 @@ impl Unixgram {
         Ok(())
     }
 
-    fn drain_tx_offload(&mut self) -> Result<(), (WriteError, bool)> {
+    fn drain_staged_gso(&mut self) -> Result<(), (WriteError, bool)> {
+        let started = Instant::now();
+        self.gso_stage_profile.drain_calls += 1;
         let mut progressed = false;
 
-        while self.tx_offload.is_some() {
-            let mut segment = std::mem::take(&mut self.tx_offload_buf);
-            let payload_len = match self
-                .tx_offload
-                .as_ref()
-                .expect("checked above")
-                .build_next_segment(&mut segment)
-            {
-                Ok(payload_len) => payload_len,
-                Err(()) => {
-                    self.tx_offload_buf = segment;
-                    return Err((WriteError::Internal(nix::Error::EINVAL), progressed));
-                }
-            };
+        while let Some(mut packet) = self.tx_staged_gso.pop_front() {
+            while !packet.is_complete() {
+                let mut segment = std::mem::take(&mut self.tx_offload_buf);
+                let payload_len = match packet.build_next_segment(&mut segment) {
+                    Ok(payload_len) => payload_len,
+                    Err(()) => {
+                        self.tx_offload_buf = segment;
+                        self.tx_staged_gso.push_front(packet);
+                        self.gso_stage_profile.drain_ns += started.elapsed().as_nanos();
+                        return Err((WriteError::Internal(nix::Error::EINVAL), progressed));
+                    }
+                };
 
-            let result = self.queue_batch_frame(&segment);
-            self.tx_offload_buf = segment;
-            match result {
-                Ok(()) => {
-                    progressed = true;
-                    let packet = self.tx_offload.as_mut().expect("checked above");
-                    packet.advance(payload_len);
-                    if packet.is_complete() {
-                        self.tx_offload = None;
+                let result = self.queue_batch_frame(&segment);
+                self.tx_offload_buf = segment;
+                match result {
+                    Ok(()) => {
+                        progressed = true;
+                        self.gso_stage_profile.drained_segments += 1;
+                        packet.advance(payload_len);
+                    }
+                    Err(error) => {
+                        self.tx_staged_gso.push_front(packet);
+                        self.gso_stage_profile.drain_ns += started.elapsed().as_nanos();
+                        return Err((error, progressed));
                     }
                 }
-                Err(error) => return Err((error, progressed)),
             }
         }
 
+        self.gso_stage_profile.drain_ns += started.elapsed().as_nanos();
+        self.gso_stage_profile.maybe_print();
         Ok(())
     }
 
@@ -299,6 +354,14 @@ impl Unixgram {
     ) -> Result<(), WriteError> {
         let header = VirtioTxHeader::parse(virtio_header)
             .map_err(|()| WriteError::Internal(nix::Error::EINVAL))?;
+
+        // Once a GSO packet is staged, do not let a later non-GSO frame pass it
+        // on the wire. Stop at that descriptor, notify the guest for the staged
+        // completions, drain them on the retry path, and then consume this frame.
+        if !self.tx_staged_gso.is_empty() && header.gso_type() == 0 {
+            self.gso_stage_profile.ordering_blocks += 1;
+            return Err(WriteError::NothingWritten);
+        }
 
         if header.is_plain() {
             return self.queue_batch_frame(frame);
@@ -313,28 +376,28 @@ impl Unixgram {
             return result;
         }
 
-        if self.tx_offload.is_some() {
-            return Err(WriteError::Internal(nix::Error::EBUSY));
+        if self.tx_staged_gso.len() == VMNET_GSO_STAGE_MAX_PACKETS {
+            self.gso_stage_profile.queue_full += 1;
+            return Err(WriteError::NothingWritten);
         }
 
-        self.tx_offload = Some(
-            TcpV4GsoPacket::new(frame, header)
-                .map_err(|()| WriteError::Internal(nix::Error::EINVAL))?,
-        );
-        match self.drain_tx_offload() {
-            Ok(()) => Ok(()),
-            Err((error, false)) => {
-                self.tx_offload = None;
-                Err(error)
-            }
-            Err((WriteError::NothingWritten, true)) => Err(WriteError::PartialWrite),
-            Err((error, true)) => Err(error),
-        }
+        let stage_started = Instant::now();
+        let packet = TcpV4GsoPacket::new(frame, header)
+            .map_err(|()| WriteError::Internal(nix::Error::EINVAL))?;
+        self.gso_stage_profile.stage_ns += stage_started.elapsed().as_nanos();
+        self.tx_staged_gso.push_back(packet);
+        self.gso_stage_profile.staged_packets += 1;
+        self.gso_stage_profile.staged_bytes += frame.len() as u64;
+        self.gso_stage_profile.max_depth = self
+            .gso_stage_profile
+            .max_depth
+            .max(self.tx_staged_gso.len());
+        Ok(())
     }
 
     fn finish_batched_writes(&mut self) -> Result<(), WriteError> {
-        if self.tx_offload.is_some() {
-            match self.drain_tx_offload() {
+        if !self.tx_staged_gso.is_empty() {
+            match self.drain_staged_gso() {
                 Ok(()) => {}
                 Err((error, _)) => return Err(error),
             }
@@ -468,7 +531,7 @@ impl NetBackend for Unixgram {
     }
 
     fn has_unfinished_write(&self) -> bool {
-        self.batched && (self.tx_count > 0 || self.tx_offload.is_some())
+        self.batched && (self.tx_count > 0 || !self.tx_staged_gso.is_empty())
     }
 
     fn try_finish_write(&mut self, _hdr_len: usize, _buf: &[u8]) -> Result<(), WriteError> {
@@ -482,6 +545,15 @@ impl NetBackend for Unixgram {
 
     fn flush_writes(&mut self) -> Result<(), WriteError> {
         if self.batched {
+            // GSO packets are already host-owned at this point. Do not perform
+            // synchronous segmentation before the worker notifies the guest that
+            // its descriptors are complete. Returning NothingWritten schedules the
+            // normal retry path; try_finish_write() performs the actual drain on
+            // that later turn.
+            if self.software_tx_offload && !self.tx_staged_gso.is_empty() {
+                self.gso_stage_profile.deferred_flushes += 1;
+                return Err(WriteError::NothingWritten);
+            }
             self.finish_batched_writes()
         } else {
             Ok(())
