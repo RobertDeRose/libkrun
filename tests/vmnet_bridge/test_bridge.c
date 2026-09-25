@@ -270,6 +270,30 @@ int main(int argc, char **argv)
 {
     assert(argc == 2);
     scenario = argv[1];
+    if (is("socket_recv_batch")) {
+        int sockets[2];
+        assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) == 0);
+        assert(send(sockets[0], "one", 3, 0) == 3);
+        assert(send(sockets[0], "two", 3, 0) == 3);
+
+        uint8_t buffers[2][8] = {{0}};
+        struct iovec iovs[2] = {
+            {.iov_base = buffers[0], .iov_len = sizeof(buffers[0])},
+            {.iov_base = buffers[1], .iov_len = sizeof(buffers[1])},
+        };
+        struct krun_msghdr_x messages[2] = {
+            {.msg_iov = &iovs[0], .msg_iovlen = 1},
+            {.msg_iov = &iovs[1], .msg_iovlen = 1},
+        };
+        assert(receive_socket_datagrams(sockets[1], messages, 2) == 2);
+        assert(messages[0].msg_datalen == 3 && messages[1].msg_datalen == 3);
+        assert(memcmp(buffers[0], "one", 3) == 0);
+        assert(memcmp(buffers[1], "two", 3) == 0);
+        close(sockets[0]);
+        close(sockets[1]);
+        puts("PASS: socket_recv_batch");
+        return 0;
+    }
     int fd = 99;
     void *bridge = (void *)1;
     if (is("shared_pair")) {

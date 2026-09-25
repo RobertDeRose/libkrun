@@ -26,12 +26,76 @@
 #define KRUN_VMNET_SOCKET_BATCH_MAGIC "KRUNVMN1"
 #define KRUN_VMNET_SOCKET_BATCH_MAGIC_SIZE 8
 #define KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES 32
+#define KRUN_VMNET_SOCKET_RECV_BATCH 2
 #define KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE 12
 #define KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE 4
 #define KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM (60 * 1024)
+
+_Static_assert(
+    KRUN_VMNET_SOCKET_RECV_BATCH * KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES
+        <= KRUN_VMNET_MAX_BATCH_PACKETS,
+    "socket receive batch can overflow vmnet TX packet storage");
 #ifndef KRUN_VMNET_TIMEOUT_MS
 #define KRUN_VMNET_TIMEOUT_MS 5000
 #endif
+
+struct krun_msghdr_x {
+    void *msg_name;
+    socklen_t msg_namelen;
+    struct iovec *msg_iov;
+    int msg_iovlen;
+    void *msg_control;
+    socklen_t msg_controllen;
+    int msg_flags;
+    size_t msg_datalen;
+};
+
+#if defined(__APPLE__)
+// XNU private batch-datagram API. Keep the declaration local so libkrun does
+// not depend on private SDK headers.
+extern ssize_t recvmsg_x(
+    int socket, const struct krun_msghdr_x *messages, unsigned int count, int flags);
+#endif
+
+static ssize_t receive_socket_datagrams(
+    int fd, struct krun_msghdr_x *messages, unsigned int count)
+{
+#if defined(__APPLE__)
+    return recvmsg_x(fd, messages, count, MSG_DONTWAIT);
+#else
+    // The bridge unit tests also run on Linux. Model recvmsg_x semantics with
+    // ordinary non-blocking receives there; production native vmnet is macOS-only.
+    unsigned int received = 0;
+    while (received < count) {
+        struct msghdr message = {
+            .msg_name = messages[received].msg_name,
+            .msg_namelen = messages[received].msg_namelen,
+            .msg_iov = messages[received].msg_iov,
+            .msg_iovlen = messages[received].msg_iovlen,
+            .msg_control = messages[received].msg_control,
+            .msg_controllen = messages[received].msg_controllen,
+            .msg_flags = 0,
+        };
+        ssize_t length = recvmsg(fd, &message, MSG_DONTWAIT);
+        if (length < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) && received > 0) {
+                break;
+            }
+            return received > 0 ? (ssize_t)received : -1;
+        }
+        messages[received].msg_flags = message.msg_flags;
+        messages[received].msg_datalen = (size_t)length;
+        received++;
+        if ((message.msg_flags & MSG_TRUNC) != 0) {
+            break;
+        }
+    }
+    return (ssize_t)received;
+#endif
+}
 
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
 
@@ -64,7 +128,7 @@ struct krun_vmnet_bridge {
     uint8_t *tx_buffers;
     struct iovec *tx_iovs;
     struct vmpktdesc *tx_packets;
-    uint8_t *socket_rx_buffer;
+    uint8_t *socket_rx_buffers;
     atomic_bool stopping;
 };
 
@@ -406,48 +470,54 @@ static void forward_packets_to_guest(struct krun_vmnet_bridge *bridge, xpc_objec
 
 static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
 {
-    size_t count = 0;
-    while (count < KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES
-           && !atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
-        struct iovec iov = {
-            .iov_base = bridge->socket_rx_buffer,
-            .iov_len = KRUN_VMNET_MAX_FRAME_SIZE,
-        };
-        struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
-        ssize_t length = recvmsg(bridge->fd, &message, 0);
-        if (length < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                atomic_store_explicit(&bridge->stopping, true, memory_order_relaxed);
-            }
-            break;
+    struct iovec iovs[KRUN_VMNET_SOCKET_RECV_BATCH];
+    struct krun_msghdr_x messages[KRUN_VMNET_SOCKET_RECV_BATCH] = {0};
+    for (size_t i = 0; i < KRUN_VMNET_SOCKET_RECV_BATCH; i++) {
+        iovs[i].iov_base = bridge->socket_rx_buffers + i * KRUN_VMNET_MAX_FRAME_SIZE;
+        iovs[i].iov_len = KRUN_VMNET_MAX_FRAME_SIZE;
+        messages[i].msg_iov = &iovs[i];
+        messages[i].msg_iovlen = 1;
+    }
+
+    ssize_t received;
+    do {
+        received = receive_socket_datagrams(
+            bridge->fd, messages, KRUN_VMNET_SOCKET_RECV_BATCH);
+    } while (received < 0 && errno == EINTR);
+    if (received < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            atomic_store_explicit(&bridge->stopping, true, memory_order_relaxed);
         }
-        if (length == 0 || (message.msg_flags & MSG_TRUNC) != 0) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (ssize_t i = 0; i < received; i++) {
+        size_t length = messages[i].msg_datalen;
+        if (length == 0 || (messages[i].msg_flags & MSG_TRUNC) != 0) {
             continue;
         }
+        const uint8_t *data = bridge->socket_rx_buffers + (size_t)i * KRUN_VMNET_MAX_FRAME_SIZE;
 
         size_t decoded = 0;
         int batch = decode_socket_batch(
-            bridge, bridge->socket_rx_buffer, (size_t)length, count,
-            KRUN_VMNET_MAX_BATCH_PACKETS, &decoded);
+            bridge, data, length, count, KRUN_VMNET_MAX_BATCH_PACKETS, &decoded);
         if (batch < 0) {
             continue;
         }
         if (batch > 0) {
             count += decoded;
-            return count;
+            continue;
         }
-        if ((size_t)length > bridge->max_packet_size) {
+        if (length > bridge->max_packet_size) {
             continue;
         }
         reset_packet_batch(
             bridge, &bridge->tx_iovs[count], &bridge->tx_packets[count],
             bridge->tx_buffers + count * bridge->max_packet_size, 1);
-        memcpy(bridge->tx_iovs[count].iov_base, bridge->socket_rx_buffer, (size_t)length);
-        bridge->tx_iovs[count].iov_len = (size_t)length;
-        bridge->tx_packets[count].vm_pkt_size = (size_t)length;
+        memcpy(bridge->tx_iovs[count].iov_base, data, length);
+        bridge->tx_iovs[count].iov_len = length;
+        bridge->tx_packets[count].vm_pkt_size = length;
         count++;
     }
     return count;
@@ -523,7 +593,7 @@ static void destroy_bridge(struct krun_vmnet_bridge *bridge)
     free(bridge->tx_packets);
     free(bridge->tx_iovs);
     free(bridge->tx_buffers);
-    free(bridge->socket_rx_buffer);
+    free(bridge->socket_rx_buffers);
     free(bridge);
 }
 
@@ -730,8 +800,9 @@ static int32_t start_interface(
             &bridge->tx_buffers, &bridge->tx_iovs, &bridge->tx_packets);
     }
     if (result == 0) {
-        bridge->socket_rx_buffer = malloc(KRUN_VMNET_MAX_FRAME_SIZE);
-        if (bridge->socket_rx_buffer == NULL) {
+        bridge->socket_rx_buffers = malloc(
+            KRUN_VMNET_SOCKET_RECV_BATCH * KRUN_VMNET_MAX_FRAME_SIZE);
+        if (bridge->socket_rx_buffers == NULL) {
             result = -ENOMEM;
         }
     }
