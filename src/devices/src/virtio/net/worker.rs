@@ -34,6 +34,12 @@ pub struct NetWorker {
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
+
+    // Native vmnet can complete several large GSO descriptors before the guest
+    // acknowledges the shared virtio-mmio VRING status bit. Avoid reinjecting
+    // the same edge while that bit is already pending.
+    #[cfg(target_os = "macos")]
+    suppress_pending_vmnet_irqs: bool,
 }
 
 impl NetWorker {
@@ -45,6 +51,9 @@ impl NetWorker {
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
     ) -> Result<Self, ConnectError> {
+        #[cfg(target_os = "macos")]
+        let suppress_pending_vmnet_irqs = matches!(&cfg_backend, VirtioNetBackend::VmnetFd(_));
+
         let backend = match cfg_backend {
             VirtioNetBackend::UnixstreamFd(fd) => {
                 // SAFETY: we need to trust that the library user has configured
@@ -92,6 +101,9 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
+
+            #[cfg(target_os = "macos")]
+            suppress_pending_vmnet_irqs,
         })
     }
 
@@ -190,6 +202,15 @@ impl NetWorker {
         }
     }
 
+    fn try_signal_used_queue(&self) -> Result<(), crate::Error> {
+        #[cfg(target_os = "macos")]
+        if self.suppress_pending_vmnet_irqs {
+            return self.interrupt.try_signal_used_queue_if_new();
+        }
+
+        self.interrupt.try_signal_used_queue()
+    }
+
     pub(crate) fn process_rx_queue_event(&mut self) {
         if let Err(e) = self.rx_q.event.read() {
             log::error!("Failed to get rx event from queue: {e:?}");
@@ -274,9 +295,7 @@ impl NetWorker {
         // At this point we processed as many Rx frames as possible.
         // We have to wake the guest if at least one descriptor chain has been used.
         if signal_queue {
-            self.interrupt
-                .try_signal_used_queue()
-                .map_err(RxError::DeviceError)?;
+            self.try_signal_used_queue().map_err(RxError::DeviceError)?;
         }
 
         result
@@ -407,9 +426,7 @@ impl NetWorker {
         }
 
         if raise_irq && tx_queue.needs_notification(&self.mem).unwrap() {
-            self.interrupt
-                .try_signal_used_queue()
-                .map_err(TxError::DeviceError)?;
+            self.try_signal_used_queue().map_err(TxError::DeviceError)?;
         }
 
         result
