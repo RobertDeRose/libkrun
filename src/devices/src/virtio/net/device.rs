@@ -39,6 +39,7 @@ pub enum FrontendError {
 pub enum RxError {
     Backend(ReadError),
     DeviceError(DeviceError),
+    QueueError(QueueError),
 }
 
 #[derive(Debug)]

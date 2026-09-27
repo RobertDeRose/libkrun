@@ -243,43 +243,50 @@ impl NetWorker {
     }
 
     fn process_rx(&mut self) -> result::Result<(), RxError> {
-        // if we have a deferred frame we try to process it first,
-        // if that is not possible, we don't continue processing other frames
-        if self.rx_has_deferred_frame {
-            if self.write_frame_to_guest() {
-                self.rx_has_deferred_frame = false;
-            } else {
-                return Ok(());
-            }
-        }
+        // Track used-ring progress, not just successfully delivered frames. A
+        // deferred frame or a rejected guest buffer can also complete a chain.
+        let mut used_queue = false;
+        let result = self.process_rx_frames(&mut used_queue);
 
-        let mut signal_queue = false;
-
-        // Read as many frames as possible.
-        let result = loop {
-            match self.read_into_rx_frame_buf_from_backend() {
-                Ok(()) => {
-                    if self.write_frame_to_guest() {
-                        signal_queue = true;
-                    } else {
-                        self.rx_has_deferred_frame = true;
-                        break Ok(());
-                    }
-                }
-                Err(ReadError::NothingRead) => break Ok(()),
-                Err(e @ ReadError::Internal(_)) => break Err(RxError::Backend(e)),
-            }
-        };
-
-        // At this point we processed as many Rx frames as possible.
-        // We have to wake the guest if at least one descriptor chain has been used.
-        if signal_queue {
+        if used_queue
+            && self
+                .rx_q
+                .queue
+                .needs_notification(&self.mem)
+                .map_err(RxError::QueueError)?
+        {
             self.interrupt
                 .try_signal_used_queue()
                 .map_err(RxError::DeviceError)?;
         }
 
         result
+    }
+
+    fn process_rx_frames(&mut self, used_queue: &mut bool) -> result::Result<(), RxError> {
+        // If we have a deferred frame, finish it before reading another one.
+        if self.rx_has_deferred_frame {
+            if self.write_frame_to_guest(used_queue) {
+                self.rx_has_deferred_frame = false;
+            } else {
+                return Ok(());
+            }
+        }
+
+        // Read as many frames as possible. The caller checks EVENT_IDX once
+        // after the batch, including when a backend error ends the batch.
+        loop {
+            match self.read_into_rx_frame_buf_from_backend() {
+                Ok(()) => {
+                    if !self.write_frame_to_guest(used_queue) {
+                        self.rx_has_deferred_frame = true;
+                        return Ok(());
+                    }
+                }
+                Err(ReadError::NothingRead) => return Ok(()),
+                Err(e @ ReadError::Internal(_)) => return Err(RxError::Backend(e)),
+            }
+        }
     }
 
     fn process_tx_loop(&mut self) {
@@ -416,7 +423,10 @@ impl NetWorker {
     }
 
     // Copies a single frame from `self.rx_frame_buf` into the guest.
-    fn write_frame_to_guest_impl(&mut self) -> result::Result<(), FrontendError> {
+    fn write_frame_to_guest_impl(
+        &mut self,
+        used_queue: &mut bool,
+    ) -> result::Result<(), FrontendError> {
         let mut result: std::result::Result<(), FrontendError> = Ok(());
 
         let queue = &mut self.rx_q.queue;
@@ -461,15 +471,16 @@ impl NetWorker {
         queue
             .add_used(&self.mem, head_index, used_len)
             .map_err(FrontendError::QueueError)?;
+        *used_queue = true;
         result
     }
 
     // Copies a single frame from `self.rx_frame_buf` into the guest. In case of an error retries
     // the operation if possible. Returns true if the operation was successfull.
-    fn write_frame_to_guest(&mut self) -> bool {
+    fn write_frame_to_guest(&mut self, used_queue: &mut bool) -> bool {
         let max_iterations = self.rx_q.queue.actual_size();
         for _ in 0..max_iterations {
-            match self.write_frame_to_guest_impl() {
+            match self.write_frame_to_guest_impl(used_queue) {
                 Ok(()) => return true,
                 Err(FrontendError::EmptyQueue) => {
                     // retry
@@ -489,5 +500,268 @@ impl NetWorker {
     fn read_into_rx_frame_buf_from_backend(&mut self) -> result::Result<(), ReadError> {
         self.rx_frame_buf_len = self.backend.read_frame(&mut self.rx_frame_buf)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue;
+    use crate::virtio::queue::VIRTQ_DESC_F_WRITE;
+    use crate::virtio::{Queue, VIRTIO_MMIO_INT_VRING};
+    use std::collections::VecDeque;
+    use std::num::Wrapping;
+    use std::os::fd::RawFd;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use utils::eventfd::EventFd;
+
+    const FRAME_LEN: usize = 128;
+
+    struct ScriptedBackend(VecDeque<Result<Vec<u8>, ReadError>>);
+
+    impl ScriptedBackend {
+        fn frames(count: usize) -> Self {
+            Self((0..count).map(|_| Ok(vec![0x5a; FRAME_LEN])).collect())
+        }
+    }
+
+    impl NetBackend for ScriptedBackend {
+        fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
+            let frame = self.0.pop_front().unwrap_or(Err(ReadError::NothingRead))?;
+            buf[..frame.len()].copy_from_slice(&frame);
+            Ok(frame.len())
+        }
+
+        fn write_frame(&mut self, _: usize, _: &mut [u8]) -> Result<(), WriteError> {
+            panic!("RX test attempted a backend write")
+        }
+
+        fn has_unfinished_write(&self) -> bool {
+            false
+        }
+
+        fn try_finish_write(&mut self, _: usize, _: &[u8]) -> Result<(), WriteError> {
+            panic!("RX test attempted a deferred backend write")
+        }
+
+        fn raw_socket_fd(&self) -> RawFd {
+            -1
+        }
+    }
+
+    fn worker(
+        mem: &GuestMemoryMmap,
+        rx: &VirtQueue<'_>,
+        event_idx: bool,
+        frames: usize,
+    ) -> NetWorker {
+        let mut queue = rx.create_queue();
+        queue.set_event_idx(event_idx);
+        NetWorker {
+            rx_q: DeviceQueue::new(queue, Arc::new(EventFd::new(0).unwrap())),
+            tx_q: DeviceQueue::new(Queue::new(8), Arc::new(EventFd::new(0).unwrap())),
+            interrupt: InterruptTransport::new(DummyIrqChip::new().into(), "rx-test".into())
+                .unwrap(),
+            mem: mem.clone(),
+            backend: Box::new(ScriptedBackend::frames(frames)),
+            rx_frame_buf: [0; MAX_BUFFER_SIZE],
+            rx_frame_buf_len: 0,
+            rx_has_deferred_frame: false,
+            tx_iovec: Vec::new(),
+            tx_frame_buf: [0; MAX_BUFFER_SIZE],
+            tx_frame_len: 0,
+            tx_has_deferred_frame: false,
+        }
+    }
+
+    fn post_buffer(rx: &VirtQueue<'_>, index: usize, flags: u16) {
+        rx.dtable[index].set(0x10000 + index as u64 * 256, 256, flags, 0);
+        rx.avail.ring[index].set(index as u16);
+        rx.avail.idx.set(index as u16 + 1);
+    }
+
+    fn irq_pending(worker: &NetWorker) -> bool {
+        worker.interrupt.status().load(Ordering::SeqCst) & VIRTIO_MMIO_INT_VRING as usize != 0
+    }
+
+    #[test]
+    fn test_rx_event_idx_batch_thresholds() {
+        for (used_event, notify) in [
+            (0, true),
+            (1, true),
+            (2, false),
+            (7, false),
+            (u16::MAX, false),
+        ] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+            post_buffer(&rx, 0, VIRTQ_DESC_F_WRITE);
+            post_buffer(&rx, 1, VIRTQ_DESC_F_WRITE);
+            rx.avail.event.set(used_event);
+            let mut worker = worker(&mem, &rx, true, 2);
+
+            worker.process_rx().unwrap();
+
+            assert_eq!(rx.used.idx.get(), 2);
+            assert_eq!(rx.used.ring[0].get().len, FRAME_LEN as u32);
+            assert_eq!(rx.used.ring[1].get().len, FRAME_LEN as u32);
+            assert_eq!(irq_pending(&worker), notify, "used_event={used_event}");
+        }
+    }
+
+    #[test]
+    fn test_rx_event_idx_rearms_across_batches() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+        post_buffer(&rx, 0, VIRTQ_DESC_F_WRITE);
+        rx.avail.event.set(1);
+        let mut worker = worker(&mem, &rx, true, 1);
+        worker.process_rx().unwrap();
+        assert!(!irq_pending(&worker));
+
+        post_buffer(&rx, 1, VIRTQ_DESC_F_WRITE);
+        worker.backend = Box::new(ScriptedBackend::frames(1));
+        worker.process_rx().unwrap();
+        assert!(irq_pending(&worker));
+
+        worker.interrupt.status().store(0, Ordering::SeqCst);
+        post_buffer(&rx, 2, VIRTQ_DESC_F_WRITE);
+        worker.backend = Box::new(ScriptedBackend::frames(1));
+        worker.process_rx().unwrap();
+        assert!(
+            !irq_pending(&worker),
+            "already crossed the event in the previous batch"
+        );
+        assert_eq!(rx.used.idx.get(), 3);
+    }
+
+    #[test]
+    fn test_rx_event_idx_deferred_only_completion() {
+        for (used_event, notify) in [(0, true), (1, false)] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+            post_buffer(&rx, 0, VIRTQ_DESC_F_WRITE);
+            rx.avail.event.set(used_event);
+            let mut worker = worker(&mem, &rx, true, 0);
+            worker.rx_has_deferred_frame = true;
+            worker.rx_frame_buf_len = FRAME_LEN;
+
+            worker.process_rx().unwrap();
+
+            assert!(!worker.rx_has_deferred_frame);
+            assert_eq!(rx.used.idx.get(), 1);
+            assert_eq!(irq_pending(&worker), notify);
+        }
+    }
+
+    #[test]
+    fn test_rx_event_idx_rejected_buffer_is_a_completion() {
+        for deferred in [false, true] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+            post_buffer(&rx, 0, 0); // Device-readable, not a valid RX buffer.
+            let mut worker = worker(&mem, &rx, true, usize::from(!deferred));
+            worker.rx_has_deferred_frame = deferred;
+            worker.rx_frame_buf_len = FRAME_LEN;
+
+            worker.process_rx().unwrap();
+
+            assert!(worker.rx_has_deferred_frame);
+            assert_eq!(rx.used.idx.get(), 1);
+            assert_eq!(rx.used.ring[0].get().len, 0);
+            assert!(irq_pending(&worker), "deferred={deferred}");
+        }
+    }
+
+    #[test]
+    fn test_rx_event_idx_completion_before_backend_error() {
+        for (used_event, notify) in [(0, true), (1, false)] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+            post_buffer(&rx, 0, VIRTQ_DESC_F_WRITE);
+            rx.avail.event.set(used_event);
+            let mut worker = worker(&mem, &rx, true, 0);
+            let mut backend = ScriptedBackend::frames(1);
+            backend
+                .0
+                .push_back(Err(ReadError::Internal(nix::errno::Errno::EIO)));
+            worker.backend = Box::new(backend);
+
+            assert!(matches!(worker.process_rx(), Err(RxError::Backend(_))));
+            assert_eq!(rx.used.idx.get(), 1);
+            assert_eq!(irq_pending(&worker), notify);
+        }
+    }
+
+    #[test]
+    fn test_rx_event_idx_no_completion_no_interrupt() {
+        for deferred in [false, true] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+            let mut worker = worker(&mem, &rx, true, 0);
+            worker.rx_has_deferred_frame = deferred;
+            worker.rx_frame_buf_len = FRAME_LEN;
+
+            worker.process_rx().unwrap();
+
+            assert_eq!(rx.used.idx.get(), 0);
+            assert!(!irq_pending(&worker));
+            assert_eq!(worker.rx_has_deferred_frame, deferred);
+        }
+    }
+
+    #[test]
+    fn test_rx_without_event_idx_still_notifies() {
+        for deferred in [false, true] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+            post_buffer(&rx, 0, VIRTQ_DESC_F_WRITE);
+            rx.avail.event.set(u16::MAX); // Must not be consulted without EVENT_IDX.
+            let mut worker = worker(&mem, &rx, false, usize::from(!deferred));
+            worker.rx_has_deferred_frame = deferred;
+            worker.rx_frame_buf_len = FRAME_LEN;
+
+            worker.process_rx().unwrap();
+
+            assert_eq!(rx.used.idx.get(), 1);
+            assert!(irq_pending(&worker));
+        }
+    }
+
+    #[test]
+    fn test_rx_event_idx_used_index_wraparound() {
+        for (used_event, notify) in [(u16::MAX, true), (0, false)] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+            post_buffer(&rx, 0, VIRTQ_DESC_F_WRITE);
+            rx.used.idx.set(u16::MAX);
+            rx.avail.event.set(used_event);
+            let mut worker = worker(&mem, &rx, true, 1);
+            worker.rx_q.queue.next_used = Wrapping(u16::MAX);
+
+            worker.process_rx().unwrap();
+
+            assert_eq!(rx.used.idx.get(), 0);
+            assert_eq!(rx.used.ring[7].get().len, FRAME_LEN as u32);
+            assert_eq!(irq_pending(&worker), notify);
+        }
+    }
+
+    #[test]
+    fn test_rx_event_idx_unreadable_event_is_an_error() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+        post_buffer(&rx, 0, VIRTQ_DESC_F_WRITE);
+        let mut worker = worker(&mem, &rx, true, 1);
+        // Keep avail.idx and ring[0] readable, but move used_event past RAM.
+        worker.rx_q.queue.avail_ring = GuestAddress(0x1fff8);
+        mem.write_obj(1u16, GuestAddress(0x1fffa)).unwrap();
+        mem.write_obj(0u16, GuestAddress(0x1fffc)).unwrap();
+
+        assert!(matches!(worker.process_rx(), Err(RxError::QueueError(_))));
+        assert_eq!(rx.used.idx.get(), 1);
+        assert!(!irq_pending(&worker));
     }
 }
