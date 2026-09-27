@@ -139,31 +139,9 @@ impl InterruptTransport {
         Ok(())
     }
 
-    // virtio-mmio exposes one interrupt status bit for all virtqueues. If that
-    // bit is already pending, another edge for the same cause is redundant; the
-    // guest acknowledges the status before walking its virtqueues.
-    fn try_signal_if_new(&self, status: u32) -> Result<bool, crate::Error> {
-        let previous = self
-            .status()
-            .fetch_or(status as usize, Ordering::SeqCst);
-        if previous & status as usize != 0 {
-            return Ok(false);
-        }
-        self.intc()
-            .lock()
-            .unwrap()
-            .set_irq(self.0.irq_line, Some(&self.0.event))?;
-        Ok(true)
-    }
-
     pub fn try_signal_used_queue(&self) -> Result<(), crate::Error> {
         debug!(target: &self.0.log_target, "interrupt: signal_used_queue");
         self.try_signal(VIRTIO_MMIO_INT_VRING)
-    }
-
-    pub fn try_signal_used_queue_if_new(&self) -> Result<(), crate::Error> {
-        debug!(target: &self.0.log_target, "interrupt: signal_used_queue_if_new");
-        self.try_signal_if_new(VIRTIO_MMIO_INT_VRING).map(|_| ())
     }
 
     pub fn try_signal_config_change(&self) -> Result<(), crate::Error> {
@@ -663,26 +641,6 @@ pub(crate) mod tests {
         d.queue_select = 2;
         assert_eq!(d.with_queue(0, Queue::get_max_size), 0);
         assert!(!d.with_queue_mut(|q| q.size = 16));
-    }
-
-    #[test]
-    fn test_interrupt_signal_if_new() {
-        let interrupt =
-            InterruptTransport::new(DummyIrqChip::new().into(), "test".to_string()).unwrap();
-
-        assert!(interrupt
-            .try_signal_if_new(VIRTIO_MMIO_INT_VRING)
-            .unwrap());
-        assert!(!interrupt
-            .try_signal_if_new(VIRTIO_MMIO_INT_VRING)
-            .unwrap());
-
-        interrupt
-            .status()
-            .fetch_and(!(VIRTIO_MMIO_INT_VRING as usize), Ordering::SeqCst);
-        assert!(interrupt
-            .try_signal_if_new(VIRTIO_MMIO_INT_VRING)
-            .unwrap());
     }
 
     #[test]
