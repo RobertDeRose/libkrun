@@ -118,32 +118,6 @@ impl InterruptTransport {
         self.0.irq_line
     }
 
-    fn read_status_for_guest(&self) -> usize {
-        #[cfg(target_os = "macos")]
-        {
-            // Diagnostic experiment: virtio-pci/MSI-X does not require the guest to
-            // acknowledge a shared transport ISR after every queue interrupt.  Keep
-            // the virtio-mmio status read that Linux expects, but consume the VRING
-            // bit atomically on that read so the following ACK write is not part of
-            // the queue-notification critical path.  CONFIG retains normal MMIO
-            // read-then-write-ack semantics.
-            return self
-                .status()
-                .fetch_and(!(VIRTIO_MMIO_INT_VRING as usize), Ordering::SeqCst);
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        self.status().load(Ordering::SeqCst)
-    }
-
-    fn ack_status_from_guest(&self, status: u32) {
-        #[cfg(target_os = "macos")]
-        let status = status & !VIRTIO_MMIO_INT_VRING;
-
-        self.status()
-            .fetch_and(!(status as usize), Ordering::SeqCst);
-    }
-
     fn set_irq_line(&mut self, irq_line: u32) {
         debug!(target: &self.0.log_target, "set_irq_line: {irq_line}");
         match Arc::get_mut(&mut self.0) {
@@ -422,7 +396,7 @@ impl BusDevice for MmioTransport {
                         .get(self.queue_select as usize)
                         .map_or(0, |c| c.size as u32),
                     0x44 => self.with_queue(0, |q| q.ready as u32),
-                    0x60 => self.interrupt.read_status_for_guest() as u32,
+                    0x60 => self.interrupt.status().load(Ordering::SeqCst) as u32,
                     0x70 => self.device_status,
                     0xfc => self.config_generation,
                     0xb0..=0xbc => {
@@ -506,7 +480,9 @@ impl BusDevice for MmioTransport {
                     }
                     0x64 => {
                         if self.check_device_status(device_status::DRIVER_OK, 0) {
-                            self.interrupt.ack_status_from_guest(v);
+                            self.interrupt
+                                .status()
+                                .fetch_and(!(v as usize), Ordering::SeqCst);
                         }
                     }
                     0x70 => self.set_device_status(v),
@@ -725,13 +701,6 @@ pub(crate) mod tests {
         d.interrupt.status().store(111, Ordering::SeqCst);
         d.read(0, 0x60, &mut buf[..]);
         assert_eq!(read_le_u32(&buf[..]), 111);
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            d.interrupt.status().load(Ordering::SeqCst),
-            111 & !(VIRTIO_MMIO_INT_VRING as usize)
-        );
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(d.interrupt.status().load(Ordering::SeqCst), 111);
 
         d.read(0, 0x70, &mut buf[..]);
         assert_eq!(read_le_u32(&buf[..]), 0);
@@ -913,52 +882,6 @@ pub(crate) mod tests {
 
             assert_eq!(buf1[i..], buf2[i..]);
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_vring_status_is_consumed_on_read_without_losing_a_new_interrupt() {
-        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
-        let mut d = MmioTransport::new(
-            m,
-            DummyIrqChip::new().into(),
-            Arc::new(Mutex::new(DummyDevice::new())),
-        )
-        .unwrap();
-        activate_device(&mut d);
-
-        d.interrupt.status().store(
-            (VIRTIO_MMIO_INT_VRING | VIRTIO_MMIO_INT_CONFIG) as usize,
-            Ordering::SeqCst,
-        );
-
-        let mut buf = [0; 4];
-        d.read(0, 0x60, &mut buf);
-        assert_eq!(
-            read_le_u32(&buf),
-            VIRTIO_MMIO_INT_VRING | VIRTIO_MMIO_INT_CONFIG
-        );
-        assert_eq!(
-            d.interrupt.status().load(Ordering::SeqCst),
-            VIRTIO_MMIO_INT_CONFIG as usize
-        );
-
-        // Model a fresh queue completion arriving after the status read but before
-        // Linux performs its normal INTERRUPT_ACK write.  The stale VRING bit in
-        // that write must not clear this new notification.
-        d.interrupt
-            .status()
-            .fetch_or(VIRTIO_MMIO_INT_VRING as usize, Ordering::SeqCst);
-        write_le_u32(
-            &mut buf,
-            VIRTIO_MMIO_INT_VRING | VIRTIO_MMIO_INT_CONFIG,
-        );
-        d.write(0, 0x64, &buf);
-
-        assert_eq!(
-            d.interrupt.status().load(Ordering::SeqCst),
-            VIRTIO_MMIO_INT_VRING as usize
-        );
     }
 
     #[test]
