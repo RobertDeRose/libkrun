@@ -227,11 +227,11 @@ pub struct DescriptorChain<'a> {
 
 impl<'a> DescriptorChain<'a> {
     pub fn checked_new(
-        mem: &'a GuestMemoryMmap,
+        mem: &GuestMemoryMmap,
         desc_table: GuestAddress,
         queue_size: u16,
         index: u16,
-    ) -> Option<DescriptorChain<'a>> {
+    ) -> Option<DescriptorChain<'_>> {
         Self::checked_new_with_state(
             mem,
             desc_table,
