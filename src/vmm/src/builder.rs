@@ -1882,20 +1882,6 @@ fn attach_mmio_device(
     Ok(())
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-fn attach_msi_mmio_device(
-    vmm: &mut Vmm,
-    id: String,
-    intc: IrqChip,
-    device: Arc<Mutex<dyn VirtioDevice>>,
-) -> std::result::Result<(), device_manager::mmio::Error> {
-    let mmio_device = MmioTransport::new(vmm.guest_memory().clone(), intc, device)?;
-    let type_id = mmio_device.locked_device().device_type();
-    vmm.mmio_device_manager
-        .register_msi_mmio_device(mmio_device, type_id, id)?;
-    Ok(())
-}
-
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 fn attach_fs_devices(
     vmm: &mut Vmm,
@@ -2185,11 +2171,6 @@ fn attach_net_devices(
     for net_device in net_devices.list.iter() {
         let id = net_device.lock().unwrap().id().to_string();
 
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-        attach_msi_mmio_device(vmm, id.clone(), intc.clone(), net_device.clone())
-            .map_err(StartMicrovmError::RegisterNetDevice)?;
-
-        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         attach_mmio_device(vmm, id, intc.clone(), net_device.clone())
             .map_err(StartMicrovmError::RegisterNetDevice)?;
     }
