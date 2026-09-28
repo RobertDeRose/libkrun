@@ -29,8 +29,6 @@ const MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
 //current version specified by the mmio standard (legacy devices used 1 here)
 const MMIO_VERSION: u32 = 2;
 
-const VIRTIO_F_RING_PACKED: u32 = 34;
-
 #[derive(Debug)]
 pub enum CreateMmioTransportError {
     CreateInterruptEventFd(io::Error),
@@ -314,11 +312,8 @@ impl MmioTransport {
         let mut locked_device = self.locked_device();
         let event_idx_enabled =
             (locked_device.acked_features() & (1 << VIRTIO_RING_F_EVENT_IDX)) != 0;
-        let packed_ring_enabled =
-            (locked_device.acked_features() & (1u64 << VIRTIO_F_RING_PACKED)) != 0;
         for dq in &mut device_queues {
             dq.queue.set_event_idx(event_idx_enabled);
-            dq.queue.set_packed_ring(packed_ring_enabled);
         }
         locked_device
             .activate(self.mem.clone(), self.interrupt.clone(), device_queues)
