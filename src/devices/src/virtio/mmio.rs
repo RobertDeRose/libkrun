@@ -131,11 +131,27 @@ impl InterruptTransport {
     }
 
     fn try_signal(&self, status: u32) -> Result<(), crate::Error> {
+        // Serialize the interrupt-status transition with the physical line update.
+        // This matters for level-triggered SPIs: an acknowledge racing a new
+        // notification must not deassert a line whose status bit was just set.
+        let intc = self.intc().lock().unwrap();
         self.status().fetch_or(status as usize, Ordering::SeqCst);
-        self.intc()
-            .lock()
-            .unwrap()
-            .set_irq(self.0.irq_line, Some(&self.0.event))?;
+        intc.set_irq(self.0.irq_line, Some(&self.0.event))?;
+        Ok(())
+    }
+
+    fn try_acknowledge(&self, status: u32) -> Result<(), crate::Error> {
+        // Use the same interrupt-controller lock as try_signal() so clearing the
+        // level cannot race a new notification. Leave the line asserted while
+        // any interrupt-status bit remains pending.
+        let intc = self.intc().lock().unwrap();
+        let previous = self
+            .status()
+            .fetch_and(!(status as usize), Ordering::SeqCst);
+        let remaining = previous & !(status as usize);
+        if remaining == 0 && previous != 0 {
+            intc.clear_irq(self.0.irq_line, Some(&self.0.event))?;
+        }
         Ok(())
     }
 
@@ -288,7 +304,12 @@ impl MmioTransport {
         self.features_select = 0;
         self.acked_features_select = 0;
         self.queue_select = 0;
-        self.interrupt.0.status.store(0, Ordering::SeqCst);
+        if let Err(e) = self.interrupt.try_acknowledge(u32::MAX) {
+            warn!(
+                target: &self.interrupt.0.log_target,
+                "Failed to clear interrupt during reset: {e:?}"
+            );
+        }
         self.device_status = device_status::INIT;
         // Do not reset config_generation and keep it monotonically increasing.
         // Recreate queues from queue_config for the next negotiation cycle.
@@ -480,9 +501,12 @@ impl BusDevice for MmioTransport {
                     }
                     0x64 => {
                         if self.check_device_status(device_status::DRIVER_OK, 0) {
-                            self.interrupt
-                                .status()
-                                .fetch_and(!(v as usize), Ordering::SeqCst);
+                            if let Err(e) = self.interrupt.try_acknowledge(v) {
+                                warn!(
+                                    target: &self.interrupt.0.log_target,
+                                    "Failed to acknowledge interrupt: {e:?}"
+                                );
+                            }
                         }
                     }
                     0x70 => self.set_device_status(v),
