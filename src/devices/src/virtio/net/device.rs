@@ -21,7 +21,7 @@ use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
-use virtio_bindings::virtio_ring::{VIRTIO_RING_F_EVENT_IDX, VIRTIO_RING_F_INDIRECT_DESC};
+use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
 
 const VIRTIO_F_VERSION_1: u32 = 32;
@@ -94,7 +94,6 @@ impl Net {
     ) -> Result<Self> {
         let avail_features = features as u64
             | (1 << VIRTIO_NET_F_MAC)
-            | (1 << VIRTIO_RING_F_INDIRECT_DESC)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
             | (1 << VIRTIO_F_VERSION_1);
 
@@ -210,27 +209,5 @@ impl VirtioDevice for Net {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
-    }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn net_advertises_indirect_descriptors() {
-        let net = Net::new(
-            "test".into(),
-            VirtioNetBackend::UnixstreamPath(PathBuf::from("/tmp/libkrun-test-net.sock")),
-            [0; 6],
-            0,
-        )
-        .unwrap();
-
-        assert_ne!(
-            net.avail_features() & (1 << VIRTIO_RING_F_INDIRECT_DESC),
-            0
-        );
     }
 }
