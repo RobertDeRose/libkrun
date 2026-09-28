@@ -25,7 +25,6 @@ use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
 
 const VIRTIO_F_VERSION_1: u32 = 32;
-const VIRTIO_F_RING_PACKED: u32 = 34;
 
 #[derive(Debug)]
 pub enum FrontendError {
@@ -96,8 +95,7 @@ impl Net {
         let avail_features = features as u64
             | (1 << VIRTIO_NET_F_MAC)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
-            | (1 << VIRTIO_F_VERSION_1)
-            | (1u64 << VIRTIO_F_RING_PACKED);
+            | (1 << VIRTIO_F_VERSION_1);
 
         let config = VirtioNetConfig {
             mac,
