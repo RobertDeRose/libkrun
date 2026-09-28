@@ -29,11 +29,13 @@ pub struct NetWorker {
     rx_frame_buf: [u8; MAX_BUFFER_SIZE],
     rx_frame_buf_len: usize,
     rx_has_deferred_frame: bool,
+    rx_indirect_observed: bool,
 
     tx_iovec: Vec<(GuestAddress, usize)>,
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
+    tx_indirect_observed: bool,
 }
 
 impl NetWorker {
@@ -87,11 +89,13 @@ impl NetWorker {
             rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             rx_frame_buf_len: 0,
             rx_has_deferred_frame: false,
+            rx_indirect_observed: false,
 
             tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
+            tx_indirect_observed: false,
         })
     }
 
@@ -334,15 +338,22 @@ impl NetWorker {
         while let Some(head) = tx_queue.pop(&self.mem) {
             let head_index = head.index;
             let mut next_desc = Some(head);
+            let mut indirect_chain = false;
 
             self.tx_iovec.clear();
             while let Some(desc) = next_desc {
+                indirect_chain |= desc.is_indirect();
                 if desc.is_write_only() {
                     self.tx_iovec.clear();
                     break;
                 }
                 self.tx_iovec.push((desc.addr, desc.len as usize));
                 next_desc = desc.next_descriptor();
+            }
+
+            if indirect_chain && !self.tx_indirect_observed {
+                self.tx_indirect_observed = true;
+                eprintln!("LIBKRUN VIRTIO-NET: indirect descriptors active [queue=tx]");
             }
 
             // Copy buffer from across multiple descriptors.
@@ -437,7 +448,9 @@ impl NetWorker {
 
         let frame_len = frame_slice.len();
         let mut maybe_next_descriptor = Some(head_descriptor);
+        let mut indirect_chain = false;
         while let Some(descriptor) = &maybe_next_descriptor {
+            indirect_chain |= descriptor.is_indirect();
             if frame_slice.is_empty() {
                 break;
             }
@@ -460,6 +473,10 @@ impl NetWorker {
             };
 
             maybe_next_descriptor = descriptor.next_descriptor();
+        }
+        if indirect_chain && !self.rx_indirect_observed {
+            self.rx_indirect_observed = true;
+            eprintln!("LIBKRUN VIRTIO-NET: indirect descriptors active [queue=rx]");
         }
         if result.is_ok() && !frame_slice.is_empty() {
             log::warn!("Receiving buffer is too small to hold frame of current size");
@@ -569,10 +586,12 @@ mod tests {
             rx_frame_buf: [0; MAX_BUFFER_SIZE],
             rx_frame_buf_len: 0,
             rx_has_deferred_frame: false,
+            rx_indirect_observed: false,
             tx_iovec: Vec::new(),
             tx_frame_buf: [0; MAX_BUFFER_SIZE],
             tx_frame_len: 0,
             tx_has_deferred_frame: false,
+            tx_indirect_observed: false,
         }
     }
 
