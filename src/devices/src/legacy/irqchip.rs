@@ -35,6 +35,10 @@ impl IrqChipDevice {
     ) -> Result<(), DeviceError> {
         self.inner.set_irq(irq_line, interrupt_evt)
     }
+
+    pub fn send_msi(&self, irq_line: Option<u32>) -> Result<(), DeviceError> {
+        self.inner.send_msi(irq_line)
+    }
 }
 
 impl BusDevice for IrqChipDevice {
@@ -121,6 +125,10 @@ pub trait IrqChipT: BusDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    fn send_msi(&self, irq_line: Option<u32>) -> Result<(), DeviceError> {
+        self.set_irq(irq_line, None)
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -132,6 +140,10 @@ pub trait IrqChipT: BusDevice + GICDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    fn send_msi(&self, irq_line: Option<u32>) -> Result<(), DeviceError> {
+        self.set_irq(irq_line, None)
+    }
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -143,6 +155,10 @@ pub trait IrqChipT: BusDevice + AIADevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    fn send_msi(&self, irq_line: Option<u32>) -> Result<(), DeviceError> {
+        self.set_irq(irq_line, None)
+    }
 }
 
 #[cfg(any(test, feature = "test_utils"))]

@@ -9,7 +9,10 @@ use crate::legacy::gic::GICDevice;
 use crate::legacy::irqchip::IrqChipT;
 use crate::Error as DeviceError;
 
-use hvf::bindings::{hv_gic_config_t, hv_ipa_t, hv_return_t, HV_SUCCESS};
+use hvf::bindings::{
+    hv_gic_config_t, hv_gic_msi_reg_t_HV_GIC_REG_GICM_SET_SPI_NSR, hv_ipa_t, hv_return_t,
+    HV_SUCCESS,
+};
 use hvf::Error;
 use utils::eventfd::EventFd;
 
@@ -24,11 +27,22 @@ pub struct HvfGicBindings {
         libloading::Symbol<'static, unsafe extern "C" fn(hv_gic_config_t, hv_ipa_t) -> hv_return_t>,
     hv_gic_config_set_redistributor_base:
         libloading::Symbol<'static, unsafe extern "C" fn(hv_gic_config_t, hv_ipa_t) -> hv_return_t>,
+    hv_gic_config_set_msi_region_base:
+        libloading::Symbol<'static, unsafe extern "C" fn(hv_gic_config_t, hv_ipa_t) -> hv_return_t>,
+    hv_gic_config_set_msi_interrupt_range:
+        libloading::Symbol<'static, unsafe extern "C" fn(hv_gic_config_t, u32, u32) -> hv_return_t>,
     hv_gic_get_distributor_size:
         libloading::Symbol<'static, unsafe extern "C" fn(*mut usize) -> hv_return_t>,
     hv_gic_get_redistributor_size:
         libloading::Symbol<'static, unsafe extern "C" fn(*mut usize) -> hv_return_t>,
+    hv_gic_get_msi_region_size:
+        libloading::Symbol<'static, unsafe extern "C" fn(*mut usize) -> hv_return_t>,
+    hv_gic_get_msi_region_base_alignment:
+        libloading::Symbol<'static, unsafe extern "C" fn(*mut usize) -> hv_return_t>,
+    hv_gic_get_spi_interrupt_range:
+        libloading::Symbol<'static, unsafe extern "C" fn(*mut u32, *mut u32) -> hv_return_t>,
     hv_gic_set_spi: libloading::Symbol<'static, unsafe extern "C" fn(u32, bool) -> hv_return_t>,
+    hv_gic_send_msi: libloading::Symbol<'static, unsafe extern "C" fn(hv_ipa_t, u32) -> hv_return_t>,
 }
 
 pub struct HvfGicV3 {
@@ -39,6 +53,9 @@ pub struct HvfGicV3 {
 
     /// Number of CPUs handled by the device
     vcpu_count: u64,
+
+    /// Address of the Hypervisor.framework GIC MSI SET_SPI_NSR register.
+    msi_addr: hv_ipa_t,
 }
 
 static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
@@ -62,13 +79,29 @@ impl HvfGicV3 {
                 hv_gic_config_set_redistributor_base: HVF
                     .get(b"hv_gic_config_set_redistributor_base")
                     .map_err(Error::FindSymbol)?,
+                hv_gic_config_set_msi_region_base: HVF
+                    .get(b"hv_gic_config_set_msi_region_base")
+                    .map_err(Error::FindSymbol)?,
+                hv_gic_config_set_msi_interrupt_range: HVF
+                    .get(b"hv_gic_config_set_msi_interrupt_range")
+                    .map_err(Error::FindSymbol)?,
                 hv_gic_get_distributor_size: HVF
                     .get(b"hv_gic_get_distributor_size")
                     .map_err(Error::FindSymbol)?,
                 hv_gic_get_redistributor_size: HVF
                     .get(b"hv_gic_get_redistributor_size")
                     .map_err(Error::FindSymbol)?,
+                hv_gic_get_msi_region_size: HVF
+                    .get(b"hv_gic_get_msi_region_size")
+                    .map_err(Error::FindSymbol)?,
+                hv_gic_get_msi_region_base_alignment: HVF
+                    .get(b"hv_gic_get_msi_region_base_alignment")
+                    .map_err(Error::FindSymbol)?,
+                hv_gic_get_spi_interrupt_range: HVF
+                    .get(b"hv_gic_get_spi_interrupt_range")
+                    .map_err(Error::FindSymbol)?,
                 hv_gic_set_spi: HVF.get(b"hv_gic_set_spi").map_err(Error::FindSymbol)?,
+                hv_gic_send_msi: HVF.get(b"hv_gic_send_msi").map_err(Error::FindSymbol)?,
             }
         };
 
@@ -105,6 +138,66 @@ impl HvfGicV3 {
             return Err(Error::VmCreate);
         }
 
+        let mut msi_region_size: usize = 0;
+        let ret = unsafe { (bindings.hv_gic_get_msi_region_size)(&mut msi_region_size) };
+        if ret != HV_SUCCESS || msi_region_size == 0 {
+            return Err(Error::VmCreate);
+        }
+
+        let mut msi_region_alignment: usize = 0;
+        let ret = unsafe {
+            (bindings.hv_gic_get_msi_region_base_alignment)(&mut msi_region_alignment)
+        };
+        if ret != HV_SUCCESS
+            || msi_region_alignment == 0
+            || !msi_region_alignment.is_power_of_two()
+        {
+            return Err(Error::VmCreate);
+        }
+
+        let msi_region_size = msi_region_size as u64;
+        let msi_region_alignment = msi_region_alignment as u64;
+        let msi_addr = dist_addr
+            .checked_sub(msi_region_size)
+            .map(|addr| addr & !(msi_region_alignment - 1))
+            .ok_or(Error::VmCreate)?;
+
+        let ret = unsafe {
+            (bindings.hv_gic_config_set_msi_region_base)(gic_config, msi_addr)
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VmCreate);
+        }
+
+        let mut spi_base = 0u32;
+        let mut spi_count = 0u32;
+        let ret = unsafe {
+            (bindings.hv_gic_get_spi_interrupt_range)(&mut spi_base, &mut spi_count)
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VmCreate);
+        }
+
+        // Keep ordinary MMIO devices on the low end of libkrun's SPI range and
+        // reserve the upper 32 IDs for MSI-delivered virtio-net interrupts.
+        const MSI_IRQ_COUNT: u32 = 32;
+        let msi_irq_base = arch::IRQ_MAX + 1 - MSI_IRQ_COUNT;
+        let spi_end = spi_base.checked_add(spi_count).ok_or(Error::VmCreate)?;
+        if msi_irq_base < spi_base || arch::IRQ_MAX >= spi_end {
+            return Err(Error::VmCreate);
+        }
+
+        let ret = unsafe {
+            (bindings.hv_gic_config_set_msi_interrupt_range)(
+                gic_config,
+                msi_irq_base,
+                MSI_IRQ_COUNT,
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VmCreate);
+        }
+
         let ret = unsafe { (bindings.hv_gic_create)(gic_config) };
         if ret != HV_SUCCESS {
             return Err(Error::VmCreate);
@@ -114,6 +207,7 @@ impl HvfGicV3 {
             bindings,
             properties: [dist_addr, dist_size, redists_addr, redists_size],
             vcpu_count,
+            msi_addr: msi_addr + hv_gic_msi_reg_t_HV_GIC_REG_GICM_SET_SPI_NSR as u64,
         })
     }
 }
@@ -145,6 +239,24 @@ impl IrqChipT for HvfGicV3 {
             Err(DeviceError::FailedSignalingUsedQueue(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "IRQ not line configured",
+            )))
+        }
+    }
+
+    fn send_msi(&self, irq_line: Option<u32>) -> Result<(), DeviceError> {
+        if let Some(irq_line) = irq_line {
+            let ret = unsafe { (self.bindings.hv_gic_send_msi)(self.msi_addr, irq_line) };
+            if ret != HV_SUCCESS {
+                Err(DeviceError::FailedSignalingUsedQueue(
+                    std::io::Error::other("HVF returned error when sending MSI"),
+                ))
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(DeviceError::FailedSignalingUsedQueue(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MSI IRQ not configured",
             )))
         }
     }
