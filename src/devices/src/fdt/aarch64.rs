@@ -315,7 +315,7 @@ fn create_virtio_node<T: DeviceInfoForFDT + Clone + Debug>(
     let irq = generate_prop32(&[
         GIC_FDT_IRQ_TYPE_SPI,
         dev_info.irq() - 32,
-        IRQ_TYPE_LEVEL_HI,
+        IRQ_TYPE_EDGE_RISING,
     ]);
 
     let virtio_node = fdt.begin_node(&format!("virtio_mmio@{:x}", dev_info.addr()))?;
