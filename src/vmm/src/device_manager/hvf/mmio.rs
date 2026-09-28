@@ -83,7 +83,6 @@ pub struct MMIODeviceManager {
     mmio_base: u64,
     irq: u32,
     last_irq: u32,
-    msi_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
 }
 
@@ -98,7 +97,6 @@ impl MMIODeviceManager {
             mmio_base: *mmio_base,
             irq: irq_interval.0,
             last_irq: irq_interval.1,
-            msi_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
         }
@@ -111,7 +109,7 @@ impl MMIODeviceManager {
         type_id: u32,
         device_id: String,
     ) -> Result<(u64, u32)> {
-        if self.irq > self.last_irq || self.irq > self.msi_irq {
+        if self.irq > self.last_irq {
             return Err(Error::IrqsExhausted);
         }
 
@@ -135,42 +133,6 @@ impl MMIODeviceManager {
         Ok(ret)
     }
 
-    /// Register a virtio MMIO device whose interrupt is delivered through the
-    /// Hypervisor.framework GIC MSI path. MSI IRQs are allocated downward from
-    /// the high end of the device IRQ range so they cannot collide with wired
-    /// IRQs allocated upward.
-    pub fn register_msi_mmio_device(
-        &mut self,
-        mut mmio_device: devices::virtio::MmioTransport,
-        type_id: u32,
-        device_id: String,
-    ) -> Result<(u64, u32)> {
-        if self.msi_irq < self.irq {
-            return Err(Error::IrqsExhausted);
-        }
-
-        let irq = self.msi_irq;
-        mmio_device.set_irq_line(irq);
-        mmio_device.set_msi_delivery();
-
-        self.bus
-            .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
-            .map_err(Error::BusError)?;
-        let ret = (self.mmio_base, irq);
-        self.id_to_dev_info.insert(
-            (DeviceType::Virtio(type_id), device_id),
-            MMIODeviceInfo {
-                addr: self.mmio_base,
-                len: MMIO_LEN,
-                irq,
-            },
-        );
-        self.mmio_base += MMIO_LEN;
-        self.msi_irq = self.msi_irq.saturating_sub(1);
-
-        Ok(ret)
-    }
-
     #[cfg(target_arch = "aarch64")]
     /// Register an early console at some MMIO address.
     pub fn register_mmio_serial(
@@ -180,7 +142,7 @@ impl MMIODeviceManager {
         intc: IrqChip,
         serial: Arc<Mutex<devices::legacy::Serial>>,
     ) -> Result<()> {
-        if self.irq > self.last_irq || self.irq > self.msi_irq {
+        if self.irq > self.last_irq {
             return Err(Error::IrqsExhausted);
         }
 
@@ -220,7 +182,7 @@ impl MMIODeviceManager {
     #[cfg(target_arch = "aarch64")]
     /// Register a MMIO RTC device.
     pub fn register_mmio_rtc(&mut self, _vm: &Vm, _intc: IrqChip) -> Result<()> {
-        if self.irq > self.last_irq || self.irq > self.msi_irq {
+        if self.irq > self.last_irq {
             return Err(Error::IrqsExhausted);
         }
 
@@ -266,7 +228,7 @@ impl MMIODeviceManager {
 
         event_manager.add_subscriber(gpio.clone()).unwrap();
 
-        if self.irq > self.last_irq || self.irq > self.msi_irq {
+        if self.irq > self.last_irq {
             return Err(Error::IrqsExhausted);
         }
 
@@ -507,27 +469,6 @@ mod tests {
             ),
             "no more IRQs are available".to_string()
         );
-    }
-
-    #[test]
-    fn test_register_msi_virtio_device_allocates_from_high_end() {
-        let guest_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x2000)]).unwrap();
-        let mut device_manager =
-            MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
-        let dummy = Arc::new(Mutex::new(DummyDevice::new()));
-        let mmio_device = devices::virtio::MmioTransport::new(
-            guest_mem,
-            DummyIrqChip::new().into(),
-            dummy,
-        )
-        .unwrap();
-
-        let (_, irq) = device_manager
-            .register_msi_mmio_device(mmio_device, 0, "msi-dummy".to_string())
-            .unwrap();
-        assert_eq!(irq, arch::IRQ_MAX);
-        assert_eq!(device_manager.msi_irq, arch::IRQ_MAX - 1);
-        assert_eq!(device_manager.irq, arch::IRQ_BASE);
     }
 
     #[test]

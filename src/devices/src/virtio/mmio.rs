@@ -86,7 +86,6 @@ struct InterruptTransportInner {
     event: EventFd,
     intc: IrqChip,
     irq_line: Option<u32>,
-    msi_delivery: bool,
 }
 
 #[derive(Clone)]
@@ -100,7 +99,6 @@ impl InterruptTransport {
             event: EventFd::new(0).map_err(CreateMmioTransportError::CreateInterruptEventFd)?,
             intc,
             irq_line: None,
-            msi_delivery: false,
         })))
     }
 
@@ -132,26 +130,12 @@ impl InterruptTransport {
         }
     }
 
-    fn set_msi_delivery(&mut self) {
-        debug!(target: &self.0.log_target, "interrupt delivery: MSI");
-        match Arc::get_mut(&mut self.0) {
-            None => {
-                error!("Cannot change interrupt delivery of activated device");
-            }
-            Some(interrupt) => {
-                interrupt.msi_delivery = true;
-            }
-        }
-    }
-
     fn try_signal(&self, status: u32) -> Result<(), crate::Error> {
         self.status().fetch_or(status as usize, Ordering::SeqCst);
-        let intc = self.intc().lock().unwrap();
-        if self.0.msi_delivery {
-            intc.send_msi(self.0.irq_line)?;
-        } else {
-            intc.set_irq(self.0.irq_line, Some(&self.0.event))?;
-        }
+        self.intc()
+            .lock()
+            .unwrap()
+            .set_irq(self.0.irq_line, Some(&self.0.event))?;
         Ok(())
     }
 
@@ -233,12 +217,6 @@ impl MmioTransport {
     /// NOTE: Can only be called when the device is not activated
     pub fn set_irq_line(&mut self, irq_line: u32) {
         self.interrupt.set_irq_line(irq_line);
-    }
-
-    /// Deliver this device's interrupts through the interrupt controller's MSI path.
-    /// This must be selected before the virtio device is activated.
-    pub fn set_msi_delivery(&mut self) {
-        self.interrupt.set_msi_delivery();
     }
 
     pub fn interrupt_evt(&self) -> &EventFd {
