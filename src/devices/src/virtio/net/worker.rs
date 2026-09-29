@@ -164,17 +164,6 @@ impl NetWorker {
                             .observe_kqueue_ready(self.tx_stats.eventfd_values + 1);
                     }
 
-                    // Service an already-ready TX queue notification before backend
-                    // events from the same wait batch. In particular, a writable
-                    // backend event can opportunistically drain TX and delay reading
-                    // the queue event even though the guest kick is already ready.
-                    // Keep those backend drains, but do not put them ahead of the kick.
-                    if epoll_events[0..ev_cnt].iter().any(|event| {
-                        event.fd() == virtq_tx_ev_fd && event.event_set() == EventSet::IN
-                    }) {
-                        self.process_tx_queue_event();
-                    }
-
                     for event in &epoll_events[0..ev_cnt] {
                         let source = event.fd();
                         let event_set = event.event_set();
@@ -182,7 +171,9 @@ impl NetWorker {
                             EventSet::IN if source == virtq_rx_ev_fd => {
                                 self.process_rx_queue_event();
                             }
-                            EventSet::IN if source == virtq_tx_ev_fd => {}
+                            EventSet::IN if source == virtq_tx_ev_fd => {
+                                self.process_tx_queue_event();
+                            }
                             _ if source == backend_socket => {
                                 if event_set.contains(EventSet::HANG_UP)
                                     || event_set.contains(EventSet::READ_HANG_UP)
