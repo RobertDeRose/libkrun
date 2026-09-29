@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::virtio::QueueNotificationCounter;
+use crate::virtio::{QueueNotificationCounter, QueueNotificationTimingSnapshot};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NetTxStatsSnapshot {
@@ -90,18 +90,31 @@ impl NetTxStatsHandle {
         self.0.enabled.store(true, Ordering::Release);
     }
 
+    pub fn observe_eventfd(&self, eventfd_sequence: u64, value: u64) {
+        self.0
+            .queue_notifications
+            .observe_eventfd(eventfd_sequence, value);
+    }
+
+    pub fn record_irq_signal(&self, signal_sequence: u64) {
+        self.0.queue_notifications.record_irq_signal(signal_sequence);
+    }
+
     pub fn publish(&self, reset_epoch: u64, snapshot: NetTxStatsSnapshot) {
         if self.is_enabled() && self.reset_epoch() == reset_epoch {
             *self.0.snapshot.lock().unwrap() = snapshot;
         }
     }
 
-    pub fn snapshot_and_disable(&self) -> (u64, NetTxStatsSnapshot) {
+    pub fn snapshot_and_disable(
+        &self,
+    ) -> (u64, QueueNotificationTimingSnapshot, NetTxStatsSnapshot) {
         self.0.queue_notifications.set_enabled(false);
         self.0.enabled.store(false, Ordering::Release);
         let queue_notifications = self.0.queue_notifications.load();
+        let queue_notification_timing = self.0.queue_notifications.timing_snapshot();
         let snapshot = *self.0.snapshot.lock().unwrap();
-        (queue_notifications, snapshot)
+        (queue_notifications, queue_notification_timing, snapshot)
     }
 
     #[cfg(test)]
@@ -141,12 +154,38 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (_, snapshot) = handle.snapshot_and_disable();
+        let (_, _, snapshot) = handle.snapshot_and_disable();
         assert_eq!(snapshot.frames, 3);
         assert!(!handle.is_enabled());
 
         handle.queue_notification_counter().increment();
         assert_eq!(handle.snapshot().0, 0);
+    }
+
+    #[test]
+    fn notification_timing_pairs_sampled_notify_with_eventfd_wakeup() {
+        let handle = NetTxStatsHandle::default();
+        let counter = handle.queue_notification_counter();
+        handle.reset_and_enable();
+        for _ in 0..64 {
+            counter.increment();
+        }
+        handle.observe_eventfd(64, 1);
+
+        let (_, timing, _) = handle.snapshot_and_disable();
+        assert_eq!(timing.notify_to_eventfd_samples, 1);
+    }
+
+    #[test]
+    fn notification_timing_pairs_sampled_irq_with_next_notify() {
+        let handle = NetTxStatsHandle::default();
+        let counter = handle.queue_notification_counter();
+        handle.reset_and_enable();
+        handle.record_irq_signal(64);
+        counter.increment();
+
+        let (_, timing, _) = handle.snapshot_and_disable();
+        assert_eq!(timing.irq_to_next_notify_samples, 1);
     }
 
     #[test]

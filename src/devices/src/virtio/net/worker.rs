@@ -243,6 +243,8 @@ impl NetWorker {
                 if self.tx_stats_enabled {
                     self.tx_stats.eventfd_wakeups += 1;
                     self.tx_stats.eventfd_values += value;
+                    self.tx_stats_handle
+                        .observe_eventfd(self.tx_stats.eventfd_values, value);
                 }
                 self.process_tx_loop();
             }
@@ -615,6 +617,10 @@ impl NetWorker {
                 self.interrupt
                     .try_signal_used_queue()
                     .map_err(TxError::DeviceError)?;
+                if self.tx_stats_enabled {
+                    self.tx_stats_handle
+                        .record_irq_signal(self.tx_stats.signal_used_queue_calls);
+                }
                 if let Some(started) = irq_started {
                     self.tx_stats.irq_signal_sample_ns += started.elapsed().as_nanos() as u64;
                     self.tx_stats.timing_sampled_irq_signals += 1;

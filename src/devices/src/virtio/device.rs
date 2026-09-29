@@ -6,7 +6,8 @@
 // found in the THIRD-PARTY file.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use super::{ActivateResult, InterruptTransport, Queue};
 use crate::virtio::AsAny;
@@ -41,11 +42,33 @@ impl DeviceQueue {
     }
 }
 
+const QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE: u64 = 64;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueueNotificationTimingSnapshot {
+    pub notify_to_eventfd_samples: u64,
+    pub notify_to_eventfd_sample_ns: u64,
+    pub notify_to_eventfd_max_ns: u64,
+    pub irq_to_next_notify_samples: u64,
+    pub irq_to_next_notify_sample_ns: u64,
+    pub irq_to_next_notify_max_ns: u64,
+}
+
+#[derive(Default)]
+struct QueueNotificationTimingState {
+    sampled_notify_sequence: u64,
+    sampled_notify_started: Option<Instant>,
+    pending_irq_started: Option<Instant>,
+    snapshot: QueueNotificationTimingSnapshot,
+}
+
 /// Optional low-overhead queue-notification counter used by targeted profiling.
 #[derive(Default)]
 pub struct QueueNotificationCounter {
     enabled: AtomicBool,
     count: AtomicU64,
+    irq_sample_pending: AtomicBool,
+    timing: Mutex<QueueNotificationTimingState>,
 }
 
 impl QueueNotificationCounter {
@@ -55,16 +78,78 @@ impl QueueNotificationCounter {
 
     pub fn reset(&self) {
         self.count.store(0, Ordering::Relaxed);
+        self.irq_sample_pending.store(false, Ordering::Relaxed);
+        *self.timing.lock().unwrap() = QueueNotificationTimingState::default();
     }
 
     pub fn increment(&self) {
-        if self.enabled.load(Ordering::Acquire) {
-            self.count.fetch_add(1, Ordering::Relaxed);
+        if !self.enabled.load(Ordering::Acquire) {
+            return;
         }
+
+        let sequence = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        let sample_notify = sequence % QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE == 0;
+        let consume_irq = self.irq_sample_pending.swap(false, Ordering::AcqRel);
+        if !sample_notify && !consume_irq {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut timing = self.timing.lock().unwrap();
+        if consume_irq {
+            if let Some(started) = timing.pending_irq_started.take() {
+                let elapsed = now.duration_since(started).as_nanos() as u64;
+                timing.snapshot.irq_to_next_notify_samples += 1;
+                timing.snapshot.irq_to_next_notify_sample_ns += elapsed;
+                timing.snapshot.irq_to_next_notify_max_ns =
+                    timing.snapshot.irq_to_next_notify_max_ns.max(elapsed);
+            }
+        }
+        if sample_notify {
+            timing.sampled_notify_sequence = sequence;
+            timing.sampled_notify_started = Some(now);
+        }
+    }
+
+    pub fn observe_eventfd(&self, eventfd_sequence: u64, value: u64) {
+        if !self.enabled.load(Ordering::Acquire)
+            || value != 1
+            || eventfd_sequence % QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE != 0
+        {
+            return;
+        }
+
+        let mut timing = self.timing.lock().unwrap();
+        if timing.sampled_notify_sequence != eventfd_sequence {
+            return;
+        }
+        if let Some(started) = timing.sampled_notify_started.take() {
+            let elapsed = started.elapsed().as_nanos() as u64;
+            timing.snapshot.notify_to_eventfd_samples += 1;
+            timing.snapshot.notify_to_eventfd_sample_ns += elapsed;
+            timing.snapshot.notify_to_eventfd_max_ns =
+                timing.snapshot.notify_to_eventfd_max_ns.max(elapsed);
+        }
+    }
+
+    pub fn record_irq_signal(&self, signal_sequence: u64) {
+        if !self.enabled.load(Ordering::Acquire)
+            || signal_sequence % QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE != 0
+        {
+            return;
+        }
+
+        let mut timing = self.timing.lock().unwrap();
+        timing.pending_irq_started = Some(Instant::now());
+        self.irq_sample_pending.store(true, Ordering::Release);
     }
 
     pub fn load(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
+    }
+
+    pub fn timing_snapshot(&self) -> QueueNotificationTimingSnapshot {
+        self.timing.lock().unwrap().snapshot
     }
 }
 

@@ -682,7 +682,8 @@ pub unsafe extern "C" fn krun_debug_get_net_tx_stats_json(
     else {
         return -libc::ENOENT;
     };
-    let (queue_notify_writes, snapshot) = stats.snapshot_and_disable();
+    let (queue_notify_writes, queue_notification_timing, snapshot) =
+        stats.snapshot_and_disable();
     drop(running);
 
     let json = format!(
@@ -716,7 +717,13 @@ pub unsafe extern "C" fn krun_debug_get_net_tx_stats_json(
             "\"timing_sampled_notification_checks\":{},",
             "\"notification_check_sample_ns\":{},",
             "\"timing_sampled_irq_signals\":{},",
-            "\"irq_signal_sample_ns\":{}}}"
+            "\"irq_signal_sample_ns\":{},",
+            "\"notify_to_eventfd_samples\":{},",
+            "\"notify_to_eventfd_sample_ns\":{},",
+            "\"notify_to_eventfd_max_ns\":{},",
+            "\"irq_to_next_notify_samples\":{},",
+            "\"irq_to_next_notify_sample_ns\":{},",
+            "\"irq_to_next_notify_max_ns\":{}}}"
         ),
         network_index,
         queue_notify_writes,
@@ -759,6 +766,12 @@ pub unsafe extern "C" fn krun_debug_get_net_tx_stats_json(
         snapshot.notification_check_sample_ns,
         snapshot.timing_sampled_irq_signals,
         snapshot.irq_signal_sample_ns,
+        queue_notification_timing.notify_to_eventfd_samples,
+        queue_notification_timing.notify_to_eventfd_sample_ns,
+        queue_notification_timing.notify_to_eventfd_max_ns,
+        queue_notification_timing.irq_to_next_notify_samples,
+        queue_notification_timing.irq_to_next_notify_sample_ns,
+        queue_notification_timing.irq_to_next_notify_max_ns,
     );
     let bytes = json.as_bytes();
     if bytes.len() + 1 > buffer_len as usize {
