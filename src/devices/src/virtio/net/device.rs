@@ -18,8 +18,6 @@ use super::stats::NetTxStatsHandle;
 use super::worker::NetWorker;
 
 use std::cmp;
-#[cfg(target_os = "macos")]
-use std::ffi::c_void;
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
@@ -69,11 +67,7 @@ pub enum VirtioNetBackend {
     UnixstreamPath(PathBuf),
     UnixgramFd(RawFd),
     #[cfg(target_os = "macos")]
-    VmnetFd {
-        fd: RawFd,
-        bridge: usize,
-        write_frame: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32,
-    },
+    VmnetFd(RawFd),
     UnixgramPath(PathBuf, bool),
     #[cfg(target_os = "linux")]
     Tap(String),
