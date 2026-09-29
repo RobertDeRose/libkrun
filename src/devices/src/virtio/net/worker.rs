@@ -238,11 +238,7 @@ impl NetWorker {
 
     pub(crate) fn process_tx_queue_event(&mut self) {
         self.sync_tx_stats();
-        #[cfg(target_os = "macos")]
-        let read_result = self.tx_q.event.read_all();
-        #[cfg(not(target_os = "macos"))]
-        let read_result = self.tx_q.event.read();
-        match read_result {
+        match self.tx_q.event.read() {
             Ok(value) => {
                 if self.tx_stats_enabled {
                     self.tx_stats.eventfd_wakeups += 1;
