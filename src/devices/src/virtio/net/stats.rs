@@ -34,6 +34,16 @@ pub struct NetTxStatsSnapshot {
     pub backend_write_sample_ns: u64,
     pub timing_sampled_flushes: u64,
     pub flush_sample_ns: u64,
+    pub timing_sampled_drain_cycles: u64,
+    pub timing_sampled_drain_frames: u64,
+    pub drain_cycle_sample_ns: u64,
+    pub tx_queue_disable_sample_ns: u64,
+    pub tx_queue_enable_sample_ns: u64,
+    pub add_used_sample_ns: u64,
+    pub timing_sampled_notification_checks: u64,
+    pub notification_check_sample_ns: u64,
+    pub timing_sampled_irq_signals: u64,
+    pub irq_signal_sample_ns: u64,
 }
 
 struct NetTxStatsShared {

@@ -342,7 +342,16 @@ impl NetWorker {
     fn process_tx_loop(&mut self) {
         self.sync_tx_stats();
         loop {
+            let timing_sample = self.tx_stats_enabled
+                && self.tx_stats.drain_passes % TX_TIMING_SAMPLE_STRIDE == 0;
+            let cycle_started = timing_sample.then(Instant::now);
+            let frames_before = self.tx_stats.frames;
+
+            let disable_started = timing_sample.then(Instant::now);
             self.tx_q.queue.disable_notification(&self.mem).unwrap();
+            if let Some(started) = disable_started {
+                self.tx_stats.tx_queue_disable_sample_ns += started.elapsed().as_nanos() as u64;
+            }
 
             self.tx_has_deferred_frame = match self.process_tx() {
                 Err(TxError::Backend(WriteError::NothingWritten)) => true,
@@ -353,7 +362,18 @@ impl NetWorker {
                 _ => false,
             };
 
+            let enable_started = timing_sample.then(Instant::now);
             let has_new_entries = self.tx_q.queue.enable_notification(&self.mem).unwrap();
+            if let Some(started) = enable_started {
+                self.tx_stats.tx_queue_enable_sample_ns += started.elapsed().as_nanos() as u64;
+            }
+            if let Some(started) = cycle_started {
+                self.tx_stats.drain_cycle_sample_ns += started.elapsed().as_nanos() as u64;
+                self.tx_stats.timing_sampled_drain_cycles += 1;
+                self.tx_stats.timing_sampled_drain_frames +=
+                    self.tx_stats.frames.saturating_sub(frames_before);
+            }
+
             if self.tx_has_deferred_frame || !has_new_entries {
                 break;
             }
@@ -487,9 +507,13 @@ impl NetWorker {
                         flush_bytes += backend_bytes;
                     }
                     self.tx_frame_len = 0;
+                    let add_used_started = timing_sample.then(Instant::now);
                     tx_queue
                         .add_used(&self.mem, head_index, 0)
                         .map_err(TxError::QueueError)?;
+                    if let Some(started) = add_used_started {
+                        self.tx_stats.add_used_sample_ns += started.elapsed().as_nanos() as u64;
+                    }
                     raise_irq = true;
                 }
                 Err(WriteError::NothingWritten) => {
@@ -571,17 +595,30 @@ impl NetWorker {
         }
 
         if raise_irq {
+            let timing_sample_notification = self.tx_stats_enabled
+                && self.tx_stats.notification_checks % TX_TIMING_SAMPLE_STRIDE == 0;
             if self.tx_stats_enabled {
                 self.tx_stats.notification_checks += 1;
             }
-            if tx_queue.needs_notification(&self.mem).unwrap() {
+            let notification_started = timing_sample_notification.then(Instant::now);
+            let needs_notification = tx_queue.needs_notification(&self.mem).unwrap();
+            if let Some(started) = notification_started {
+                self.tx_stats.notification_check_sample_ns += started.elapsed().as_nanos() as u64;
+                self.tx_stats.timing_sampled_notification_checks += 1;
+            }
+            if needs_notification {
                 if self.tx_stats_enabled {
                     self.tx_stats.notification_true += 1;
                     self.tx_stats.signal_used_queue_calls += 1;
                 }
+                let irq_started = timing_sample_notification.then(Instant::now);
                 self.interrupt
                     .try_signal_used_queue()
                     .map_err(TxError::DeviceError)?;
+                if let Some(started) = irq_started {
+                    self.tx_stats.irq_signal_sample_ns += started.elapsed().as_nanos() as u64;
+                    self.tx_stats.timing_sampled_irq_signals += 1;
+                }
             } else if self.tx_stats_enabled {
                 self.tx_stats.notification_false += 1;
             }

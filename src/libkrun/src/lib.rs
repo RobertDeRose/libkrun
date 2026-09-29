@@ -706,7 +706,17 @@ pub unsafe extern "C" fn krun_debug_get_net_tx_stats_json(
             "\"descriptor_parse_sample_ns\":{},",
             "\"guest_copy_sample_ns\":{},",
             "\"backend_write_sample_ns\":{},",
-            "\"timing_sampled_flushes\":{},\"flush_sample_ns\":{}}}"
+            "\"timing_sampled_flushes\":{},\"flush_sample_ns\":{},",
+            "\"timing_sampled_drain_cycles\":{},",
+            "\"timing_sampled_drain_frames\":{},",
+            "\"drain_cycle_sample_ns\":{},",
+            "\"tx_queue_disable_sample_ns\":{},",
+            "\"tx_queue_enable_sample_ns\":{},",
+            "\"add_used_sample_ns\":{},",
+            "\"timing_sampled_notification_checks\":{},",
+            "\"notification_check_sample_ns\":{},",
+            "\"timing_sampled_irq_signals\":{},",
+            "\"irq_signal_sample_ns\":{}}}"
         ),
         network_index,
         queue_notify_writes,
@@ -739,6 +749,16 @@ pub unsafe extern "C" fn krun_debug_get_net_tx_stats_json(
         snapshot.backend_write_sample_ns,
         snapshot.timing_sampled_flushes,
         snapshot.flush_sample_ns,
+        snapshot.timing_sampled_drain_cycles,
+        snapshot.timing_sampled_drain_frames,
+        snapshot.drain_cycle_sample_ns,
+        snapshot.tx_queue_disable_sample_ns,
+        snapshot.tx_queue_enable_sample_ns,
+        snapshot.add_used_sample_ns,
+        snapshot.timing_sampled_notification_checks,
+        snapshot.notification_check_sample_ns,
+        snapshot.timing_sampled_irq_signals,
+        snapshot.irq_signal_sample_ns,
     );
     let bytes = json.as_bytes();
     if bytes.len() + 1 > buffer_len as usize {
