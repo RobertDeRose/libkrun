@@ -148,8 +148,22 @@ impl NetWorker {
 
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
-            match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
+            self.tx_stats_handle.set_worker_waiting(true);
+            let wait_result = epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice());
+            self.tx_stats_handle.set_worker_waiting(false);
+            match wait_result {
                 Ok(ev_cnt) => {
+                    self.sync_tx_stats();
+                    if self.tx_stats_enabled
+                        && epoll_events[0..ev_cnt].iter().any(|event| {
+                            event.fd() == virtq_tx_ev_fd
+                                && event.event_set() == EventSet::IN
+                        })
+                    {
+                        self.tx_stats_handle
+                            .observe_kqueue_ready(self.tx_stats.eventfd_values + 1);
+                    }
+
                     for event in &epoll_events[0..ev_cnt] {
                         let source = event.fd();
                         let event_set = event.event_set();

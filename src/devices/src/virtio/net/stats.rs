@@ -90,6 +90,18 @@ impl NetTxStatsHandle {
         self.0.enabled.store(true, Ordering::Release);
     }
 
+    pub fn set_worker_waiting(&self, waiting: bool) {
+        if self.is_enabled() {
+            self.0.queue_notifications.set_worker_waiting(waiting);
+        }
+    }
+
+    pub fn observe_kqueue_ready(&self, eventfd_sequence: u64) {
+        self.0
+            .queue_notifications
+            .observe_kqueue_ready(eventfd_sequence);
+    }
+
     pub fn observe_eventfd(&self, eventfd_sequence: u64, value: u64) {
         self.0
             .queue_notifications
@@ -167,14 +179,20 @@ mod tests {
         let handle = NetTxStatsHandle::default();
         let counter = handle.queue_notification_counter();
         handle.reset_and_enable();
+        counter.set_worker_waiting(true);
         for _ in 0..63 {
             let _ = counter.increment();
         }
         let sequence = counter.increment().unwrap();
         counter.record_eventfd_write(sequence, 250);
+        handle.observe_kqueue_ready(64);
         handle.observe_eventfd(64, 1);
 
         let (_, timing, _) = handle.snapshot_and_disable();
+        assert_eq!(timing.notify_while_worker_waiting_samples, 1);
+        assert_eq!(timing.notify_while_worker_busy_samples, 0);
+        assert_eq!(timing.notify_to_kqueue_ready_samples, 1);
+        assert_eq!(timing.kqueue_ready_to_eventfd_samples, 1);
         assert_eq!(timing.notify_to_eventfd_samples, 1);
         assert_eq!(timing.eventfd_write_samples, 1);
         assert_eq!(timing.eventfd_write_sample_ns, 250);

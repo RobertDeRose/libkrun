@@ -52,6 +52,14 @@ pub struct QueueNotificationTimingSnapshot {
     pub eventfd_write_samples: u64,
     pub eventfd_write_sample_ns: u64,
     pub eventfd_write_max_ns: u64,
+    pub notify_while_worker_waiting_samples: u64,
+    pub notify_while_worker_busy_samples: u64,
+    pub notify_to_kqueue_ready_samples: u64,
+    pub notify_to_kqueue_ready_sample_ns: u64,
+    pub notify_to_kqueue_ready_max_ns: u64,
+    pub kqueue_ready_to_eventfd_samples: u64,
+    pub kqueue_ready_to_eventfd_sample_ns: u64,
+    pub kqueue_ready_to_eventfd_max_ns: u64,
     pub irq_to_next_notify_samples: u64,
     pub irq_to_next_notify_sample_ns: u64,
     pub irq_to_next_notify_max_ns: u64,
@@ -61,6 +69,8 @@ pub struct QueueNotificationTimingSnapshot {
 struct QueueNotificationTimingState {
     sampled_notify_sequence: u64,
     sampled_notify_started: Option<Instant>,
+    sampled_kqueue_ready_sequence: u64,
+    sampled_kqueue_ready_started: Option<Instant>,
     pending_irq_started: Option<Instant>,
     snapshot: QueueNotificationTimingSnapshot,
 }
@@ -71,6 +81,7 @@ pub struct QueueNotificationCounter {
     enabled: AtomicBool,
     count: AtomicU64,
     irq_sample_pending: AtomicBool,
+    worker_waiting: AtomicBool,
     timing: Mutex<QueueNotificationTimingState>,
 }
 
@@ -79,9 +90,14 @@ impl QueueNotificationCounter {
         self.enabled.store(enabled, Ordering::Release);
     }
 
+    pub fn set_worker_waiting(&self, waiting: bool) {
+        self.worker_waiting.store(waiting, Ordering::Release);
+    }
+
     pub fn reset(&self) {
         self.count.store(0, Ordering::Relaxed);
         self.irq_sample_pending.store(false, Ordering::Relaxed);
+        self.worker_waiting.store(false, Ordering::Relaxed);
         *self.timing.lock().unwrap() = QueueNotificationTimingState::default();
     }
 
@@ -109,8 +125,15 @@ impl QueueNotificationCounter {
             }
         }
         if sample_notify {
+            if self.worker_waiting.load(Ordering::Acquire) {
+                timing.snapshot.notify_while_worker_waiting_samples += 1;
+            } else {
+                timing.snapshot.notify_while_worker_busy_samples += 1;
+            }
             timing.sampled_notify_sequence = sequence;
             timing.sampled_notify_started = Some(now);
+            timing.sampled_kqueue_ready_sequence = 0;
+            timing.sampled_kqueue_ready_started = None;
             Some(sequence)
         } else {
             None
@@ -134,6 +157,29 @@ impl QueueNotificationCounter {
             timing.snapshot.eventfd_write_max_ns.max(elapsed_ns);
     }
 
+    pub fn observe_kqueue_ready(&self, eventfd_sequence: u64) {
+        if !self.enabled.load(Ordering::Acquire)
+            || eventfd_sequence % QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE != 0
+        {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut timing = self.timing.lock().unwrap();
+        if timing.sampled_notify_sequence != eventfd_sequence {
+            return;
+        }
+        if let Some(started) = timing.sampled_notify_started {
+            let elapsed = now.duration_since(started).as_nanos() as u64;
+            timing.snapshot.notify_to_kqueue_ready_samples += 1;
+            timing.snapshot.notify_to_kqueue_ready_sample_ns += elapsed;
+            timing.snapshot.notify_to_kqueue_ready_max_ns =
+                timing.snapshot.notify_to_kqueue_ready_max_ns.max(elapsed);
+            timing.sampled_kqueue_ready_sequence = eventfd_sequence;
+            timing.sampled_kqueue_ready_started = Some(now);
+        }
+    }
+
     pub fn observe_eventfd(&self, eventfd_sequence: u64, value: u64) {
         if !self.enabled.load(Ordering::Acquire)
             || value != 1
@@ -145,6 +191,15 @@ impl QueueNotificationCounter {
         let mut timing = self.timing.lock().unwrap();
         if timing.sampled_notify_sequence != eventfd_sequence {
             return;
+        }
+        if timing.sampled_kqueue_ready_sequence == eventfd_sequence {
+            if let Some(started) = timing.sampled_kqueue_ready_started.take() {
+                let elapsed = started.elapsed().as_nanos() as u64;
+                timing.snapshot.kqueue_ready_to_eventfd_samples += 1;
+                timing.snapshot.kqueue_ready_to_eventfd_sample_ns += elapsed;
+                timing.snapshot.kqueue_ready_to_eventfd_max_ns =
+                    timing.snapshot.kqueue_ready_to_eventfd_max_ns.max(elapsed);
+            }
         }
         if let Some(started) = timing.sampled_notify_started.take() {
             let elapsed = started.elapsed().as_nanos() as u64;
