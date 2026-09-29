@@ -41,15 +41,7 @@ const VMNET_BATCH_MAGIC: [u8; 8] = *b"KRUNVMN1";
 const VMNET_BATCH_MAX_FRAMES: usize = 32;
 const VMNET_BATCH_HEADER_LEN: usize = 12;
 const VMNET_BATCH_FRAME_HEADER_LEN: usize = 4;
-// Keep bridge->guest batches conservative, but allow the private guest->vmnet
-// transport to group two maximum-sized TSO frames. P8 profiling shows those
-// frames average about 65 KiB and currently bypass batching, leaving one
-// Unix-datagram send syscall per virtio frame.
-const VMNET_RX_BATCH_MAX_DATAGRAM: usize = 60 * 1024;
-const VMNET_TX_BATCH_TARGET_FRAMES: usize = 2;
-const VMNET_TX_BATCH_MAX_DATAGRAM: usize = VMNET_BATCH_HEADER_LEN
-    + VMNET_TX_BATCH_TARGET_FRAMES
-        * (VMNET_BATCH_FRAME_HEADER_LEN + MAX_BUFFER_SIZE - VNET_HDR_LEN);
+const VMNET_BATCH_MAX_DATAGRAM: usize = 60 * 1024;
 
 pub struct Unixgram {
     fd: OwnedFd,
@@ -105,7 +97,7 @@ impl Unixgram {
             };
         }
 
-        let mut tx_batch = Vec::with_capacity(VMNET_TX_BATCH_MAX_DATAGRAM);
+        let mut tx_batch = Vec::with_capacity(VMNET_BATCH_MAX_DATAGRAM);
         tx_batch.resize(VMNET_BATCH_HEADER_LEN, 0);
         Self {
             fd,
@@ -232,10 +224,12 @@ impl Unixgram {
     }
 
     fn queue_batch_frame(&mut self, frame: &[u8]) -> Result<(), WriteError> {
-        // Preserve the raw-datagram fallback for any frame that cannot fit in
-        // the private batching envelope. The native TSO maximum fits two-wide.
+        // Preserve support for unusually large frames: a raw datagram has no
+        // batch-envelope overhead and matches the historical transport. Batch
+        // datagrams are always <= VMNET_BATCH_MAX_DATAGRAM, so the receiver can
+        // distinguish this fallback without inspecting Ethernet bytes.
         if frame.len() + VMNET_BATCH_HEADER_LEN + VMNET_BATCH_FRAME_HEADER_LEN
-            > VMNET_TX_BATCH_MAX_DATAGRAM
+            > VMNET_BATCH_MAX_DATAGRAM
         {
             self.flush_batch()?;
             return self.send_datagram(frame);
@@ -243,7 +237,7 @@ impl Unixgram {
 
         if self.tx_count == VMNET_BATCH_MAX_FRAMES
             || self.tx_batch.len() + VMNET_BATCH_FRAME_HEADER_LEN + frame.len()
-                > VMNET_TX_BATCH_MAX_DATAGRAM
+                > VMNET_BATCH_MAX_DATAGRAM
         {
             self.flush_batch()?;
         }
@@ -256,7 +250,7 @@ impl Unixgram {
     }
 
     fn parse_rx_batch(&mut self, length: usize) -> bool {
-        if length > VMNET_RX_BATCH_MAX_DATAGRAM
+        if length > VMNET_BATCH_MAX_DATAGRAM
             || length < VMNET_BATCH_HEADER_LEN + VMNET_BATCH_FRAME_HEADER_LEN
             || self.rx_datagram[..8] != VMNET_BATCH_MAGIC
         {
