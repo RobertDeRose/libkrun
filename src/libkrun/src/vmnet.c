@@ -29,7 +29,15 @@
 #define KRUN_VMNET_SOCKET_RECV_BATCH 2
 #define KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE 12
 #define KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE 4
-#define KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM (60 * 1024)
+// Keep vmnet->guest batching at the proven conservative size. For the private
+// guest->vmnet direction, allow two maximum-sized TSO frames in one datagram so
+// the virtio backend can reduce Unix-datagram send syscall frequency.
+#define KRUN_VMNET_SOCKET_TO_GUEST_BATCH_MAX_DATAGRAM (60 * 1024)
+#define KRUN_VMNET_SOCKET_TO_VMNET_BATCH_TARGET_FRAMES 2
+#define KRUN_VMNET_SOCKET_TO_VMNET_BATCH_MAX_DATAGRAM \
+    (KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE \
+     + KRUN_VMNET_SOCKET_TO_VMNET_BATCH_TARGET_FRAMES \
+         * (KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE + KRUN_VMNET_MAX_FRAME_SIZE))
 
 _Static_assert(
     KRUN_VMNET_SOCKET_RECV_BATCH * KRUN_VMNET_SOCKET_BATCH_MAX_FRAMES
@@ -254,7 +262,7 @@ static int set_socket_options(int fd)
 #endif
     const int rcvbuf = KRUN_VMNET_SOCKET_RCVBUF;
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    const int sndbuf = KRUN_VMNET_MAX_FRAME_SIZE;
+    const int sndbuf = KRUN_VMNET_SOCKET_TO_VMNET_BATCH_MAX_DATAGRAM;
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     return 0;
 }
@@ -313,7 +321,7 @@ static bool send_guest_packet_group(
     if (count == 1
         && packets[0].vm_pkt_size + KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE
                + KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE
-            > KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM) {
+            > KRUN_VMNET_SOCKET_TO_GUEST_BATCH_MAX_DATAGRAM) {
         ssize_t written = send(
             bridge->fd, packets[0].vm_pkt_iov->iov_base, packets[0].vm_pkt_size, 0);
         return written == (ssize_t)packets[0].vm_pkt_size
@@ -363,13 +371,13 @@ static void send_guest_packet_batch(
             }
             if (group_count > 0
                 && group_size + KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE + packet_size
-                    > KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM) {
+                    > KRUN_VMNET_SOCKET_TO_GUEST_BATCH_MAX_DATAGRAM) {
                 break;
             }
             if (group_count == 0
                 && packet_size + KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE
                        + KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE
-                    > KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM) {
+                    > KRUN_VMNET_SOCKET_TO_GUEST_BATCH_MAX_DATAGRAM) {
                 if (!send_guest_packet_group(bridge, &packets[offset], 1)) {
                     return;
                 }
@@ -399,7 +407,7 @@ static int decode_socket_batch(
     size_t *out_count)
 {
     *out_count = 0;
-    if (length > KRUN_VMNET_SOCKET_BATCH_MAX_DATAGRAM
+    if (length > KRUN_VMNET_SOCKET_TO_VMNET_BATCH_MAX_DATAGRAM
         || length < KRUN_VMNET_SOCKET_BATCH_HEADER_SIZE
                + KRUN_VMNET_SOCKET_BATCH_FRAME_HEADER_SIZE
         || memcmp(data, KRUN_VMNET_SOCKET_BATCH_MAGIC,
@@ -473,8 +481,9 @@ static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
     struct iovec iovs[KRUN_VMNET_SOCKET_RECV_BATCH];
     struct krun_msghdr_x messages[KRUN_VMNET_SOCKET_RECV_BATCH] = {0};
     for (size_t i = 0; i < KRUN_VMNET_SOCKET_RECV_BATCH; i++) {
-        iovs[i].iov_base = bridge->socket_rx_buffers + i * KRUN_VMNET_MAX_FRAME_SIZE;
-        iovs[i].iov_len = KRUN_VMNET_MAX_FRAME_SIZE;
+        iovs[i].iov_base = bridge->socket_rx_buffers
+            + i * KRUN_VMNET_SOCKET_TO_VMNET_BATCH_MAX_DATAGRAM;
+        iovs[i].iov_len = KRUN_VMNET_SOCKET_TO_VMNET_BATCH_MAX_DATAGRAM;
         messages[i].msg_iov = &iovs[i];
         messages[i].msg_iovlen = 1;
     }
@@ -497,7 +506,8 @@ static size_t receive_packet_batch(struct krun_vmnet_bridge *bridge)
         if (length == 0 || (messages[i].msg_flags & MSG_TRUNC) != 0) {
             continue;
         }
-        const uint8_t *data = bridge->socket_rx_buffers + (size_t)i * KRUN_VMNET_MAX_FRAME_SIZE;
+        const uint8_t *data = bridge->socket_rx_buffers
+            + (size_t)i * KRUN_VMNET_SOCKET_TO_VMNET_BATCH_MAX_DATAGRAM;
 
         size_t decoded = 0;
         int batch = decode_socket_batch(
@@ -801,7 +811,8 @@ static int32_t start_interface(
     }
     if (result == 0) {
         bridge->socket_rx_buffers = malloc(
-            KRUN_VMNET_SOCKET_RECV_BATCH * KRUN_VMNET_MAX_FRAME_SIZE);
+            KRUN_VMNET_SOCKET_RECV_BATCH
+                * KRUN_VMNET_SOCKET_TO_VMNET_BATCH_MAX_DATAGRAM);
         if (bridge->socket_rx_buffers == NULL) {
             result = -ENOMEM;
         }
