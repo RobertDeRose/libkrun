@@ -112,15 +112,15 @@ impl QueueNotificationCounter {
     }
 
     pub fn observe_eventfd(&self, eventfd_sequence: u64, value: u64) {
-        if !self.enabled.load(Ordering::Acquire)
-            || value != 1
-            || eventfd_sequence % QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE != 0
-        {
+        if !self.enabled.load(Ordering::Acquire) || value == 0 {
             return;
         }
 
+        let first_sequence = eventfd_sequence.saturating_sub(value).saturating_add(1);
         let mut timing = self.timing.lock().unwrap();
-        if timing.sampled_notify_sequence != eventfd_sequence {
+        if timing.sampled_notify_sequence < first_sequence
+            || timing.sampled_notify_sequence > eventfd_sequence
+        {
             return;
         }
         if let Some(started) = timing.sampled_notify_started.take() {

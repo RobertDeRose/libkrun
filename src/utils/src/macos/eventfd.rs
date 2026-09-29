@@ -61,6 +61,38 @@ impl EventFd {
         Ok(u64::from_le_bytes(buf))
     }
 
+    /// Drain and sum all values currently pending in this nonblocking eventfd.
+    ///
+    /// macOS emulates eventfd with a pipe, so an ordinary `read()` consumes only
+    /// one 8-byte write. Queue notifications use this helper to approximate Linux
+    /// eventfd counter semantics without changing semaphore-style users.
+    pub fn read_all(&self) -> result::Result<u64, io::Error> {
+        let mut total = 0u64;
+        let mut buf = [0u8; 512];
+
+        loop {
+            match read(&self.read_fd, &mut buf) {
+                Ok(0) => {
+                    return if total == 0 {
+                        Err(io::ErrorKind::UnexpectedEof.into())
+                    } else {
+                        Ok(total)
+                    };
+                }
+                Ok(len) => {
+                    if len % std::mem::size_of::<u64>() != 0 {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    }
+                    for value in buf[..len].chunks_exact(std::mem::size_of::<u64>()) {
+                        total = total.saturating_add(u64::from_le_bytes(value.try_into().unwrap()));
+                    }
+                }
+                Err(Errno::EAGAIN) if total != 0 => return Ok(total),
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
     pub fn try_clone(&self) -> result::Result<EventFd, io::Error> {
         let read_fd = dup(&self.read_fd)?;
         let write_fd = dup(&self.write_fd)?;
@@ -93,6 +125,16 @@ mod tests {
         let evt = EventFd::new(EFD_NONBLOCK).unwrap();
         evt.write(55).unwrap();
         assert_eq!(evt.read().unwrap(), 55);
+    }
+
+    #[test]
+    fn test_read_all_coalesces_pending_values() {
+        let evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        evt.write(1).unwrap();
+        evt.write(2).unwrap();
+        evt.write(3).unwrap();
+        assert_eq!(evt.read_all().unwrap(), 6);
+        assert_eq!(evt.read().unwrap_err().kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]

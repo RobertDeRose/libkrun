@@ -163,14 +163,14 @@ mod tests {
     }
 
     #[test]
-    fn notification_timing_pairs_sampled_notify_with_eventfd_wakeup() {
+    fn notification_timing_pairs_sampled_notify_with_coalesced_eventfd_wakeup() {
         let handle = NetTxStatsHandle::default();
         let counter = handle.queue_notification_counter();
         handle.reset_and_enable();
-        for _ in 0..64 {
+        for _ in 0..65 {
             counter.increment();
         }
-        handle.observe_eventfd(64, 1);
+        handle.observe_eventfd(65, 2);
 
         let (_, timing, _) = handle.snapshot_and_disable();
         assert_eq!(timing.notify_to_eventfd_samples, 1);
