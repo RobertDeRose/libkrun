@@ -4,6 +4,8 @@ use nix::sys::socket::{
     SockFlag, SockType, UnixAddr,
 };
 use nix::unistd::unlink;
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::process;
@@ -43,6 +45,12 @@ const VMNET_BATCH_HEADER_LEN: usize = 12;
 const VMNET_BATCH_FRAME_HEADER_LEN: usize = 4;
 const VMNET_BATCH_MAX_DATAGRAM: usize = 60 * 1024;
 
+#[cfg(target_os = "macos")]
+struct VmnetDirectTx {
+    bridge: usize,
+    write_frame: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32,
+}
+
 pub struct Unixgram {
     fd: OwnedFd,
     retries: u64,
@@ -54,6 +62,8 @@ pub struct Unixgram {
     rx_lengths: [usize; VMNET_BATCH_MAX_FRAMES],
     rx_count: usize,
     rx_index: usize,
+    #[cfg(target_os = "macos")]
+    vmnet_direct_tx: Option<VmnetDirectTx>,
 }
 
 impl Unixgram {
@@ -64,8 +74,17 @@ impl Unixgram {
 
     /// Create the backend for libkrun's private native-vmnet socketpair.
     #[cfg(target_os = "macos")]
-    pub fn new_batched(fd: OwnedFd) -> Self {
-        Self::with_batching(fd, true)
+    pub fn new_batched(
+        fd: OwnedFd,
+        bridge: usize,
+        write_frame: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32,
+    ) -> Self {
+        let mut backend = Self::with_batching(fd, true);
+        backend.vmnet_direct_tx = Some(VmnetDirectTx {
+            bridge,
+            write_frame,
+        });
+        backend
     }
 
     fn with_batching(fd: OwnedFd, batched: bool) -> Self {
@@ -110,6 +129,8 @@ impl Unixgram {
             rx_lengths: [0; VMNET_BATCH_MAX_FRAMES],
             rx_count: 0,
             rx_index: 0,
+            #[cfg(target_os = "macos")]
+            vmnet_direct_tx: None,
         }
     }
 
@@ -361,6 +382,28 @@ impl NetBackend for Unixgram {
 
     /// Try to write a frame to the proxy.
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
+        #[cfg(target_os = "macos")]
+        if let Some(direct) = &self.vmnet_direct_tx {
+            let frame = &buf[hdr_len..];
+            let result = unsafe {
+                (direct.write_frame)(
+                    direct.bridge as *mut c_void,
+                    frame.as_ptr(),
+                    frame.len(),
+                )
+            };
+            return match result {
+                0 => Ok(()),
+                result if result == -libc::EAGAIN || result == -libc::ENOBUFS => {
+                    Err(WriteError::NothingWritten)
+                }
+                result if result == -libc::EPIPE => Err(WriteError::ProcessNotRunning),
+                result if result < 0 => {
+                    Err(WriteError::Internal(nix::Error::from_raw(-result)))
+                }
+                _ => Err(WriteError::Internal(nix::Error::EIO)),
+            };
+        }
         if self.batched {
             return self.queue_batch_frame(&buf[hdr_len..]);
         }
@@ -372,10 +415,18 @@ impl NetBackend for Unixgram {
     }
 
     fn has_unfinished_write(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.vmnet_direct_tx.is_some() {
+            return false;
+        }
         self.batched && self.tx_count > 0
     }
 
     fn try_finish_write(&mut self, _hdr_len: usize, _buf: &[u8]) -> Result<(), WriteError> {
+        #[cfg(target_os = "macos")]
+        if self.vmnet_direct_tx.is_some() {
+            return Ok(());
+        }
         if self.batched {
             self.flush_batch()
         } else {
@@ -385,6 +436,10 @@ impl NetBackend for Unixgram {
     }
 
     fn flush_writes(&mut self) -> Result<(), WriteError> {
+        #[cfg(target_os = "macos")]
+        if self.vmnet_direct_tx.is_some() {
+            return Ok(());
+        }
         if self.batched {
             self.flush_batch()
         } else {

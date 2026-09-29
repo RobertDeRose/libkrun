@@ -165,6 +165,11 @@ extern "C" {
         out_fd: *mut c_int,
         out_bridge: *mut *mut c_void,
     ) -> c_int;
+    fn krun_vmnet_write_frame(
+        bridge: *mut c_void,
+        frame: *const u8,
+        frame_len: usize,
+    ) -> c_int;
     fn krun_vmnet_stop(bridge: *mut c_void);
 }
 
@@ -1373,7 +1378,16 @@ unsafe fn add_vmnet_backend(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            create_virtio_net(cfg, VirtioNetBackend::VmnetFd(fd), mac, features);
+            create_virtio_net(
+                cfg,
+                VirtioNetBackend::VmnetFd {
+                    fd,
+                    bridge: bridge as usize,
+                    write_frame: krun_vmnet_write_frame,
+                },
+                mac,
+                features,
+            );
             cfg.vmnet_bridges.push(VmnetBridge(bridge));
             if flags & NET_FLAG_DHCP_CLIENT != 0 {
                 cfg.vmr.dhcp_client = true;

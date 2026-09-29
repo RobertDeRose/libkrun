@@ -72,7 +72,8 @@ if [[ "${ASAN:-0}" == 1 ]]; then
 fi
 "$cc" -I"$root/tests/vmnet_bridge/include" "${flags[@]}" \
   "$root/tests/vmnet_bridge/test_bridge.c" "${libs[@]}" -o "$build/test-bridge"
-for scenario in socket_recv_batch success offload batched_io partial_write batch_cap shared_pair serialized serialized_offload serialized_not_authorized invalid_arguments permission \
+for scenario in socket_recv_batch success offload direct_tx batched_io partial_write batch_cap \
+  shared_pair serialized serialized_offload serialized_not_authorized invalid_arguments permission \
   null_interface_success start_failure invalid_packet_size event_failure \
   truncated_frame late_start late_stop stop_submit_failure; do
   "$build/test-bridge" "$scenario"

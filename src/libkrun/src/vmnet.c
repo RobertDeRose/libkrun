@@ -540,6 +540,40 @@ static void write_packet_batch(struct krun_vmnet_bridge *bridge, size_t received
     }
 }
 
+int32_t krun_vmnet_write_frame(void *opaque, const uint8_t *frame, size_t frame_len)
+{
+    struct krun_vmnet_bridge *bridge = opaque;
+    if (bridge == NULL || frame == NULL || frame_len == 0) {
+        return -EINVAL;
+    }
+    if (atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
+        return -EPIPE;
+    }
+    if (frame_len > bridge->max_packet_size) {
+        return -EMSGSIZE;
+    }
+
+    struct iovec iov = {
+        .iov_base = (void *)frame,
+        .iov_len = frame_len,
+    };
+    struct vmpktdesc packet = {
+        .vm_pkt_size = frame_len,
+        .vm_pkt_iov = &iov,
+        .vm_pkt_iovcnt = 1,
+        .vm_flags = 0,
+    };
+    int count = 1;
+    vmnet_return_t status = vmnet_write(bridge->interface, &packet, &count);
+    if (status == VMNET_SUCCESS && count == 1) {
+        return 0;
+    }
+    if (status == VMNET_SUCCESS && count == 0) {
+        return -ENOBUFS;
+    }
+    return -vmnet_status_to_errno(status);
+}
+
 static void *forward_packets_to_vmnet(void *opaque)
 {
     struct krun_vmnet_bridge *bridge = opaque;

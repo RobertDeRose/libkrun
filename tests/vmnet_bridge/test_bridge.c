@@ -133,7 +133,8 @@ static interface_ref fake_start(xpc_object_t descriptor, dispatch_queue_t queue,
         assert(!descriptor->allocate_mac); // Descriptor must outlive asynchronous start.
         struct fake_xpc parameters = {
             .size = is("invalid_packet_size") ? 0
-                : (is("offload") || is("serialized_offload") ? KRUN_VMNET_MAX_FRAME_SIZE : 2048),
+                : (is("offload") || is("direct_tx") || is("serialized_offload")
+                   ? KRUN_VMNET_MAX_FRAME_SIZE : 2048),
             .read_max_packets = is("batch_cap") ? 128 : 8,
             .write_max_packets = is("batch_cap") ? 128 : 8,
         };
@@ -157,7 +158,7 @@ interface_ref vmnet_start_interface(xpc_object_t descriptor, dispatch_queue_t qu
     atomic_fetch_add(&shared_start_calls, 1);
     assert(descriptor->mode == VMNET_SHARED_MODE);
     assert(descriptor->isolation);
-    bool offload = is("offload");
+    bool offload = is("offload") || is("direct_tx");
     assert(!descriptor->allocate_mac);
     assert(descriptor->tso == offload && descriptor->checksum == offload);
     assert(strcmp(descriptor->start, "192.168.200.1") == 0);
@@ -327,7 +328,7 @@ int main(int argc, char **argv)
     }
     bool serialized = is("serialized") || is("serialized_not_authorized")
         || is("serialized_offload");
-    int enable_offload = is("offload") || is("serialized_offload");
+    int enable_offload = is("offload") || is("direct_tx") || is("serialized_offload");
     int result = serialized ? krun_vmnet_start((void *)1, enable_offload, &fd, &bridge)
                             : krun_vmnet_start_shared(
                                   "192.168.200.1", "255.255.255.0", enable_offload, &fd, &bridge);
@@ -364,6 +365,15 @@ int main(int argc, char **argv)
             free(large);
             for (int i = 0; i < 100 && atomic_load(&writes) < 2; i++) usleep(1000);
             assert(atomic_load(&writes) == 2);
+            assert(atomic_load(&max_write_packet_size) == (int)large_size);
+        }
+        if (is("direct_tx")) {
+            size_t large_size = 64 * 1024;
+            uint8_t *large = calloc(1, large_size);
+            assert(large != NULL);
+            assert(krun_vmnet_write_frame(bridge, large, large_size) == 0);
+            free(large);
+            assert(atomic_load(&writes) == 3);
             assert(atomic_load(&max_write_packet_size) == (int)large_size);
         }
         atomic_store(&reads_pending, 1);
