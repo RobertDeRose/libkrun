@@ -133,12 +133,12 @@ mod tests {
     fn queue_notifications_are_counted_only_while_enabled() {
         let handle = NetTxStatsHandle::default();
         let counter = handle.queue_notification_counter();
-        counter.increment();
+        let _ = counter.increment();
         assert_eq!(counter.load(), 0);
 
         handle.reset_and_enable();
-        counter.increment();
-        counter.increment();
+        let _ = counter.increment();
+        let _ = counter.increment();
         assert_eq!(counter.load(), 2);
     }
 
@@ -158,7 +158,7 @@ mod tests {
         assert_eq!(snapshot.frames, 3);
         assert!(!handle.is_enabled());
 
-        handle.queue_notification_counter().increment();
+        let _ = handle.queue_notification_counter().increment();
         assert_eq!(handle.snapshot().0, 0);
     }
 
@@ -167,13 +167,18 @@ mod tests {
         let handle = NetTxStatsHandle::default();
         let counter = handle.queue_notification_counter();
         handle.reset_and_enable();
-        for _ in 0..64 {
-            counter.increment();
+        for _ in 0..63 {
+            let _ = counter.increment();
         }
+        let sequence = counter.increment().unwrap();
+        counter.record_eventfd_write(sequence, 250);
         handle.observe_eventfd(64, 1);
 
         let (_, timing, _) = handle.snapshot_and_disable();
         assert_eq!(timing.notify_to_eventfd_samples, 1);
+        assert_eq!(timing.eventfd_write_samples, 1);
+        assert_eq!(timing.eventfd_write_sample_ns, 250);
+        assert_eq!(timing.eventfd_write_max_ns, 250);
     }
 
     #[test]
@@ -182,7 +187,7 @@ mod tests {
         let counter = handle.queue_notification_counter();
         handle.reset_and_enable();
         handle.record_irq_signal(64);
-        counter.increment();
+        let _ = counter.increment();
 
         let (_, timing, _) = handle.snapshot_and_disable();
         assert_eq!(timing.irq_to_next_notify_samples, 1);

@@ -9,6 +9,7 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use utils::eventfd::EFD_NONBLOCK;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -478,11 +479,23 @@ impl BusDevice for MmioTransport {
                     0x44 => self.update_queue_field(|q| q.ready = v == 1),
                     0x50 => {
                         // Queue notification - write to the eventfd for the specified queue.
-                        if let Some(Some(counter)) = self.queue_notify_counters.get(v as usize) {
-                            counter.increment();
-                        }
+                        let counter = self
+                            .queue_notify_counters
+                            .get(v as usize)
+                            .and_then(|counter| counter.as_ref());
+                        let timing_sequence = counter.and_then(|counter| counter.increment());
+                        let write_started = timing_sequence.map(|_| Instant::now());
+
                         if let Some(eventfd) = self.queue_evts.get(v as usize) {
                             eventfd.write(1).unwrap();
+                            if let (Some(counter), Some(sequence), Some(started)) =
+                                (counter, timing_sequence, write_started)
+                            {
+                                counter.record_eventfd_write(
+                                    sequence,
+                                    started.elapsed().as_nanos() as u64,
+                                );
+                            }
                         } else {
                             warn!("invalid queue index for notification: {v}");
                         }

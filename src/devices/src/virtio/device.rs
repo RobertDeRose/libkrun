@@ -49,6 +49,9 @@ pub struct QueueNotificationTimingSnapshot {
     pub notify_to_eventfd_samples: u64,
     pub notify_to_eventfd_sample_ns: u64,
     pub notify_to_eventfd_max_ns: u64,
+    pub eventfd_write_samples: u64,
+    pub eventfd_write_sample_ns: u64,
+    pub eventfd_write_max_ns: u64,
     pub irq_to_next_notify_samples: u64,
     pub irq_to_next_notify_sample_ns: u64,
     pub irq_to_next_notify_max_ns: u64,
@@ -82,16 +85,16 @@ impl QueueNotificationCounter {
         *self.timing.lock().unwrap() = QueueNotificationTimingState::default();
     }
 
-    pub fn increment(&self) {
+    pub fn increment(&self) -> Option<u64> {
         if !self.enabled.load(Ordering::Acquire) {
-            return;
+            return None;
         }
 
         let sequence = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         let sample_notify = sequence % QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE == 0;
         let consume_irq = self.irq_sample_pending.swap(false, Ordering::AcqRel);
         if !sample_notify && !consume_irq {
-            return;
+            return None;
         }
 
         let now = Instant::now();
@@ -108,7 +111,27 @@ impl QueueNotificationCounter {
         if sample_notify {
             timing.sampled_notify_sequence = sequence;
             timing.sampled_notify_started = Some(now);
+            Some(sequence)
+        } else {
+            None
         }
+    }
+
+    pub fn record_eventfd_write(&self, sequence: u64, elapsed_ns: u64) {
+        if !self.enabled.load(Ordering::Acquire)
+            || sequence % QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE != 0
+        {
+            return;
+        }
+
+        let mut timing = self.timing.lock().unwrap();
+        if timing.sampled_notify_sequence != sequence {
+            return;
+        }
+        timing.snapshot.eventfd_write_samples += 1;
+        timing.snapshot.eventfd_write_sample_ns += elapsed_ns;
+        timing.snapshot.eventfd_write_max_ns =
+            timing.snapshot.eventfd_write_max_ns.max(elapsed_ns);
     }
 
     pub fn observe_eventfd(&self, eventfd_sequence: u64, value: u64) {
