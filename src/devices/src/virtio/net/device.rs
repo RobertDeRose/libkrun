@@ -14,6 +14,7 @@ use crate::virtio::{
 use crate::Error as DeviceError;
 
 use super::backend::{ReadError, WriteError};
+use super::stats::NetTxStatsHandle;
 use super::worker::NetWorker;
 
 use std::cmp;
@@ -82,6 +83,7 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
 
     config: VirtioNetConfig,
+    tx_stats: NetTxStatsHandle,
 }
 
 impl Net {
@@ -91,6 +93,7 @@ impl Net {
         cfg_backend: VirtioNetBackend,
         mac: [u8; 6],
         features: u32,
+        tx_stats: NetTxStatsHandle,
     ) -> Result<Self> {
         let avail_features = features as u64
             | (1 << VIRTIO_NET_F_MAC)
@@ -151,6 +154,13 @@ impl VirtioDevice for Net {
         &QUEUE_CONFIG
     }
 
+    fn queue_notification_counter(
+        &self,
+        queue_index: usize,
+    ) -> Option<std::sync::Arc<crate::virtio::QueueNotificationCounter>> {
+        (queue_index == 1).then(|| self.tx_stats.queue_notification_counter())
+    }
+
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
         let config_slice = self.config.as_slice();
         let config_len = config_slice.len() as u64;
@@ -191,6 +201,7 @@ impl VirtioDevice for Net {
             mem.clone(),
             self.acked_features,
             self.cfg_backend.clone(),
+            self.tx_stats.clone(),
         ) {
             Ok(worker) => {
                 worker.run();

@@ -5,6 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::{ActivateResult, InterruptTransport, Queue};
@@ -37,6 +38,33 @@ pub struct DeviceQueue {
 impl DeviceQueue {
     pub fn new(queue: Queue, event: Arc<EventFd>) -> Self {
         Self { queue, event }
+    }
+}
+
+/// Optional low-overhead queue-notification counter used by targeted profiling.
+#[derive(Default)]
+pub struct QueueNotificationCounter {
+    enabled: AtomicBool,
+    count: AtomicU64,
+}
+
+impl QueueNotificationCounter {
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Release);
+    }
+
+    pub fn reset(&self) {
+        self.count.store(0, Ordering::Relaxed);
+    }
+
+    pub fn increment(&self) {
+        if self.enabled.load(Ordering::Acquire) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn load(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
     }
 }
 
@@ -98,6 +126,14 @@ pub trait VirtioDevice: AsAny + Send {
     /// Returns the queue configuration for this device.
     /// The transport uses this to construct the queues during initialization and after reset.
     fn queue_config(&self) -> &[QueueConfig];
+
+    /// Optionally exposes a profiling counter for guest notifications to one queue.
+    fn queue_notification_counter(
+        &self,
+        _queue_index: usize,
+    ) -> Option<Arc<QueueNotificationCounter>> {
+        None
+    }
 
     /// The set of feature bits shifted by `page * 32`.
     fn avail_features_by_page(&self, page: u32) -> u32 {

@@ -8,6 +8,7 @@ use crate::virtio::{DeviceQueue, InterruptTransport};
 
 use super::backend::{NetBackend, ReadError, WriteError};
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
+use super::stats::{NetTxStatsHandle, NetTxStatsSnapshot};
 use super::VNET_HDR_LEN;
 
 #[cfg(target_os = "macos")]
@@ -34,6 +35,11 @@ pub struct NetWorker {
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
+
+    tx_stats_handle: NetTxStatsHandle,
+    tx_stats: NetTxStatsSnapshot,
+    tx_stats_reset_epoch: u64,
+    tx_stats_enabled: bool,
 }
 
 impl NetWorker {
@@ -44,6 +50,7 @@ impl NetWorker {
         mem: GuestMemoryMmap,
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
+        tx_stats_handle: NetTxStatsHandle,
     ) -> Result<Self, ConnectError> {
         let backend = match cfg_backend {
             VirtioNetBackend::UnixstreamFd(fd) => {
@@ -92,6 +99,11 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
+
+            tx_stats_reset_epoch: tx_stats_handle.reset_epoch(),
+            tx_stats_enabled: tx_stats_handle.is_enabled(),
+            tx_stats_handle,
+            tx_stats: NetTxStatsSnapshot::default(),
         })
     }
 
@@ -205,9 +217,32 @@ impl NetWorker {
         }
     }
 
+    fn sync_tx_stats(&mut self) {
+        let reset_epoch = self.tx_stats_handle.reset_epoch();
+        if reset_epoch != self.tx_stats_reset_epoch {
+            self.tx_stats = NetTxStatsSnapshot::default();
+            self.tx_stats_reset_epoch = reset_epoch;
+        }
+        self.tx_stats_enabled = self.tx_stats_handle.is_enabled();
+    }
+
+    fn publish_tx_stats(&self) {
+        if self.tx_stats_enabled {
+            self.tx_stats_handle
+                .publish(self.tx_stats_reset_epoch, self.tx_stats);
+        }
+    }
+
     pub(crate) fn process_tx_queue_event(&mut self) {
+        self.sync_tx_stats();
         match self.tx_q.event.read() {
-            Ok(_) => self.process_tx_loop(),
+            Ok(value) => {
+                if self.tx_stats_enabled {
+                    self.tx_stats.eventfd_wakeups += 1;
+                    self.tx_stats.eventfd_values += value;
+                }
+                self.process_tx_loop();
+            }
             Err(e) => {
                 log::error!("Failed to get tx queue event from queue: {e:?}");
             }
@@ -227,12 +262,24 @@ impl NetWorker {
     }
 
     pub(crate) fn process_backend_socket_writeable(&mut self) {
+        self.sync_tx_stats();
         match self
             .backend
             .try_finish_write(VNET_HDR_LEN, &self.tx_frame_buf[..self.tx_frame_len])
         {
             Ok(()) => self.process_tx_loop(),
-            Err(WriteError::PartialWrite | WriteError::NothingWritten) => {}
+            Err(WriteError::PartialWrite) => {
+                if self.tx_stats_enabled {
+                    self.tx_stats.partial_writes += 1;
+                    self.publish_tx_stats();
+                }
+            }
+            Err(WriteError::NothingWritten) => {
+                if self.tx_stats_enabled {
+                    self.tx_stats.nothing_written += 1;
+                    self.publish_tx_stats();
+                }
+            }
             Err(e @ WriteError::Internal(_)) => {
                 log::error!("Failed to finish write: {e:?}");
             }
@@ -290,6 +337,7 @@ impl NetWorker {
     }
 
     fn process_tx_loop(&mut self) {
+        self.sync_tx_stats();
         loop {
             self.tx_q.queue.disable_notification(&self.mem).unwrap();
 
@@ -307,9 +355,17 @@ impl NetWorker {
                 break;
             }
         }
+        self.publish_tx_stats();
     }
 
     fn process_tx(&mut self) -> result::Result<(), TxError> {
+        if self.tx_stats_enabled {
+            self.tx_stats.drain_passes += 1;
+        }
+        let mut drain_frames = 0u64;
+        let mut drain_bytes = 0u64;
+        let mut flush_frames = 0u64;
+        let mut flush_bytes = 0u64;
         let tx_queue = &mut self.tx_q.queue;
 
         if self.backend.has_unfinished_write() {
@@ -319,9 +375,24 @@ impl NetWorker {
             {
                 Ok(()) => {}
                 Err(WriteError::NothingWritten) => {
+                    if self.tx_stats_enabled {
+                        self.tx_stats.nothing_written += 1;
+                        self.tx_stats.empty_drain_passes += 1;
+                    }
                     return Err(TxError::Backend(WriteError::NothingWritten));
                 }
+                Err(WriteError::PartialWrite) => {
+                    if self.tx_stats_enabled {
+                        self.tx_stats.partial_writes += 1;
+                        self.tx_stats.empty_drain_passes += 1;
+                    }
+                    log::trace!("Cannot process tx because of unfinished partial write!");
+                    return Ok(());
+                }
                 Err(_) => {
+                    if self.tx_stats_enabled {
+                        self.tx_stats.empty_drain_passes += 1;
+                    }
                     log::trace!("Cannot process tx because of unfinished partial write!");
                     return Ok(());
                 }
@@ -334,9 +405,15 @@ impl NetWorker {
         while let Some(head) = tx_queue.pop(&self.mem) {
             let head_index = head.index;
             let mut next_desc = Some(head);
+            if self.tx_stats_enabled {
+                self.tx_stats.descriptor_chains += 1;
+            }
 
             self.tx_iovec.clear();
             while let Some(desc) = next_desc {
+                if self.tx_stats_enabled {
+                    self.tx_stats.descriptors += 1;
+                }
                 if desc.is_write_only() {
                     self.tx_iovec.clear();
                     break;
@@ -366,11 +443,24 @@ impl NetWorker {
             }
 
             self.tx_frame_len = read_count;
+            let backend_bytes = read_count.saturating_sub(VNET_HDR_LEN) as u64;
+            if self.tx_stats_enabled {
+                self.tx_stats.frames += 1;
+                self.tx_stats.bytes += backend_bytes;
+                self.tx_stats.write_frame_calls += 1;
+                self.tx_stats.backend_bytes += backend_bytes;
+                drain_frames += 1;
+                drain_bytes += backend_bytes;
+            }
             match self
                 .backend
                 .write_frame(VNET_HDR_LEN, &mut self.tx_frame_buf[..read_count])
             {
                 Ok(()) => {
+                    if self.tx_stats_enabled {
+                        flush_frames += 1;
+                        flush_bytes += backend_bytes;
+                    }
                     self.tx_frame_len = 0;
                     tx_queue
                         .add_used(&self.mem, head_index, 0)
@@ -378,11 +468,19 @@ impl NetWorker {
                     raise_irq = true;
                 }
                 Err(WriteError::NothingWritten) => {
+                    if self.tx_stats_enabled {
+                        self.tx_stats.nothing_written += 1;
+                    }
                     tx_queue.undo_pop();
                     result = Err(TxError::Backend(WriteError::NothingWritten));
                     break;
                 }
                 Err(WriteError::PartialWrite) => {
+                    if self.tx_stats_enabled {
+                        self.tx_stats.partial_writes += 1;
+                        flush_frames += 1;
+                        flush_bytes += backend_bytes;
+                    }
                     log::trace!("process_tx: partial write");
                     /*
                     This situation should be pretty rare, assuming reasonably sized socket buffers.
@@ -407,16 +505,53 @@ impl NetWorker {
             }
         }
 
+        if self.tx_stats_enabled {
+            if drain_frames == 0 {
+                self.tx_stats.empty_drain_passes += 1;
+            }
+            self.tx_stats.max_frames_per_drain =
+                self.tx_stats.max_frames_per_drain.max(drain_frames);
+            self.tx_stats.max_bytes_per_drain =
+                self.tx_stats.max_bytes_per_drain.max(drain_bytes);
+        }
+
         if result.is_ok() {
+            if self.tx_stats_enabled {
+                self.tx_stats.flush_calls += 1;
+                self.tx_stats.frames_between_flushes += flush_frames;
+                self.tx_stats.bytes_between_flushes += flush_bytes;
+                self.tx_stats.max_frames_between_flush =
+                    self.tx_stats.max_frames_between_flush.max(flush_frames);
+                self.tx_stats.max_bytes_between_flush =
+                    self.tx_stats.max_bytes_between_flush.max(flush_bytes);
+            }
             if let Err(e) = self.backend.flush_writes() {
+                if self.tx_stats_enabled {
+                    match &e {
+                        WriteError::NothingWritten => self.tx_stats.nothing_written += 1,
+                        WriteError::PartialWrite => self.tx_stats.partial_writes += 1,
+                        _ => {}
+                    }
+                }
                 result = Err(TxError::Backend(e));
             }
         }
 
-        if raise_irq && tx_queue.needs_notification(&self.mem).unwrap() {
-            self.interrupt
-                .try_signal_used_queue()
-                .map_err(TxError::DeviceError)?;
+        if raise_irq {
+            if self.tx_stats_enabled {
+                self.tx_stats.notification_checks += 1;
+            }
+            if tx_queue.needs_notification(&self.mem).unwrap() {
+                if self.tx_stats_enabled {
+                    self.tx_stats.notification_true += 1;
+                    self.tx_stats.signal_used_queue_calls += 1;
+                }
+                self.interrupt
+                    .try_signal_used_queue()
+                    .map_err(TxError::DeviceError)?;
+            } else if self.tx_stats_enabled {
+                self.tx_stats.notification_false += 1;
+            }
         }
 
         result
