@@ -22,6 +22,22 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 const TX_TIMING_SAMPLE_STRIDE: u64 = 64;
 
+#[cfg(target_os = "macos")]
+fn set_network_worker_qos() {
+    // Use the highest ordinary macOS QoS class for this scheduling experiment.
+    // If wake latency falls without a throughput gain, scheduler wakeup time is
+    // not the sustained-throughput ceiling and this should be reverted.
+    let result = unsafe {
+        libc::pthread_set_qos_class_self_np(
+            libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+            0,
+        )
+    };
+    if result != 0 {
+        log::warn!("Failed to set virtio-net worker QoS: {result}");
+    }
+}
+
 pub struct NetWorker {
     rx_q: DeviceQueue,
     tx_q: DeviceQueue,
@@ -118,6 +134,9 @@ impl NetWorker {
     }
 
     fn work(mut self) {
+        #[cfg(target_os = "macos")]
+        set_network_worker_qos();
+
         #[cfg(target_os = "macos")]
         const TX_TIMER_FD: RawFd = -2;
 
