@@ -28,6 +28,12 @@ pub struct NetTxStatsSnapshot {
     pub notification_true: u64,
     pub notification_false: u64,
     pub signal_used_queue_calls: u64,
+    pub timing_sampled_frames: u64,
+    pub descriptor_parse_sample_ns: u64,
+    pub guest_copy_sample_ns: u64,
+    pub backend_write_sample_ns: u64,
+    pub timing_sampled_flushes: u64,
+    pub flush_sample_ns: u64,
 }
 
 struct NetTxStatsShared {

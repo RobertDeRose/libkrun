@@ -15,9 +15,12 @@ use super::VNET_HDR_LEN;
 use std::os::fd::RawFd;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::thread;
+use std::time::Instant;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+const TX_TIMING_SAMPLE_STRIDE: u64 = 64;
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
@@ -403,6 +406,9 @@ impl NetWorker {
         let mut result = Ok(());
 
         while let Some(head) = tx_queue.pop(&self.mem) {
+            let timing_sample = self.tx_stats_enabled
+                && self.tx_stats.frames % TX_TIMING_SAMPLE_STRIDE == 0;
+            let descriptor_started = timing_sample.then(Instant::now);
             let head_index = head.index;
             let mut next_desc = Some(head);
             if self.tx_stats_enabled {
@@ -421,6 +427,14 @@ impl NetWorker {
                 self.tx_iovec.push((desc.addr, desc.len as usize));
                 next_desc = desc.next_descriptor();
             }
+
+            let copy_started = if let Some(started) = descriptor_started {
+                self.tx_stats.descriptor_parse_sample_ns +=
+                    started.elapsed().as_nanos() as u64;
+                Some(Instant::now())
+            } else {
+                None
+            };
 
             // Copy buffer from across multiple descriptors.
             let mut read_count = 0;
@@ -442,6 +456,13 @@ impl NetWorker {
                 }
             }
 
+            let backend_started = if let Some(started) = copy_started {
+                self.tx_stats.guest_copy_sample_ns += started.elapsed().as_nanos() as u64;
+                Some(Instant::now())
+            } else {
+                None
+            };
+
             self.tx_frame_len = read_count;
             let backend_bytes = read_count.saturating_sub(VNET_HDR_LEN) as u64;
             if self.tx_stats_enabled {
@@ -452,10 +473,14 @@ impl NetWorker {
                 drain_frames += 1;
                 drain_bytes += backend_bytes;
             }
-            match self
+            let write_result = self
                 .backend
-                .write_frame(VNET_HDR_LEN, &mut self.tx_frame_buf[..read_count])
-            {
+                .write_frame(VNET_HDR_LEN, &mut self.tx_frame_buf[..read_count]);
+            if let Some(started) = backend_started {
+                self.tx_stats.backend_write_sample_ns += started.elapsed().as_nanos() as u64;
+                self.tx_stats.timing_sampled_frames += 1;
+            }
+            match write_result {
                 Ok(()) => {
                     if self.tx_stats_enabled {
                         flush_frames += 1;
@@ -516,6 +541,8 @@ impl NetWorker {
         }
 
         if result.is_ok() {
+            let timing_sample_flush = self.tx_stats_enabled
+                && self.tx_stats.flush_calls % TX_TIMING_SAMPLE_STRIDE == 0;
             if self.tx_stats_enabled {
                 self.tx_stats.flush_calls += 1;
                 self.tx_stats.frames_between_flushes += flush_frames;
@@ -525,7 +552,13 @@ impl NetWorker {
                 self.tx_stats.max_bytes_between_flush =
                     self.tx_stats.max_bytes_between_flush.max(flush_bytes);
             }
-            if let Err(e) = self.backend.flush_writes() {
+            let flush_started = timing_sample_flush.then(Instant::now);
+            let flush_result = self.backend.flush_writes();
+            if let Some(started) = flush_started {
+                self.tx_stats.flush_sample_ns += started.elapsed().as_nanos() as u64;
+                self.tx_stats.timing_sampled_flushes += 1;
+            }
+            if let Err(e) = flush_result {
                 if self.tx_stats_enabled {
                     match &e {
                         WriteError::NothingWritten => self.tx_stats.nothing_written += 1,

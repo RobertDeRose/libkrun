@@ -701,7 +701,12 @@ pub unsafe extern "C" fn krun_debug_get_net_tx_stats_json(
             "\"max_frames_between_flush\":{},\"max_bytes_between_flush\":{},",
             "\"notification_checks\":{},\"notification_true\":{},",
             "\"notification_false\":{},\"signal_used_queue_calls\":{},",
-            "\"timing_collected\":false}}"
+            "\"timing_collected\":true,\"timing_sample_stride\":64,",
+            "\"timing_sampled_frames\":{},",
+            "\"descriptor_parse_sample_ns\":{},",
+            "\"guest_copy_sample_ns\":{},",
+            "\"backend_write_sample_ns\":{},",
+            "\"timing_sampled_flushes\":{},\"flush_sample_ns\":{}}}"
         ),
         network_index,
         queue_notify_writes,
@@ -728,6 +733,12 @@ pub unsafe extern "C" fn krun_debug_get_net_tx_stats_json(
         snapshot.notification_true,
         snapshot.notification_false,
         snapshot.signal_used_queue_calls,
+        snapshot.timing_sampled_frames,
+        snapshot.descriptor_parse_sample_ns,
+        snapshot.guest_copy_sample_ns,
+        snapshot.backend_write_sample_ns,
+        snapshot.timing_sampled_flushes,
+        snapshot.flush_sample_ns,
     );
     let bytes = json.as_bytes();
     if bytes.len() + 1 > buffer_len as usize {
