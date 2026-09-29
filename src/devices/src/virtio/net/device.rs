@@ -115,6 +115,7 @@ impl Net {
 
             device_state: DeviceState::Inactive,
             config,
+            tx_stats,
         })
     }
 
