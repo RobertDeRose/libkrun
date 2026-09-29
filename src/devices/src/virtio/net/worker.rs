@@ -262,6 +262,15 @@ impl NetWorker {
     }
 
     pub(crate) fn process_backend_socket_writeable(&mut self) {
+        // A writable backend event only advances TX when a previous backend
+        // write was deferred. In particular, macOS can report frequent
+        // EVFILT_WRITE transitions while the native unixgram backend has no
+        // pending batch. Re-entering process_tx_loop() for those events causes
+        // an empty virtqueue drain and notification re-arm with no guest work.
+        if !self.backend.has_unfinished_write() {
+            return;
+        }
+
         self.sync_tx_stats();
         match self
             .backend
