@@ -947,6 +947,40 @@ int32_t krun_vmnet_start_shared(
     return -ENOTSUP;
 }
 
+int32_t krun_vmnet_write_iov(
+    void *opaque, const struct iovec *iovs, size_t iov_count, size_t frame_len)
+{
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    struct krun_vmnet_bridge *bridge = opaque;
+    if (bridge == NULL || iovs == NULL || iov_count == 0 || frame_len == 0) {
+        return -EINVAL;
+    }
+    if (atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
+        return -EPIPE;
+    }
+    if (frame_len > bridge->max_packet_size) {
+        return -EMSGSIZE;
+    }
+    // The caller's buffers are only borrowed for this call: vmnet_write copies
+    // them before returning, so guest memory can be handed over directly.
+    struct vmpktdesc packet = {
+        .vm_pkt_size = frame_len,
+        .vm_pkt_iov = (struct iovec *)iovs,
+        .vm_pkt_iovcnt = (uint32_t)iov_count,
+        .vm_flags = 0,
+    };
+    int count = 1;
+    vmnet_return_t status = vmnet_write(bridge->interface, &packet, &count);
+    if (status != VMNET_SUCCESS) {
+        return vmnet_framework_error("vmnet_write", status);
+    }
+    return count == 1 ? 0 : -ENOBUFS;
+#else
+    (void)opaque; (void)iovs; (void)iov_count; (void)frame_len;
+    return -ENOTSUP;
+#endif
+}
+
 void krun_vmnet_stop(void *opaque)
 {
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000

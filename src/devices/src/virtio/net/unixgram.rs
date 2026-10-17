@@ -10,6 +10,8 @@ use std::process;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
+#[cfg(target_os = "macos")]
+use super::device::VmnetDirectTx;
 use super::{write_virtio_net_hdr, MAX_BUFFER_SIZE, VNET_HDR_LEN};
 
 const VFKIT_MAGIC: [u8; 4] = *b"VFKT";
@@ -54,6 +56,8 @@ pub struct Unixgram {
     rx_lengths: [usize; VMNET_BATCH_MAX_FRAMES],
     rx_count: usize,
     rx_index: usize,
+    #[cfg(target_os = "macos")]
+    direct_tx: Option<VmnetDirectTx>,
 }
 
 impl Unixgram {
@@ -64,8 +68,10 @@ impl Unixgram {
 
     /// Create the backend for libkrun's private native-vmnet socketpair.
     #[cfg(target_os = "macos")]
-    pub fn new_batched(fd: OwnedFd) -> Self {
-        Self::with_batching(fd, true)
+    pub fn new_batched(fd: OwnedFd, direct_tx: Option<VmnetDirectTx>) -> Self {
+        let mut backend = Self::with_batching(fd, true);
+        backend.direct_tx = direct_tx;
+        backend
     }
 
     fn with_batching(fd: OwnedFd, batched: bool) -> Self {
@@ -110,6 +116,8 @@ impl Unixgram {
             rx_lengths: [0; VMNET_BATCH_MAX_FRAMES],
             rx_count: 0,
             rx_index: 0,
+            #[cfg(target_os = "macos")]
+            direct_tx: None,
         }
     }
 
@@ -373,6 +381,28 @@ impl NetBackend for Unixgram {
 
     fn has_unfinished_write(&self) -> bool {
         self.batched && self.tx_count > 0
+    }
+
+    #[cfg(target_os = "macos")]
+    fn supports_iov_write(&self) -> bool {
+        self.direct_tx.is_some()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_frame_iov(&mut self, iovs: &[libc::iovec], frame_len: usize) -> Result<(), WriteError> {
+        let Some(direct) = self.direct_tx else {
+            return Err(WriteError::Internal(nix::Error::ENOTSUP));
+        };
+        // SAFETY: iovs point into guest memory or the worker's frame buffer,
+        // both valid for the duration of this synchronous call.
+        let result = unsafe { (direct.write_iov)(direct.bridge, iovs.as_ptr(), iovs.len(), frame_len) };
+        match result {
+            0 => Ok(()),
+            r if r == -libc::ENOBUFS || r == -libc::EAGAIN => Err(WriteError::NothingWritten),
+            r if r == -libc::EPIPE => Err(WriteError::ProcessNotRunning),
+            r if r < 0 => Err(WriteError::Internal(nix::Error::from_raw(-r))),
+            _ => Err(WriteError::Internal(nix::Error::EIO)),
+        }
     }
 
     fn try_finish_write(&mut self, _hdr_len: usize, _buf: &[u8]) -> Result<(), WriteError> {

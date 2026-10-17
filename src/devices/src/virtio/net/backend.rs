@@ -47,6 +47,18 @@ pub trait NetBackend {
     }
     fn raw_socket_fd(&self) -> RawFd;
 
+    /// True when write_frame_iov sends frames straight from guest memory and
+    /// write_frame/flush_writes are not used for TX.
+    fn supports_iov_write(&self) -> bool {
+        false
+    }
+
+    /// Write one frame from `iovs` (header already excluded). NothingWritten
+    /// means the backend is full and the frame must be retried later.
+    fn write_frame_iov(&mut self, _iovs: &[libc::iovec], _frame_len: usize) -> Result<(), WriteError> {
+        Err(WriteError::Internal(nix::Error::ENOTSUP))
+    }
+
     /// Delay in microseconds before retrying after NothingWritten.
     /// Returns 0 if no delay-based retry is needed (e.g. on Linux where
     /// EAGAIN + EPOLLET handles retries via writable events).

@@ -18,9 +18,16 @@ use std::thread;
 use std::time::Instant;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 const TX_TIMING_SAMPLE_STRIDE: u64 = 64;
+
+/// Host addresses of the frame being written. They are only ever built and
+/// consumed on the worker thread within one write, so moving the worker is safe.
+struct HostIovecs(Vec<libc::iovec>);
+
+// SAFETY: see above; the pointers are never retained across calls.
+unsafe impl Send for HostIovecs {}
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
@@ -35,6 +42,7 @@ pub struct NetWorker {
     rx_has_deferred_frame: bool,
 
     tx_iovec: Vec<(GuestAddress, usize)>,
+    tx_host_iovec: HostIovecs,
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
@@ -72,10 +80,10 @@ impl NetWorker {
                 Box::new(Unixgram::new(owned_fd)) as Box<dyn NetBackend + Send>
             }
             #[cfg(target_os = "macos")]
-            VirtioNetBackend::VmnetFd(fd) => {
+            VirtioNetBackend::VmnetFd { fd, direct_tx } => {
                 // SAFETY: the native vmnet bridge created and transferred this socketpair fd.
                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-                Box::new(Unixgram::new_batched(owned_fd)) as Box<dyn NetBackend + Send>
+                Box::new(Unixgram::new_batched(owned_fd, direct_tx)) as Box<dyn NetBackend + Send>
             }
             VirtioNetBackend::UnixgramPath(path, vfkit_magic) => {
                 Box::new(Unixgram::open(path, vfkit_magic)?) as Box<dyn NetBackend + Send>
@@ -101,6 +109,7 @@ impl NetWorker {
             tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
+            tx_host_iovec: HostIovecs(Vec::with_capacity(QUEUE_SIZE as usize)),
             tx_has_deferred_frame: false,
 
             tx_stats_reset_epoch: tx_stats_handle.reset_epoch(),
@@ -472,8 +481,49 @@ impl NetWorker {
                 None
             };
 
+            // Direct backends take the frame straight from guest memory; the
+            // virtio-net header at the start of the chain is skipped, never copied.
+            let direct = self.backend.supports_iov_write();
+            let mut direct_len = 0usize;
+            if direct {
+                self.tx_host_iovec.0.clear();
+                let mut skip = VNET_HDR_LEN;
+                for &(desc_addr, desc_len) in &self.tx_iovec {
+                    let offset = cmp::min(skip, desc_len);
+                    skip -= offset;
+                    let len = desc_len - offset;
+                    if len == 0 {
+                        continue;
+                    }
+                    if direct_len + len > MAX_BUFFER_SIZE - VNET_HDR_LEN {
+                        direct_len = 0;
+                        break;
+                    }
+                    match self.mem.get_slice(desc_addr.unchecked_add(offset as u64), len) {
+                        Ok(slice) => {
+                            self.tx_host_iovec.0.push(libc::iovec {
+                                iov_base: slice.ptr_guard_mut().as_ptr() as *mut libc::c_void,
+                                iov_len: len,
+                            });
+                            direct_len += len;
+                        }
+                        Err(_) => {
+                            direct_len = 0;
+                            break;
+                        }
+                    }
+                }
+                if skip != 0 {
+                    direct_len = 0;
+                }
+            }
+
             // Copy buffer from across multiple descriptors.
             let mut read_count = 0;
+            if direct && direct_len > 0 {
+                self.tx_iovec.clear();
+                read_count = direct_len + VNET_HDR_LEN;
+            }
             for (desc_addr, desc_len) in self.tx_iovec.drain(..) {
                 let limit = cmp::min(read_count + desc_len, self.tx_frame_buf.len());
 
@@ -509,9 +559,21 @@ impl NetWorker {
                 drain_frames += 1;
                 drain_bytes += backend_bytes;
             }
-            let write_result = self
-                .backend
-                .write_frame(VNET_HDR_LEN, &mut self.tx_frame_buf[..read_count]);
+            let write_result = if direct {
+                if direct_len == 0 {
+                    // Fallback for an unmappable chain: write the copied frame as one iovec.
+                    self.tx_host_iovec.0.clear();
+                    self.tx_host_iovec.0.push(libc::iovec {
+                        iov_base: self.tx_frame_buf[VNET_HDR_LEN..].as_mut_ptr() as *mut libc::c_void,
+                        iov_len: backend_bytes as usize,
+                    });
+                }
+                self.backend
+                    .write_frame_iov(&self.tx_host_iovec.0, backend_bytes as usize)
+            } else {
+                self.backend
+                    .write_frame(VNET_HDR_LEN, &mut self.tx_frame_buf[..read_count])
+            };
             if let Some(started) = backend_started {
                 self.tx_stats.backend_write_sample_ns += started.elapsed().as_nanos() as u64;
                 self.tx_stats.timing_sampled_frames += 1;

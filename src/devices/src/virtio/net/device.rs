@@ -18,6 +18,8 @@ use super::stats::NetTxStatsHandle;
 use super::worker::NetWorker;
 
 use std::cmp;
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
@@ -61,13 +63,34 @@ struct VirtioNetConfig {
 // Safe because it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioNetConfig {}
 
+/// Writes one frame to vmnet from the worker thread: no copy into a staging
+/// buffer, no datagram hop to the bridge thread. The function borrows the iovecs
+/// only for the call; the bridge outlives every virtio-net device using it.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+pub struct VmnetDirectTx {
+    pub bridge: *mut c_void,
+    pub write_iov:
+        unsafe extern "C" fn(*mut c_void, *const libc::iovec, usize, usize) -> i32,
+}
+
+// SAFETY: the bridge pointer is only passed back to C, which serializes
+// internally. Rust never dereferences it.
+#[cfg(target_os = "macos")]
+unsafe impl Send for VmnetDirectTx {}
+
 #[derive(Clone)]
 pub enum VirtioNetBackend {
     UnixstreamFd(RawFd),
     UnixstreamPath(PathBuf),
     UnixgramFd(RawFd),
     #[cfg(target_os = "macos")]
-    VmnetFd(RawFd),
+    VmnetFd {
+        fd: RawFd,
+        /// Opaque native bridge plus a direct frame writer, or None to send
+        /// TX frames through the bridge's socketpair.
+        direct_tx: Option<VmnetDirectTx>,
+    },
     UnixgramPath(PathBuf, bool),
     #[cfg(target_os = "linux")]
     Tap(String),

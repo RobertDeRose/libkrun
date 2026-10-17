@@ -310,6 +310,29 @@ int main(int argc, char **argv)
         puts("PASS: shared_pair");
         return 0;
     }
+    if (is("direct_iov")) {
+        assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.0", 0, &fd, &bridge) == 0);
+        uint8_t head[14] = {1}, body[1500] = {2};
+        struct iovec iovs[2] = {
+            {.iov_base = head, .iov_len = sizeof(head)},
+            {.iov_base = body, .iov_len = sizeof(body)},
+        };
+        // One frame from two guest buffers reaches vmnet as a single packet.
+        assert(krun_vmnet_write_iov(bridge, iovs, 2, sizeof(head) + sizeof(body)) == 0);
+        assert(atomic_load(&writes) == 1);
+        assert(atomic_load(&write_calls) == 1);
+        assert(atomic_load(&max_write_packet_size) == (int)(sizeof(head) + sizeof(body)));
+        assert(krun_vmnet_write_iov(bridge, iovs, 2, KRUN_VMNET_MAX_FRAME_SIZE + 1) == -EMSGSIZE);
+        assert(krun_vmnet_write_iov(NULL, iovs, 2, 64) == -EINVAL);
+        assert(krun_vmnet_write_iov(bridge, NULL, 2, 64) == -EINVAL);
+        assert(krun_vmnet_write_iov(bridge, iovs, 0, 64) == -EINVAL);
+        assert(krun_vmnet_write_iov(bridge, iovs, 2, 0) == -EINVAL);
+        assert(atomic_load(&writes) == 1);
+        close(fd);
+        krun_vmnet_stop(bridge);
+        puts("PASS: direct_iov");
+        return 0;
+    }
     if (is("invalid_arguments")) {
         assert(krun_vmnet_start_shared(NULL, "255.255.255.0", 0, &fd, &bridge) == -EINVAL);
         const char *bad_gateway[] = {"garbage", "192.168.200.0", "192.168.200.255", "256.1.1.1"};
