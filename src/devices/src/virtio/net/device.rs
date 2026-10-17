@@ -66,12 +66,28 @@ unsafe impl ByteValued for VirtioNetConfig {}
 /// Writes one frame to vmnet from the worker thread: no copy into a staging
 /// buffer, no datagram hop to the bridge thread. The function borrows the iovecs
 /// only for the call; the bridge outlives every virtio-net device using it.
+/// Mirror of vmnet's `struct vmpktdesc`.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+pub struct VmPktDesc {
+    pub vm_pkt_size: usize,
+    pub vm_pkt_iov: *mut libc::iovec,
+    pub vm_pkt_iovcnt: u32,
+    pub vm_flags: u32,
+}
+
+#[cfg(target_os = "macos")]
+pub type VmnetRxSink = unsafe extern "C" fn(*mut c_void, *const VmPktDesc, usize);
+
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 pub struct VmnetDirectTx {
     pub bridge: *mut c_void,
     pub write_iov:
         unsafe extern "C" fn(*mut c_void, *const libc::iovec, usize, usize) -> i32,
+    /// Routes received frames to a sink on the bridge's receive queue instead
+    /// of the socket pair. None keeps receive on the socket pair.
+    pub set_rx_sink: Option<unsafe extern "C" fn(*mut c_void, Option<VmnetRxSink>, *mut c_void) -> i32>,
 }
 
 // SAFETY: the bridge pointer is only passed back to C, which serializes
@@ -279,9 +295,33 @@ impl VirtioDevice for Net {
         }
         let ctrl_q = queues.next();
 
+        // With a direct receive hook, frames go from the bridge's receive
+        // callback into the guest ring; the worker only handles ring refills.
+        #[cfg(target_os = "macos")]
+        let rx_direct = match &self.cfg_backend {
+            VirtioNetBackend::VmnetFd {
+                direct_tx:
+                    Some(VmnetDirectTx {
+                        bridge,
+                        set_rx_sink: Some(set_rx_sink),
+                        ..
+                    }),
+                ..
+            } => Some(super::rx_direct::RxDirect::install(
+                *bridge,
+                *set_rx_sink,
+                interrupt.clone(),
+                mem.clone(),
+            )),
+            _ => None,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let rx_direct = None;
+
         // Pair 0 owns the backend socket, receive, and the control queue.
         let worker = match NetWorker::new(
             rx_q,
+            rx_direct,
             tx_q,
             ctrl_q,
             interrupt.clone(),

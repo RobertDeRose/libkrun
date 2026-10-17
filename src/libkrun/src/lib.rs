@@ -171,6 +171,11 @@ extern "C" {
         iov_count: usize,
         frame_len: usize,
     ) -> c_int;
+    fn krun_vmnet_set_rx_sink(
+        bridge: *mut c_void,
+        sink: Option<devices::virtio::net::device::VmnetRxSink>,
+        opaque: *mut c_void,
+    ) -> c_int;
     fn krun_vmnet_stop(bridge: *mut c_void);
 }
 
@@ -1453,6 +1458,11 @@ unsafe fn add_vmnet_backend(
                 devices::virtio::net::device::VmnetDirectTx {
                     bridge,
                     write_iov: krun_vmnet_write_iov,
+                    // Receive goes straight from the bridge callback into the
+                    // guest ring unless the socket receive path is forced.
+                    set_rx_sink: std::env::var_os("KRUN_VMNET_SOCKET_RX")
+                        .is_none()
+                        .then_some(krun_vmnet_set_rx_sink as unsafe extern "C" fn(_, _, _) -> _),
                 },
             );
             // One TX queue per vCPU (capped) when frames go to vmnet directly, so

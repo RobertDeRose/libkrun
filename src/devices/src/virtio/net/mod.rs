@@ -19,6 +19,8 @@ mod tap;
 mod unixgram;
 mod unixstream;
 #[cfg(target_os = "macos")]
+pub mod rx_direct;
+#[cfg(target_os = "macos")]
 mod vmnet_direct;
 mod worker;
 

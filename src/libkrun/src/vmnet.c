@@ -110,7 +110,12 @@ struct completion {
     uint64_t write_max_packets;
 };
 
+/// Delivers received frames to the VMM instead of the private socket pair.
+typedef void (*krun_vmnet_rx_sink_fn)(void *opaque, const struct vmpktdesc *packets, size_t count);
+
 struct krun_vmnet_bridge {
+    _Atomic(krun_vmnet_rx_sink_fn) rx_sink;
+    _Atomic(void *) rx_sink_opaque;
     interface_ref interface;
     vmnet_network_ref network;
     xpc_object_t descriptor;
@@ -463,7 +468,13 @@ static void forward_packets_to_guest(struct krun_vmnet_bridge *bridge, xpc_objec
         if (status != VMNET_SUCCESS || count <= 0 || (size_t)count > requested) {
             break;
         }
-        send_guest_packet_batch(bridge, bridge->rx_packets, (size_t)count);
+        krun_vmnet_rx_sink_fn sink = atomic_load_explicit(&bridge->rx_sink, memory_order_acquire);
+        if (sink != NULL) {
+            sink(atomic_load_explicit(&bridge->rx_sink_opaque, memory_order_acquire),
+                 bridge->rx_packets, (size_t)count);
+        } else {
+            send_guest_packet_batch(bridge, bridge->rx_packets, (size_t)count);
+        }
         available -= (uint64_t)count;
     }
 }
@@ -945,6 +956,25 @@ int32_t krun_vmnet_start_shared(
     }
 #endif
     return -ENOTSUP;
+}
+
+int32_t krun_vmnet_set_rx_sink(void *opaque, krun_vmnet_rx_sink_fn sink, void *sink_opaque)
+{
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    struct krun_vmnet_bridge *bridge = opaque;
+    if (bridge == NULL) {
+        return -EINVAL;
+    }
+    // Publish the opaque before the function pointer so a callback that sees
+    // the sink also sees its argument. Frames read before this call still go
+    // to the socket pair.
+    atomic_store_explicit(&bridge->rx_sink_opaque, sink_opaque, memory_order_release);
+    atomic_store_explicit(&bridge->rx_sink, sink, memory_order_release);
+    return 0;
+#else
+    (void)opaque; (void)sink; (void)sink_opaque;
+    return -ENOTSUP;
+#endif
 }
 
 int32_t krun_vmnet_write_iov(

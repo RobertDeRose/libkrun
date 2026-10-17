@@ -4,7 +4,13 @@ use crate::virtio::net::tap::Tap;
 use crate::virtio::net::unixgram::Unixgram;
 use crate::virtio::net::unixstream::Unixstream;
 #[cfg(target_os = "macos")]
+use crate::virtio::net::rx_direct::RxDirect;
+#[cfg(target_os = "macos")]
 use crate::virtio::net::vmnet_direct::VmnetDirect;
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use utils::eventfd::EventFd;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE};
 use crate::virtio::{DeviceQueue, InterruptTransport};
 
@@ -34,8 +40,13 @@ struct HostIovecs(Vec<libc::iovec>);
 unsafe impl Send for HostIovecs {}
 
 pub struct NetWorker {
-    /// Receive queue; None for the TX-only workers of extra queue pairs.
+    /// Receive queue on the socket path; None for TX-only workers and when
+    /// the bridge delivers frames directly (see rx_direct).
     rx_q: Option<DeviceQueue>,
+    /// Direct receive: the kick eventfd the worker watches, and the shared
+    /// state the bridge callback fills.
+    #[cfg(target_os = "macos")]
+    rx_direct: Option<(Arc<EventFd>, RxDirect)>,
     tx_q: DeviceQueue,
     /// Control queue (VIRTIO_NET_F_CTRL_VQ); only the pair-0 worker owns it.
     ctrl_q: Option<DeviceQueue>,
@@ -64,8 +75,10 @@ pub struct NetWorker {
 }
 
 impl NetWorker {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rx_q: DeviceQueue,
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] rx_direct: Option<RxDirect>,
         tx_q: DeviceQueue,
         ctrl_q: Option<DeviceQueue>,
         interrupt: InterruptTransport,
@@ -106,8 +119,26 @@ impl NetWorker {
             }
         };
 
+        #[cfg(target_os = "macos")]
+        let (rx_q, rx_direct) = match rx_direct {
+            Some(direct) => {
+                let kick = rx_q.event.clone();
+                direct
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .attach_queue(rx_q);
+                (None, Some((kick, direct)))
+            }
+            None => (Some(rx_q), None),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let rx_q = Some(rx_q);
+
         Ok(Self {
-            rx_q: Some(rx_q),
+            rx_q,
+            #[cfg(target_os = "macos")]
+            rx_direct,
             tx_q,
             ctrl_q,
             max_queue_pairs,
@@ -146,6 +177,7 @@ impl NetWorker {
     ) -> Self {
         Self {
             rx_q: None,
+            rx_direct: None,
             tx_q,
             ctrl_q: None,
             max_queue_pairs: 1,
@@ -185,10 +217,20 @@ impl NetWorker {
         const TX_TIMER_FD: RawFd = -2;
 
         // TX-only workers have no receive queue, control queue, or socket.
-        let virtq_rx_ev_fd = self.rx_q.as_ref().map_or(-1, |q| q.event.as_raw_fd());
+        #[allow(unused_mut)]
+        let mut virtq_rx_ev_fd = self.rx_q.as_ref().map_or(-1, |q| q.event.as_raw_fd());
+        #[cfg(target_os = "macos")]
+        if let Some((kick, _)) = &self.rx_direct {
+            virtq_rx_ev_fd = kick.as_raw_fd();
+        }
         let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
         let virtq_ctrl_ev_fd = self.ctrl_q.as_ref().map_or(-1, |q| q.event.as_raw_fd());
-        let backend_socket = self.backend.raw_socket_fd();
+        // The socket carries receive traffic only on the socket receive path.
+        let backend_socket = if self.rx_q.is_some() {
+            self.backend.raw_socket_fd()
+        } else {
+            -1
+        };
 
         let epoll = Epoll::new().unwrap();
 
@@ -250,7 +292,11 @@ impl NetWorker {
                         let event_set = event.event_set();
                         match event_set {
                             EventSet::IN if source == virtq_rx_ev_fd => {
-                                self.process_rx_queue_event();
+                                if self.rx_q.is_some() {
+                                    self.process_rx_queue_event();
+                                } else {
+                                    self.process_rx_kick_direct();
+                                }
                             }
                             EventSet::IN if source == virtq_tx_ev_fd => {
                                 self.process_tx_queue_event();
@@ -371,6 +417,21 @@ impl NetWorker {
         }
         if raise_irq {
             self.interrupt.signal_used_queue();
+        }
+    }
+
+    /// Direct receive: the guest posted buffers, so drain waiting frames.
+    fn process_rx_kick_direct(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some((kick, direct)) = &self.rx_direct {
+            if let Err(e) = kick.read() {
+                log::error!("Failed to get rx event from queue: {e:?}");
+            }
+            direct
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .on_guest_kick();
         }
     }
 
@@ -1000,6 +1061,8 @@ mod tests {
         queue.set_event_idx(event_idx);
         NetWorker {
             rx_q: Some(DeviceQueue::new(queue, Arc::new(EventFd::new(0).unwrap()))),
+            #[cfg(target_os = "macos")]
+            rx_direct: None,
             tx_q: DeviceQueue::new(Queue::new(8), Arc::new(EventFd::new(0).unwrap())),
             ctrl_q: None,
             max_queue_pairs: 1,
