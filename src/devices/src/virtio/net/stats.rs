@@ -46,11 +46,58 @@ pub struct NetTxStatsSnapshot {
     pub irq_signal_sample_ns: u64,
 }
 
+impl NetTxStatsSnapshot {
+    /// Fold another worker's counters into this one: sums, except the max_*
+    /// fields which keep the larger observation.
+    pub fn merge(&mut self, other: &NetTxStatsSnapshot) {
+        self.eventfd_wakeups += other.eventfd_wakeups;
+        self.eventfd_values += other.eventfd_values;
+        self.drain_passes += other.drain_passes;
+        self.empty_drain_passes += other.empty_drain_passes;
+        self.frames += other.frames;
+        self.bytes += other.bytes;
+        self.descriptor_chains += other.descriptor_chains;
+        self.descriptors += other.descriptors;
+        self.max_frames_per_drain = self.max_frames_per_drain.max(other.max_frames_per_drain);
+        self.max_bytes_per_drain = self.max_bytes_per_drain.max(other.max_bytes_per_drain);
+        self.write_frame_calls += other.write_frame_calls;
+        self.backend_bytes += other.backend_bytes;
+        self.nothing_written += other.nothing_written;
+        self.partial_writes += other.partial_writes;
+        self.flush_calls += other.flush_calls;
+        self.frames_between_flushes += other.frames_between_flushes;
+        self.bytes_between_flushes += other.bytes_between_flushes;
+        self.max_frames_between_flush = self.max_frames_between_flush.max(other.max_frames_between_flush);
+        self.max_bytes_between_flush = self.max_bytes_between_flush.max(other.max_bytes_between_flush);
+        self.notification_checks += other.notification_checks;
+        self.notification_true += other.notification_true;
+        self.notification_false += other.notification_false;
+        self.signal_used_queue_calls += other.signal_used_queue_calls;
+        self.timing_sampled_frames += other.timing_sampled_frames;
+        self.descriptor_parse_sample_ns += other.descriptor_parse_sample_ns;
+        self.guest_copy_sample_ns += other.guest_copy_sample_ns;
+        self.backend_write_sample_ns += other.backend_write_sample_ns;
+        self.timing_sampled_flushes += other.timing_sampled_flushes;
+        self.flush_sample_ns += other.flush_sample_ns;
+        self.timing_sampled_drain_cycles += other.timing_sampled_drain_cycles;
+        self.timing_sampled_drain_frames += other.timing_sampled_drain_frames;
+        self.drain_cycle_sample_ns += other.drain_cycle_sample_ns;
+        self.tx_queue_disable_sample_ns += other.tx_queue_disable_sample_ns;
+        self.tx_queue_enable_sample_ns += other.tx_queue_enable_sample_ns;
+        self.add_used_sample_ns += other.add_used_sample_ns;
+        self.timing_sampled_notification_checks += other.timing_sampled_notification_checks;
+        self.notification_check_sample_ns += other.notification_check_sample_ns;
+        self.timing_sampled_irq_signals += other.timing_sampled_irq_signals;
+        self.irq_signal_sample_ns += other.irq_signal_sample_ns;
+    }
+}
+
 struct NetTxStatsShared {
     enabled: AtomicBool,
     reset_epoch: AtomicU64,
     queue_notifications: Arc<QueueNotificationCounter>,
-    snapshot: Mutex<NetTxStatsSnapshot>,
+    /// One published snapshot per TX worker, indexed by queue pair.
+    snapshots: Mutex<Vec<NetTxStatsSnapshot>>,
 }
 
 #[derive(Clone)]
@@ -62,7 +109,7 @@ impl Default for NetTxStatsHandle {
             enabled: AtomicBool::new(false),
             reset_epoch: AtomicU64::new(0),
             queue_notifications: Arc::new(QueueNotificationCounter::default()),
-            snapshot: Mutex::new(NetTxStatsSnapshot::default()),
+            snapshots: Mutex::new(Vec::new()),
         }))
     }
 }
@@ -84,7 +131,7 @@ impl NetTxStatsHandle {
         self.0.enabled.store(false, Ordering::Release);
         self.0.queue_notifications.set_enabled(false);
         self.0.queue_notifications.reset();
-        *self.0.snapshot.lock().unwrap() = NetTxStatsSnapshot::default();
+        self.0.snapshots.lock().unwrap().clear();
         self.0.reset_epoch.fetch_add(1, Ordering::AcqRel);
         self.0.queue_notifications.set_enabled(true);
         self.0.enabled.store(true, Ordering::Release);
@@ -113,9 +160,25 @@ impl NetTxStatsHandle {
     }
 
     pub fn publish(&self, reset_epoch: u64, snapshot: NetTxStatsSnapshot) {
+        self.publish_slot(0, reset_epoch, snapshot);
+    }
+
+    pub fn publish_slot(&self, slot: usize, reset_epoch: u64, snapshot: NetTxStatsSnapshot) {
         if self.is_enabled() && self.reset_epoch() == reset_epoch {
-            *self.0.snapshot.lock().unwrap() = snapshot;
+            let mut snapshots = self.0.snapshots.lock().unwrap();
+            if snapshots.len() <= slot {
+                snapshots.resize(slot + 1, NetTxStatsSnapshot::default());
+            }
+            snapshots[slot] = snapshot;
         }
+    }
+
+    fn merged(&self) -> NetTxStatsSnapshot {
+        let mut merged = NetTxStatsSnapshot::default();
+        for snapshot in self.0.snapshots.lock().unwrap().iter() {
+            merged.merge(snapshot);
+        }
+        merged
     }
 
     pub fn snapshot_and_disable(
@@ -125,14 +188,14 @@ impl NetTxStatsHandle {
         self.0.enabled.store(false, Ordering::Release);
         let queue_notifications = self.0.queue_notifications.load();
         let queue_notification_timing = self.0.queue_notifications.timing_snapshot();
-        let snapshot = *self.0.snapshot.lock().unwrap();
+        let snapshot = self.merged();
         (queue_notifications, queue_notification_timing, snapshot)
     }
 
     #[cfg(test)]
     fn snapshot(&self) -> (u64, NetTxStatsSnapshot) {
         let queue_notifications = self.0.queue_notifications.load();
-        let snapshot = *self.0.snapshot.lock().unwrap();
+        let snapshot = self.merged();
         (queue_notifications, snapshot)
     }
 }

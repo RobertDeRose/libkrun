@@ -4,12 +4,10 @@
 use std::{io, mem, result};
 use virtio_bindings::virtio_net::virtio_net_hdr_v1;
 
-use super::QueueConfig;
-
 pub const MAX_BUFFER_SIZE: usize = 65562;
-const QUEUE_SIZE: u16 = 1024;
-pub const NUM_QUEUES: usize = 2;
-pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZE); NUM_QUEUES];
+pub(crate) const QUEUE_SIZE: u16 = 1024;
+/// Control virtqueue used for VIRTIO_NET_F_MQ negotiation only.
+pub(crate) const CTRL_QUEUE_SIZE: u16 = 64;
 
 mod backend;
 pub mod device;
@@ -18,6 +16,8 @@ pub mod stats;
 mod tap;
 mod unixgram;
 mod unixstream;
+#[cfg(target_os = "macos")]
+mod vmnet_direct;
 mod worker;
 
 // https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-2050006

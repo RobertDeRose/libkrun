@@ -5,7 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 use crate::virtio::net::Result;
-use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
+use crate::virtio::net::{CTRL_QUEUE_SIZE, QUEUE_SIZE};
 use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
@@ -23,7 +23,7 @@ use std::ffi::c_void;
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
-use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
+use virtio_bindings::virtio_net::{VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MQ};
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
 
@@ -79,6 +79,23 @@ pub struct VmnetDirectTx {
 #[cfg(target_os = "macos")]
 unsafe impl Send for VmnetDirectTx {}
 
+#[cfg(target_os = "macos")]
+impl VmnetDirectTx {
+    /// Write one frame; a full vmnet reports NothingWritten for the retry path.
+    pub fn write(&self, iovs: &[libc::iovec], frame_len: usize) -> std::result::Result<(), WriteError> {
+        // SAFETY: iovs point into guest memory or a worker buffer, both valid
+        // for the duration of this synchronous call.
+        let result = unsafe { (self.write_iov)(self.bridge, iovs.as_ptr(), iovs.len(), frame_len) };
+        match result {
+            0 => Ok(()),
+            r if r == -libc::ENOBUFS || r == -libc::EAGAIN => Err(WriteError::NothingWritten),
+            r if r == -libc::EPIPE => Err(WriteError::ProcessNotRunning),
+            r if r < 0 => Err(WriteError::Internal(nix::Error::from_raw(-r))),
+            _ => Err(WriteError::Internal(nix::Error::EIO)),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum VirtioNetBackend {
     UnixstreamFd(RawFd),
@@ -107,6 +124,10 @@ pub struct Net {
 
     config: VirtioNetConfig,
     tx_stats: NetTxStatsHandle,
+    /// RX/TX queue pairs offered to the guest. Above one, a control queue
+    /// follows the pairs and every TX queue gets its own worker thread.
+    queue_pairs: u16,
+    queue_config: Vec<QueueConfig>,
 }
 
 impl Net {
@@ -117,16 +138,23 @@ impl Net {
         mac: [u8; 6],
         features: u32,
         tx_stats: NetTxStatsHandle,
+        queue_pairs: u16,
     ) -> Result<Self> {
-        let avail_features = features as u64
+        let queue_pairs = queue_pairs.max(1);
+        let mut avail_features = features as u64
             | (1 << VIRTIO_NET_F_MAC)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
             | (1 << VIRTIO_F_VERSION_1);
+        let mut queue_config = vec![QueueConfig::new(QUEUE_SIZE); 2 * queue_pairs as usize];
+        if queue_pairs > 1 {
+            avail_features |= (1 << VIRTIO_NET_F_MQ) | (1 << VIRTIO_NET_F_CTRL_VQ);
+            queue_config.push(QueueConfig::new(CTRL_QUEUE_SIZE));
+        }
 
         let config = VirtioNetConfig {
             mac,
             status: 0,
-            max_virtqueue_pairs: 0,
+            max_virtqueue_pairs: queue_pairs,
         };
 
         Ok(Net {
@@ -139,6 +167,8 @@ impl Net {
             device_state: DeviceState::Inactive,
             config,
             tx_stats,
+            queue_pairs,
+            queue_config,
         })
     }
 
@@ -175,14 +205,16 @@ impl VirtioDevice for Net {
     }
 
     fn queue_config(&self) -> &[QueueConfig] {
-        &QUEUE_CONFIG
+        &self.queue_config
     }
 
     fn queue_notification_counter(
         &self,
         queue_index: usize,
     ) -> Option<std::sync::Arc<crate::virtio::QueueNotificationCounter>> {
-        (queue_index == 1).then(|| self.tx_stats.queue_notification_counter())
+        // Every TX queue (odd index below the control queue) feeds one counter.
+        (queue_index % 2 == 1 && queue_index < 2 * self.queue_pairs as usize)
+            .then(|| self.tx_stats.queue_notification_counter())
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
@@ -213,33 +245,71 @@ impl VirtioDevice for Net {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        let [rx_q, tx_q]: [_; NUM_QUEUES] = queues.try_into().map_err(|_| {
-            error!("Cannot perform activate. Expected {} queue(s)", NUM_QUEUES);
-            ActivateError::BadActivate
-        })?;
+        let expected = self.queue_config.len();
+        if queues.len() != expected {
+            error!("Cannot perform activate. Expected {expected} queue(s)");
+            return Err(ActivateError::BadActivate);
+        }
+        let mut queues = queues.into_iter();
+        let rx_q = queues.next().unwrap();
+        let tx_q = queues.next().unwrap();
+        let mut extra_tx = Vec::with_capacity(self.queue_pairs as usize - 1);
+        for _ in 1..self.queue_pairs {
+            let _rx = queues.next().unwrap(); // Receive uses pair 0 only.
+            extra_tx.push(queues.next().unwrap());
+        }
+        let ctrl_q = queues.next();
 
-        match NetWorker::new(
+        // Pair 0 owns the backend socket, receive, and the control queue.
+        let worker = match NetWorker::new(
             rx_q,
             tx_q,
+            ctrl_q,
             interrupt.clone(),
             mem.clone(),
             self.acked_features,
             self.cfg_backend.clone(),
             self.tx_stats.clone(),
+            self.queue_pairs,
         ) {
-            Ok(worker) => {
-                worker.run();
-                self.device_state = DeviceState::Activated(mem, interrupt);
-                Ok(())
-            }
+            Ok(worker) => worker,
             Err(err) => {
                 error!(
                     "Error activating virtio-net ({}) backend: {err:?}",
                     self.id()
                 );
-                Err(ActivateError::BadActivate)
+                return Err(ActivateError::BadActivate);
             }
+        };
+        #[cfg(target_os = "macos")]
+        if let VirtioNetBackend::VmnetFd {
+            direct_tx: Some(direct_tx),
+            ..
+        } = &self.cfg_backend
+        {
+            for (index, tx_q) in extra_tx.into_iter().enumerate() {
+                NetWorker::new_tx_only(
+                    tx_q,
+                    interrupt.clone(),
+                    mem.clone(),
+                    *direct_tx,
+                    self.tx_stats.clone(),
+                    index + 1,
+                )
+                .run();
+            }
+        } else if !extra_tx.is_empty() {
+            error!("virtio-net ({}) offers multiple queues without a direct TX backend", self.id());
+            return Err(ActivateError::BadActivate);
         }
+        #[cfg(not(target_os = "macos"))]
+        if !extra_tx.is_empty() {
+            error!("virtio-net ({}) multiqueue is only supported on macOS", self.id());
+            return Err(ActivateError::BadActivate);
+        }
+        worker.run();
+        self.device_state = DeviceState::Activated(mem, interrupt);
+        Ok(())
     }
 
     fn is_activated(&self) -> bool {

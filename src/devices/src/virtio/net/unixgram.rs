@@ -390,18 +390,9 @@ impl NetBackend for Unixgram {
 
     #[cfg(target_os = "macos")]
     fn write_frame_iov(&mut self, iovs: &[libc::iovec], frame_len: usize) -> Result<(), WriteError> {
-        let Some(direct) = self.direct_tx else {
-            return Err(WriteError::Internal(nix::Error::ENOTSUP));
-        };
-        // SAFETY: iovs point into guest memory or the worker's frame buffer,
-        // both valid for the duration of this synchronous call.
-        let result = unsafe { (direct.write_iov)(direct.bridge, iovs.as_ptr(), iovs.len(), frame_len) };
-        match result {
-            0 => Ok(()),
-            r if r == -libc::ENOBUFS || r == -libc::EAGAIN => Err(WriteError::NothingWritten),
-            r if r == -libc::EPIPE => Err(WriteError::ProcessNotRunning),
-            r if r < 0 => Err(WriteError::Internal(nix::Error::from_raw(-r))),
-            _ => Err(WriteError::Internal(nix::Error::EIO)),
+        match self.direct_tx {
+            Some(direct) => direct.write(iovs, frame_len),
+            None => Err(WriteError::Internal(nix::Error::ENOTSUP)),
         }
     }
 

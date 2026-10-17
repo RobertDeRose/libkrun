@@ -1318,7 +1318,7 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            create_virtio_net(cfg, backend, mac, features);
+            create_virtio_net(cfg, backend, mac, features, 1);
             if enable_dhcp_client {
                 cfg.vmr.dhcp_client = true;
             }
@@ -1379,7 +1379,7 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            create_virtio_net(cfg, backend, mac, features);
+            create_virtio_net(cfg, backend, mac, features, 1);
             if enable_dhcp_client {
                 cfg.vmr.dhcp_client = true;
             }
@@ -1390,6 +1390,19 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
 }
 
 #[cfg(all(target_os = "macos", feature = "net"))]
+/// KRUN_NET_QUEUE_PAIRS overrides the default of min(vCPUs, 8).
+#[cfg(all(target_os = "macos", feature = "net"))]
+fn vmnet_queue_pairs(cfg: &ContextConfig) -> u16 {
+    const MAX_QUEUE_PAIRS: u16 = 8;
+    if let Some(value) = std::env::var_os("KRUN_NET_QUEUE_PAIRS") {
+        if let Some(pairs) = value.to_str().and_then(|v| v.parse::<u16>().ok()) {
+            return pairs.clamp(1, MAX_QUEUE_PAIRS);
+        }
+    }
+    let vcpus = cfg.vmr.vm_config().vcpu_count.unwrap_or(1) as u16;
+    vcpus.clamp(1, MAX_QUEUE_PAIRS)
+}
+
 unsafe fn add_vmnet_backend(
     ctx_id: u32,
     c_mac: *const u8,
@@ -1442,7 +1455,20 @@ unsafe fn add_vmnet_backend(
                     write_iov: krun_vmnet_write_iov,
                 },
             );
-            create_virtio_net(cfg, VirtioNetBackend::VmnetFd { fd, direct_tx }, mac, features);
+            // One TX queue per vCPU (capped) when frames go to vmnet directly, so
+            // the guest can spread flows over independent writer threads.
+            let queue_pairs = if direct_tx.is_some() {
+                vmnet_queue_pairs(cfg)
+            } else {
+                1
+            };
+            create_virtio_net(
+                cfg,
+                VirtioNetBackend::VmnetFd { fd, direct_tx },
+                mac,
+                features,
+                queue_pairs,
+            );
             cfg.vmnet_bridges.push(VmnetBridge(bridge));
             if flags & NET_FLAG_DHCP_CLIENT != 0 {
                 cfg.vmr.dhcp_client = true;
@@ -1566,7 +1592,7 @@ pub unsafe extern "C" fn krun_add_net_tap(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            create_virtio_net(cfg, VirtioNetBackend::Tap(tap_name), mac, features);
+            create_virtio_net(cfg, VirtioNetBackend::Tap(tap_name), mac, features, 1);
             if enable_dhcp_client {
                 cfg.vmr.dhcp_client = true;
             }
@@ -2490,6 +2516,7 @@ fn create_virtio_net(
     backend: VirtioNetBackend,
     mac: [u8; 6],
     features: u32,
+    queue_pairs: u16,
 ) {
     let tx_stats = NetTxStatsHandle::default();
     let network_interface_config = NetworkInterfaceConfig {
@@ -2498,6 +2525,7 @@ fn create_virtio_net(
         mac,
         features,
         tx_stats: tx_stats.clone(),
+        queue_pairs,
     };
     ctx_cfg.net_tx_stats.push(tx_stats);
     ctx_cfg.net_index += 1;
@@ -3350,7 +3378,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             let mac = ctx_cfg
                 .legacy_mac
                 .unwrap_or([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee]);
-            create_virtio_net(&mut ctx_cfg, backend, mac, NET_COMPAT_FEATURES);
+            create_virtio_net(&mut ctx_cfg, backend, mac, NET_COMPAT_FEATURES, 1);
         }
     }
 

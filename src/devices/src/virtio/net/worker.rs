@@ -3,10 +3,14 @@ use crate::virtio::net::backend::ConnectError;
 use crate::virtio::net::tap::Tap;
 use crate::virtio::net::unixgram::Unixgram;
 use crate::virtio::net::unixstream::Unixstream;
+#[cfg(target_os = "macos")]
+use crate::virtio::net::vmnet_direct::VmnetDirect;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE};
 use crate::virtio::{DeviceQueue, InterruptTransport};
 
 use super::backend::{NetBackend, ReadError, WriteError};
+#[cfg(target_os = "macos")]
+use super::device::VmnetDirectTx;
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
 use super::stats::{NetTxStatsHandle, NetTxStatsSnapshot};
 use super::VNET_HDR_LEN;
@@ -30,8 +34,14 @@ struct HostIovecs(Vec<libc::iovec>);
 unsafe impl Send for HostIovecs {}
 
 pub struct NetWorker {
-    rx_q: DeviceQueue,
+    /// Receive queue; None for the TX-only workers of extra queue pairs.
+    rx_q: Option<DeviceQueue>,
     tx_q: DeviceQueue,
+    /// Control queue (VIRTIO_NET_F_CTRL_VQ); only the pair-0 worker owns it.
+    ctrl_q: Option<DeviceQueue>,
+    max_queue_pairs: u16,
+    /// Index into the shared TX stats; pair 0 also drives the handoff timing.
+    stats_slot: usize,
     interrupt: InterruptTransport,
 
     mem: GuestMemoryMmap,
@@ -57,11 +67,13 @@ impl NetWorker {
     pub fn new(
         rx_q: DeviceQueue,
         tx_q: DeviceQueue,
+        ctrl_q: Option<DeviceQueue>,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
         _vnet_features: u64,
         cfg_backend: VirtioNetBackend,
         tx_stats_handle: NetTxStatsHandle,
+        max_queue_pairs: u16,
     ) -> Result<Self, ConnectError> {
         let backend = match cfg_backend {
             VirtioNetBackend::UnixstreamFd(fd) => {
@@ -95,8 +107,11 @@ impl NetWorker {
         };
 
         Ok(Self {
-            rx_q,
+            rx_q: Some(rx_q),
             tx_q,
+            ctrl_q,
+            max_queue_pairs,
+            stats_slot: 0,
 
             mem,
             backend,
@@ -119,9 +134,48 @@ impl NetWorker {
         })
     }
 
+    /// Worker for an extra TX queue of a multiqueue native vmnet device.
+    #[cfg(target_os = "macos")]
+    pub fn new_tx_only(
+        tx_q: DeviceQueue,
+        interrupt: InterruptTransport,
+        mem: GuestMemoryMmap,
+        direct_tx: VmnetDirectTx,
+        tx_stats_handle: NetTxStatsHandle,
+        stats_slot: usize,
+    ) -> Self {
+        Self {
+            rx_q: None,
+            tx_q,
+            ctrl_q: None,
+            max_queue_pairs: 1,
+            stats_slot,
+            mem,
+            backend: Box::new(VmnetDirect(direct_tx)),
+            interrupt,
+            rx_frame_buf: [0u8; MAX_BUFFER_SIZE],
+            rx_frame_buf_len: 0,
+            rx_has_deferred_frame: false,
+            tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
+            tx_frame_len: 0,
+            tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
+            tx_host_iovec: HostIovecs(Vec::with_capacity(QUEUE_SIZE as usize)),
+            tx_has_deferred_frame: false,
+            tx_stats_reset_epoch: tx_stats_handle.reset_epoch(),
+            tx_stats_enabled: tx_stats_handle.is_enabled(),
+            tx_stats_handle,
+            tx_stats: NetTxStatsSnapshot::default(),
+        }
+    }
+
     pub fn run(self) {
+        let name = if self.stats_slot == 0 {
+            "virtio-net worker".to_string()
+        } else {
+            format!("virtio-net tx {}", self.stats_slot)
+        };
         thread::Builder::new()
-            .name("virtio-net worker".into())
+            .name(name)
             .spawn(|| self.work())
             .unwrap();
     }
@@ -130,40 +184,58 @@ impl NetWorker {
         #[cfg(target_os = "macos")]
         const TX_TIMER_FD: RawFd = -2;
 
-        let virtq_rx_ev_fd = self.rx_q.event.as_raw_fd();
+        // TX-only workers have no receive queue, control queue, or socket.
+        let virtq_rx_ev_fd = self.rx_q.as_ref().map_or(-1, |q| q.event.as_raw_fd());
         let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
+        let virtq_ctrl_ev_fd = self.ctrl_q.as_ref().map_or(-1, |q| q.event.as_raw_fd());
         let backend_socket = self.backend.raw_socket_fd();
 
         let epoll = Epoll::new().unwrap();
 
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            virtq_rx_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_rx_ev_fd as u64),
-        );
+        if virtq_rx_ev_fd >= 0 {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                virtq_rx_ev_fd,
+                &EpollEvent::new(EventSet::IN, virtq_rx_ev_fd as u64),
+            );
+        }
         let _ = epoll.ctl(
             ControlOperation::Add,
             virtq_tx_ev_fd,
             &EpollEvent::new(EventSet::IN, virtq_tx_ev_fd as u64),
         );
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            backend_socket,
-            &EpollEvent::new(
-                EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED | EventSet::READ_HANG_UP,
-                backend_socket as u64,
-            ),
-        );
+        if virtq_ctrl_ev_fd >= 0 {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                virtq_ctrl_ev_fd,
+                &EpollEvent::new(EventSet::IN, virtq_ctrl_ev_fd as u64),
+            );
+        }
+        if backend_socket >= 0 {
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                backend_socket,
+                &EpollEvent::new(
+                    EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED | EventSet::READ_HANG_UP,
+                    backend_socket as u64,
+                ),
+            );
+        }
 
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
-            self.tx_stats_handle.set_worker_waiting(true);
+            if self.stats_slot == 0 {
+                self.tx_stats_handle.set_worker_waiting(true);
+            }
             let wait_result = epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice());
-            self.tx_stats_handle.set_worker_waiting(false);
+            if self.stats_slot == 0 {
+                self.tx_stats_handle.set_worker_waiting(false);
+            }
             match wait_result {
                 Ok(ev_cnt) => {
                     self.sync_tx_stats();
                     if self.tx_stats_enabled
+                        && self.stats_slot == 0
                         && epoll_events[0..ev_cnt].iter().any(|event| {
                             event.fd() == virtq_tx_ev_fd
                                 && event.event_set() == EventSet::IN
@@ -182,6 +254,9 @@ impl NetWorker {
                             }
                             EventSet::IN if source == virtq_tx_ev_fd => {
                                 self.process_tx_queue_event();
+                            }
+                            EventSet::IN if source == virtq_ctrl_ev_fd => {
+                                self.process_ctrl_queue_event();
                             }
                             _ if source == backend_socket => {
                                 if event_set.contains(EventSet::HANG_UP)
@@ -228,17 +303,88 @@ impl NetWorker {
         }
     }
 
+    /// Handle VIRTIO_NET_F_CTRL_VQ commands. Only VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET
+    /// is accepted: the guest may use any number of pairs up to the maximum,
+    /// since every TX queue already has a worker and receive stays on pair 0.
+    pub(crate) fn process_ctrl_queue_event(&mut self) {
+        if let Some(ctrl_q) = self.ctrl_q.as_ref() {
+            if let Err(e) = ctrl_q.event.read() {
+                log::error!("Failed to get ctrl event from queue: {e:?}");
+            }
+        }
+        self.process_ctrl_queue();
+    }
+
+    fn process_ctrl_queue(&mut self) {
+        use virtio_bindings::virtio_net::{
+            VIRTIO_NET_CTRL_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET, VIRTIO_NET_ERR, VIRTIO_NET_OK,
+        };
+        let Some(ctrl_q) = self.ctrl_q.as_mut() else {
+            return;
+        };
+        let mut raise_irq = false;
+        while let Some(head) = ctrl_q.queue.pop(&self.mem) {
+            let head_index = head.index;
+            let mut request = Vec::new();
+            let mut ack_addr = None;
+            let mut next_desc = Some(head);
+            while let Some(desc) = next_desc {
+                if desc.is_write_only() {
+                    ack_addr = Some(desc.addr);
+                } else {
+                    let start = request.len();
+                    request.resize(start + desc.len as usize, 0);
+                    if self.mem.read_slice(&mut request[start..], desc.addr).is_err() {
+                        request.truncate(start);
+                    }
+                }
+                next_desc = desc.next_descriptor();
+            }
+            let mut ack = VIRTIO_NET_ERR as u8;
+            if request.len() >= 4
+                && request[0] as u32 == VIRTIO_NET_CTRL_MQ
+                && request[1] as u32 == VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET
+            {
+                let pairs = u16::from_le_bytes([request[2], request[3]]);
+                if (1..=self.max_queue_pairs).contains(&pairs) {
+                    log::info!("virtio-net: guest enabled {pairs} queue pair(s)");
+                    ack = VIRTIO_NET_OK as u8;
+                }
+            } else {
+                log::warn!(
+                    "virtio-net: unsupported control command class={:?} cmd={:?}",
+                    request.first(),
+                    request.get(1)
+                );
+            }
+            let mut used_len = 0;
+            if let Some(addr) = ack_addr {
+                if self.mem.write_obj(ack, addr).is_ok() {
+                    used_len = 1;
+                }
+            }
+            if let Err(e) = ctrl_q.queue.add_used(&self.mem, head_index, used_len) {
+                log::error!("virtio-net: failed to complete control request: {e:?}");
+                break;
+            }
+            raise_irq = true;
+        }
+        if raise_irq {
+            self.interrupt.signal_used_queue();
+        }
+    }
+
     pub(crate) fn process_rx_queue_event(&mut self) {
-        if let Err(e) = self.rx_q.event.read() {
+        if let Err(e) = self.rx_q.as_mut().unwrap().event.read() {
             log::error!("Failed to get rx event from queue: {e:?}");
         }
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
+        if let Err(e) = self.rx_q.as_mut().unwrap().queue.disable_notification(&self.mem) {
             error!("error disabling queue notifications: {e:?}");
         }
         if let Err(e) = self.process_rx() {
             log::error!("Failed to process rx: {e:?} (triggered by queue event)")
         };
-        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
+        if let Err(e) = self.rx_q.as_mut().unwrap().queue.enable_notification(&self.mem) {
             error!("error disabling queue notifications: {e:?}");
         }
     }
@@ -255,7 +401,7 @@ impl NetWorker {
     fn publish_tx_stats(&self) {
         if self.tx_stats_enabled {
             self.tx_stats_handle
-                .publish(self.tx_stats_reset_epoch, self.tx_stats);
+                .publish_slot(self.stats_slot, self.tx_stats_reset_epoch, self.tx_stats);
         }
     }
 
@@ -266,8 +412,10 @@ impl NetWorker {
                 if self.tx_stats_enabled {
                     self.tx_stats.eventfd_wakeups += 1;
                     self.tx_stats.eventfd_values += value;
-                    self.tx_stats_handle
-                        .observe_eventfd(self.tx_stats.eventfd_values, value);
+                    if self.stats_slot == 0 {
+                        self.tx_stats_handle
+                            .observe_eventfd(self.tx_stats.eventfd_values, value);
+                    }
                 }
                 self.process_tx_loop();
             }
@@ -278,13 +426,13 @@ impl NetWorker {
     }
 
     pub(crate) fn process_backend_socket_readable(&mut self) {
-        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
+        if let Err(e) = self.rx_q.as_mut().unwrap().queue.enable_notification(&self.mem) {
             error!("error disabling queue notifications: {e:?}");
         }
         if let Err(e) = self.process_rx() {
             log::error!("Failed to process rx: {e:?} (triggered by backend socket readable)");
         };
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
+        if let Err(e) = self.rx_q.as_mut().unwrap().queue.disable_notification(&self.mem) {
             error!("error disabling queue notifications: {e:?}");
         }
     }
@@ -326,6 +474,8 @@ impl NetWorker {
         if used_queue
             && self
                 .rx_q
+                .as_mut()
+                .unwrap()
                 .queue
                 .needs_notification(&self.mem)
                 .map_err(RxError::QueueError)?
@@ -694,8 +844,10 @@ impl NetWorker {
                     .try_signal_used_queue()
                     .map_err(TxError::DeviceError)?;
                 if self.tx_stats_enabled {
-                    self.tx_stats_handle
+                    if self.stats_slot == 0 {
+                        self.tx_stats_handle
                         .record_irq_signal(self.tx_stats.signal_used_queue_calls);
+                    }
                 }
                 if let Some(started) = irq_started {
                     self.tx_stats.irq_signal_sample_ns += started.elapsed().as_nanos() as u64;
@@ -716,7 +868,7 @@ impl NetWorker {
     ) -> result::Result<(), FrontendError> {
         let mut result: std::result::Result<(), FrontendError> = Ok(());
 
-        let queue = &mut self.rx_q.queue;
+        let queue = &mut self.rx_q.as_mut().unwrap().queue;
         let head_descriptor = queue.pop(&self.mem).ok_or(FrontendError::EmptyQueue)?;
         let head_index = head_descriptor.index;
 
@@ -765,7 +917,7 @@ impl NetWorker {
     // Copies a single frame from `self.rx_frame_buf` into the guest. In case of an error retries
     // the operation if possible. Returns true if the operation was successfull.
     fn write_frame_to_guest(&mut self, used_queue: &mut bool) -> bool {
-        let max_iterations = self.rx_q.queue.actual_size();
+        let max_iterations = self.rx_q.as_mut().unwrap().queue.actual_size();
         for _ in 0..max_iterations {
             match self.write_frame_to_guest_impl(used_queue) {
                 Ok(()) => return true,
@@ -795,7 +947,7 @@ mod tests {
     use super::*;
     use crate::legacy::DummyIrqChip;
     use crate::virtio::queue::tests::VirtQueue;
-    use crate::virtio::queue::VIRTQ_DESC_F_WRITE;
+    use crate::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use crate::virtio::{Queue, VIRTIO_MMIO_INT_VRING};
     use std::collections::VecDeque;
     use std::num::Wrapping;
@@ -847,8 +999,11 @@ mod tests {
         let mut queue = rx.create_queue();
         queue.set_event_idx(event_idx);
         NetWorker {
-            rx_q: DeviceQueue::new(queue, Arc::new(EventFd::new(0).unwrap())),
+            rx_q: Some(DeviceQueue::new(queue, Arc::new(EventFd::new(0).unwrap()))),
             tx_q: DeviceQueue::new(Queue::new(8), Arc::new(EventFd::new(0).unwrap())),
+            ctrl_q: None,
+            max_queue_pairs: 1,
+            stats_slot: 0,
             interrupt: InterruptTransport::new(DummyIrqChip::new().into(), "rx-test".into())
                 .unwrap(),
             mem: mem.clone(),
@@ -857,9 +1012,14 @@ mod tests {
             rx_frame_buf_len: 0,
             rx_has_deferred_frame: false,
             tx_iovec: Vec::new(),
+            tx_host_iovec: HostIovecs(Vec::new()),
             tx_frame_buf: [0; MAX_BUFFER_SIZE],
             tx_frame_len: 0,
             tx_has_deferred_frame: false,
+            tx_stats_handle: NetTxStatsHandle::default(),
+            tx_stats: NetTxStatsSnapshot::default(),
+            tx_stats_reset_epoch: 0,
+            tx_stats_enabled: false,
         }
     }
 
@@ -871,6 +1031,56 @@ mod tests {
 
     fn irq_pending(worker: &NetWorker) -> bool {
         worker.interrupt.status().load(Ordering::SeqCst) & VIRTIO_MMIO_INT_VRING as usize != 0
+    }
+
+    /// Posts a control request (readable) chained to a one-byte ack (writable).
+    fn post_ctrl_request(mem: &GuestMemoryMmap, ctrl: &VirtQueue<'_>, index: usize, request: &[u8]) {
+        let request_addr = 0x10000 + index as u64 * 512;
+        let ack_addr = request_addr + 256;
+        mem.write_slice(request, GuestAddress(request_addr)).unwrap();
+        mem.write_obj(0xaau8, GuestAddress(ack_addr)).unwrap();
+        let first = index as u16 * 2;
+        ctrl.dtable[first as usize].set(request_addr, request.len() as u32, VIRTQ_DESC_F_NEXT, first + 1);
+        ctrl.dtable[first as usize + 1].set(ack_addr, 1, VIRTQ_DESC_F_WRITE, 0);
+        ctrl.avail.ring[index].set(first);
+        ctrl.avail.idx.set(index as u16 + 1);
+    }
+
+    #[test]
+    fn test_ctrl_queue_accepts_queue_pairs_within_maximum() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+        let ctrl = VirtQueue::new(GuestAddress(0x4000), &mem, 8);
+        // VIRTIO_NET_CTRL_MQ / VQ_PAIRS_SET, 3 pairs; then 9 pairs (too many);
+        // then an unsupported class.
+        post_ctrl_request(&mem, &ctrl, 0, &[4, 0, 3, 0]);
+        post_ctrl_request(&mem, &ctrl, 1, &[4, 0, 9, 0]);
+        post_ctrl_request(&mem, &ctrl, 2, &[0, 0, 1, 0]);
+        let mut worker = worker(&mem, &rx, true, 0);
+        worker.max_queue_pairs = 4;
+        worker.ctrl_q = Some(DeviceQueue::new(
+            ctrl.create_queue(),
+            Arc::new(EventFd::new(0).unwrap()),
+        ));
+        worker.process_ctrl_queue();
+        assert_eq!(ctrl.used.idx.get(), 3);
+        for index in 0..3 {
+            assert_eq!(ctrl.used.ring[index].get().len, 1, "ack written for request {index}");
+        }
+        let acks: Vec<u8> = (0..3)
+            .map(|index| mem.read_obj::<u8>(GuestAddress(0x10000 + index as u64 * 512 + 256)).unwrap())
+            .collect();
+        assert_eq!(acks, vec![0, 1, 1], "OK, ERR (pairs above maximum), ERR (unsupported class)");
+        assert!(irq_pending(&worker));
+    }
+
+    #[test]
+    fn test_ctrl_queue_without_control_queue_is_a_no_op() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+        let mut worker = worker(&mem, &rx, true, 0);
+        worker.process_ctrl_queue();
+        assert!(!irq_pending(&worker));
     }
 
     #[test]
@@ -1026,7 +1236,7 @@ mod tests {
             rx.used.idx.set(u16::MAX);
             rx.avail.event.set(used_event);
             let mut worker = worker(&mem, &rx, true, 1);
-            worker.rx_q.queue.next_used = Wrapping(u16::MAX);
+            worker.rx_q.as_mut().unwrap().queue.next_used = Wrapping(u16::MAX);
 
             worker.process_rx().unwrap();
 
@@ -1043,7 +1253,7 @@ mod tests {
         post_buffer(&rx, 0, VIRTQ_DESC_F_WRITE);
         let mut worker = worker(&mem, &rx, true, 1);
         // Keep avail.idx and ring[0] readable, but move used_event past RAM.
-        worker.rx_q.queue.avail_ring = GuestAddress(0x1fff8);
+        worker.rx_q.as_mut().unwrap().queue.avail_ring = GuestAddress(0x1fff8);
         mem.write_obj(1u16, GuestAddress(0x1fffa)).unwrap();
         mem.write_obj(0u16, GuestAddress(0x1fffc)).unwrap();
 
