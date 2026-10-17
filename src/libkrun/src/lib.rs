@@ -1390,17 +1390,17 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
 }
 
 #[cfg(all(target_os = "macos", feature = "net"))]
-/// KRUN_NET_QUEUE_PAIRS overrides the default of min(vCPUs, 8).
+/// 0 lets the VMM builder pick min(vCPUs, 8) once the VM configuration is
+/// final, since networks may be added before krun_set_vm_config.
+/// KRUN_NET_QUEUE_PAIRS forces a count.
 #[cfg(all(target_os = "macos", feature = "net"))]
-fn vmnet_queue_pairs(cfg: &ContextConfig) -> u16 {
-    const MAX_QUEUE_PAIRS: u16 = 8;
+fn vmnet_queue_pairs() -> u16 {
     if let Some(value) = std::env::var_os("KRUN_NET_QUEUE_PAIRS") {
         if let Some(pairs) = value.to_str().and_then(|v| v.parse::<u16>().ok()) {
-            return pairs.clamp(1, MAX_QUEUE_PAIRS);
+            return pairs.clamp(1, devices::virtio::net::MAX_QUEUE_PAIRS);
         }
     }
-    let vcpus = cfg.vmr.vm_config().vcpu_count.unwrap_or(1) as u16;
-    vcpus.clamp(1, MAX_QUEUE_PAIRS)
+    0
 }
 
 unsafe fn add_vmnet_backend(
@@ -1458,7 +1458,7 @@ unsafe fn add_vmnet_backend(
             // One TX queue per vCPU (capped) when frames go to vmnet directly, so
             // the guest can spread flows over independent writer threads.
             let queue_pairs = if direct_tx.is_some() {
-                vmnet_queue_pairs(cfg)
+                vmnet_queue_pairs()
             } else {
                 1
             };

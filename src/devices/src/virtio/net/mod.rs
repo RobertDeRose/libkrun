@@ -8,6 +8,8 @@ pub const MAX_BUFFER_SIZE: usize = 65562;
 pub(crate) const QUEUE_SIZE: u16 = 1024;
 /// Control virtqueue used for VIRTIO_NET_F_MQ negotiation only.
 pub(crate) const CTRL_QUEUE_SIZE: u16 = 64;
+/// Upper bound on RX/TX queue pairs, and TX worker threads, per device.
+pub const MAX_QUEUE_PAIRS: u16 = 8;
 
 mod backend;
 pub mod device;

@@ -128,6 +128,7 @@ pub struct Net {
     /// follows the pairs and every TX queue gets its own worker thread.
     queue_pairs: u16,
     queue_config: Vec<QueueConfig>,
+    auto_queue_pairs: bool,
 }
 
 impl Net {
@@ -140,24 +141,18 @@ impl Net {
         tx_stats: NetTxStatsHandle,
         queue_pairs: u16,
     ) -> Result<Self> {
-        let queue_pairs = queue_pairs.max(1);
-        let mut avail_features = features as u64
+        let avail_features = features as u64
             | (1 << VIRTIO_NET_F_MAC)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
             | (1 << VIRTIO_F_VERSION_1);
-        let mut queue_config = vec![QueueConfig::new(QUEUE_SIZE); 2 * queue_pairs as usize];
-        if queue_pairs > 1 {
-            avail_features |= (1 << VIRTIO_NET_F_MQ) | (1 << VIRTIO_NET_F_CTRL_VQ);
-            queue_config.push(QueueConfig::new(CTRL_QUEUE_SIZE));
-        }
 
         let config = VirtioNetConfig {
             mac,
             status: 0,
-            max_virtqueue_pairs: queue_pairs,
+            max_virtqueue_pairs: 0,
         };
 
-        Ok(Net {
+        let mut net = Net {
             id,
             cfg_backend,
 
@@ -167,9 +162,33 @@ impl Net {
             device_state: DeviceState::Inactive,
             config,
             tx_stats,
-            queue_pairs,
-            queue_config,
-        })
+            queue_pairs: 0,
+            queue_config: Vec::new(),
+            auto_queue_pairs: queue_pairs == 0,
+        };
+        net.set_queue_pairs(queue_pairs.max(1));
+        Ok(net)
+    }
+
+    /// True when the pair count should follow the VM's vCPU count, which the
+    /// builder applies with set_queue_pairs() once the VM configuration is final.
+    pub fn auto_queue_pairs(&self) -> bool {
+        self.auto_queue_pairs
+    }
+
+    /// Set the RX/TX queue pairs offered to the guest. Only valid before the
+    /// MMIO transport reads the queue layout, i.e. before activation.
+    pub fn set_queue_pairs(&mut self, queue_pairs: u16) {
+        let queue_pairs = queue_pairs.max(1);
+        let mq_features = (1 << VIRTIO_NET_F_MQ) | (1 << VIRTIO_NET_F_CTRL_VQ);
+        self.avail_features &= !mq_features;
+        self.queue_config = vec![QueueConfig::new(QUEUE_SIZE); 2 * queue_pairs as usize];
+        if queue_pairs > 1 {
+            self.avail_features |= mq_features;
+            self.queue_config.push(QueueConfig::new(CTRL_QUEUE_SIZE));
+        }
+        self.config.max_virtqueue_pairs = queue_pairs;
+        self.queue_pairs = queue_pairs;
     }
 
     /// Provides the ID of this net device.
