@@ -727,6 +727,10 @@ impl NetWorker {
                 if skip != 0 {
                     direct_len = 0;
                 }
+                // MEASUREMENT BUILD: always stage the frame in tx_frame_buf and
+                // write from there, to compare kernel copy cost against writing
+                // straight from guest memory.
+                direct_len = 0;
             }
 
             // Copy buffer from across multiple descriptors.
