@@ -32,8 +32,16 @@ impl NetBackend for VmnetDirect {
         true
     }
 
+    fn supports_batch_write(&self) -> bool {
+        true
+    }
+
     fn write_frame_iov(&mut self, iovs: &[libc::iovec], frame_len: usize) -> Result<(), WriteError> {
         self.0.write(iovs, frame_len)
+    }
+
+    fn write_frames(&mut self, packets: &[super::device::VmPktDesc]) -> Result<usize, WriteError> {
+        self.0.write_frames(packets)
     }
 
     fn write_retry_delay_us(&self) -> u64 {

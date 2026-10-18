@@ -171,6 +171,12 @@ extern "C" {
         iov_count: usize,
         frame_len: usize,
     ) -> c_int;
+    fn krun_vmnet_write_batch(
+        bridge: *mut c_void,
+        packets: *const devices::virtio::net::device::VmPktDesc,
+        count: usize,
+        written: *mut usize,
+    ) -> c_int;
     fn krun_vmnet_set_rx_sink(
         bridge: *mut c_void,
         sink: Option<devices::virtio::net::device::VmnetRxSink>,
@@ -1463,6 +1469,7 @@ unsafe fn add_vmnet_backend(
                     set_rx_sink: std::env::var_os("KRUN_VMNET_SOCKET_RX")
                         .is_none()
                         .then_some(krun_vmnet_set_rx_sink as unsafe extern "C" fn(_, _, _) -> _),
+                    write_batch: krun_vmnet_write_batch,
                 },
             );
             // One TX queue per vCPU (capped) when frames go to vmnet directly, so

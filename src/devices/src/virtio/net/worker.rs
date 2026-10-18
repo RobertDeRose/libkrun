@@ -16,7 +16,7 @@ use crate::virtio::{DeviceQueue, InterruptTransport};
 
 use super::backend::{NetBackend, ReadError, WriteError};
 #[cfg(target_os = "macos")]
-use super::device::VmnetDirectTx;
+use super::device::{VmPktDesc, VmnetDirectTx};
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
 use super::stats::{NetTxStatsHandle, NetTxStatsSnapshot};
 use super::VNET_HDR_LEN;
@@ -35,6 +35,96 @@ const TX_TIMING_SAMPLE_STRIDE: u64 = 64;
 /// Host addresses of the frame being written. They are only ever built and
 /// consumed on the worker thread within one write, so moving the worker is safe.
 struct HostIovecs(Vec<libc::iovec>);
+
+/// Most frames handed to one batched backend write; matches the bridge's
+/// largest vmnet_write batch.
+#[cfg(target_os = "macos")]
+const TX_BATCH_MAX: usize = 64;
+
+/// Packet descriptors for one batched write; built and consumed within a
+/// single flush on the worker thread.
+#[cfg(target_os = "macos")]
+struct PktDescs(Vec<VmPktDesc>);
+
+// SAFETY: the raw iovec pointers inside are never retained across calls.
+#[cfg(target_os = "macos")]
+unsafe impl Send for PktDescs {}
+
+/// One popped TX chain whose iovecs sit in `tx_batch_iovecs`.
+#[cfg(target_os = "macos")]
+struct PendingFrame {
+    head_index: u16,
+    iov_start: usize,
+    iov_count: usize,
+    bytes: u64,
+    timing_sample: bool,
+}
+
+#[cfg(target_os = "macos")]
+struct BatchOutcome {
+    written: usize,
+    offered: usize,
+}
+
+/// Flush the pending batch with one backend write. Accepted frames are
+/// completed; the unaccepted tail is un-popped so the next drain retries it.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn flush_tx_batch(
+    backend: &mut (dyn NetBackend + Send),
+    queue: &mut crate::virtio::Queue,
+    mem: &GuestMemoryMmap,
+    batch: &mut Vec<PendingFrame>,
+    iovecs: &mut Vec<libc::iovec>,
+    descs: &mut Vec<VmPktDesc>,
+    stats: &mut NetTxStatsSnapshot,
+    stats_enabled: bool,
+) -> result::Result<BatchOutcome, TxError> {
+    let offered = batch.len();
+    if offered == 0 {
+        return Ok(BatchOutcome { written: 0, offered: 0 });
+    }
+    descs.clear();
+    for frame in batch.iter() {
+        descs.push(VmPktDesc {
+            vm_pkt_size: frame.bytes as usize,
+            vm_pkt_iov: iovecs[frame.iov_start..].as_mut_ptr(),
+            vm_pkt_iovcnt: frame.iov_count as u32,
+            vm_flags: 0,
+        });
+    }
+    let sampled = batch.iter().filter(|frame| frame.timing_sample).count() as u64;
+    let started = (sampled > 0).then(Instant::now);
+    let written = match backend.write_frames(descs) {
+        Ok(written) => written.min(offered),
+        Err(e @ WriteError::Internal(_) | e @ WriteError::ProcessNotRunning) => {
+            return Err(TxError::Backend(e))
+        }
+        Err(_) => 0,
+    };
+    if let Some(started) = started {
+        // Share the batch's write time across its sampled frames.
+        stats.backend_write_sample_ns += started.elapsed().as_nanos() as u64 * sampled / offered as u64;
+        stats.timing_sampled_frames += sampled;
+    }
+    if stats_enabled {
+        stats.write_frame_calls += 1;
+        if written < offered {
+            stats.nothing_written += 1;
+        }
+    }
+    for frame in &batch[..written] {
+        queue
+            .add_used(mem, frame.head_index, 0)
+            .map_err(TxError::QueueError)?;
+    }
+    for _ in written..offered {
+        queue.undo_pop();
+    }
+    batch.clear();
+    iovecs.clear();
+    Ok(BatchOutcome { written, offered })
+}
 
 // SAFETY: see above; the pointers are never retained across calls.
 unsafe impl Send for HostIovecs {}
@@ -64,6 +154,13 @@ pub struct NetWorker {
 
     tx_iovec: Vec<(GuestAddress, usize)>,
     tx_host_iovec: HostIovecs,
+    /// Frames of the current drain pass waiting for one batched backend write.
+    #[cfg(target_os = "macos")]
+    tx_batch: Vec<PendingFrame>,
+    #[cfg(target_os = "macos")]
+    tx_batch_iovecs: HostIovecs,
+    #[cfg(target_os = "macos")]
+    tx_batch_descs: PktDescs,
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
@@ -156,6 +253,12 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_host_iovec: HostIovecs(Vec::with_capacity(QUEUE_SIZE as usize)),
+            #[cfg(target_os = "macos")]
+            tx_batch: Vec::with_capacity(TX_BATCH_MAX),
+            #[cfg(target_os = "macos")]
+            tx_batch_iovecs: HostIovecs(Vec::with_capacity(QUEUE_SIZE as usize)),
+            #[cfg(target_os = "macos")]
+            tx_batch_descs: PktDescs(Vec::with_capacity(TX_BATCH_MAX)),
             tx_has_deferred_frame: false,
 
             tx_stats_reset_epoch: tx_stats_handle.reset_epoch(),
@@ -192,6 +295,9 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_host_iovec: HostIovecs(Vec::with_capacity(QUEUE_SIZE as usize)),
+            tx_batch: Vec::with_capacity(TX_BATCH_MAX),
+            tx_batch_iovecs: HostIovecs(Vec::with_capacity(QUEUE_SIZE as usize)),
+            tx_batch_descs: PktDescs(Vec::with_capacity(TX_BATCH_MAX)),
             tx_has_deferred_frame: false,
             tx_stats_reset_epoch: tx_stats_handle.reset_epoch(),
             tx_stats_enabled: tx_stats_handle.is_enabled(),
@@ -695,6 +801,8 @@ impl NetWorker {
             // Direct backends take the frame straight from guest memory; the
             // virtio-net header at the start of the chain is skipped, never copied.
             let direct = self.backend.supports_iov_write();
+            #[cfg(target_os = "macos")]
+            let batching = direct && self.backend.supports_batch_write();
             let mut direct_len = 0usize;
             if direct {
                 self.tx_host_iovec.0.clear();
@@ -765,10 +873,62 @@ impl NetWorker {
             if self.tx_stats_enabled {
                 self.tx_stats.frames += 1;
                 self.tx_stats.bytes += backend_bytes;
-                self.tx_stats.write_frame_calls += 1;
                 self.tx_stats.backend_bytes += backend_bytes;
                 drain_frames += 1;
                 drain_bytes += backend_bytes;
+            }
+            #[cfg(target_os = "macos")]
+            if batching {
+                if direct_len > 0 {
+                    // Queue the frame for one write at the end of the pass.
+                    let iov_start = self.tx_batch_iovecs.0.len();
+                    self.tx_batch_iovecs.0.extend_from_slice(&self.tx_host_iovec.0);
+                    self.tx_batch.push(PendingFrame {
+                        head_index,
+                        iov_start,
+                        iov_count: self.tx_host_iovec.0.len(),
+                        bytes: backend_bytes,
+                        timing_sample,
+                    });
+                    self.tx_frame_len = 0;
+                    if self.tx_stats_enabled {
+                        flush_frames += 1;
+                        flush_bytes += backend_bytes;
+                    }
+                    if self.tx_batch.len() < TX_BATCH_MAX {
+                        continue;
+                    }
+                }
+                // Batch full, or this frame needs the staged single write:
+                // flush what is pending first so frame order is kept.
+                let outcome = flush_tx_batch(
+                    &mut *self.backend,
+                    tx_queue,
+                    &self.mem,
+                    &mut self.tx_batch,
+                    &mut self.tx_batch_iovecs.0,
+                    &mut self.tx_batch_descs.0,
+                    &mut self.tx_stats,
+                    self.tx_stats_enabled,
+                )?;
+                if outcome.written > 0 {
+                    raise_irq = true;
+                }
+                if outcome.written < outcome.offered {
+                    if direct_len > 0 {
+                        // This frame was part of the un-popped tail.
+                    } else {
+                        tx_queue.undo_pop();
+                    }
+                    result = Err(TxError::Backend(WriteError::NothingWritten));
+                    break;
+                }
+                if direct_len > 0 {
+                    continue;
+                }
+            }
+            if self.tx_stats_enabled {
+                self.tx_stats.write_frame_calls += 1;
             }
             let write_result = if direct {
                 if direct_len == 0 {
@@ -840,6 +1000,26 @@ impl NetWorker {
                 Err(e @ WriteError::Internal(_) | e @ WriteError::ProcessNotRunning) => {
                     return Err(TxError::Backend(e))
                 }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        if result.is_ok() && !self.tx_batch.is_empty() {
+            let outcome = flush_tx_batch(
+                &mut *self.backend,
+                tx_queue,
+                &self.mem,
+                &mut self.tx_batch,
+                &mut self.tx_batch_iovecs.0,
+                &mut self.tx_batch_descs.0,
+                &mut self.tx_stats,
+                self.tx_stats_enabled,
+            )?;
+            if outcome.written > 0 {
+                raise_irq = true;
+            }
+            if outcome.written < outcome.offered {
+                result = Err(TxError::Backend(WriteError::NothingWritten));
             }
         }
 
@@ -1011,6 +1191,8 @@ mod tests {
     use crate::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use crate::virtio::{Queue, VIRTIO_MMIO_INT_VRING};
     use std::collections::VecDeque;
+    #[cfg(target_os = "macos")]
+    use super::super::device::VmPktDesc;
     use std::num::Wrapping;
     use std::os::fd::RawFd;
     use std::sync::atomic::Ordering;
@@ -1076,6 +1258,12 @@ mod tests {
             rx_has_deferred_frame: false,
             tx_iovec: Vec::new(),
             tx_host_iovec: HostIovecs(Vec::new()),
+            #[cfg(target_os = "macos")]
+            tx_batch: Vec::new(),
+            #[cfg(target_os = "macos")]
+            tx_batch_iovecs: HostIovecs(Vec::new()),
+            #[cfg(target_os = "macos")]
+            tx_batch_descs: PktDescs(Vec::new()),
             tx_frame_buf: [0; MAX_BUFFER_SIZE],
             tx_frame_len: 0,
             tx_has_deferred_frame: false,
@@ -1144,6 +1332,91 @@ mod tests {
         let mut worker = worker(&mem, &rx, true, 0);
         worker.process_ctrl_queue();
         assert!(!irq_pending(&worker));
+    }
+
+    #[cfg(target_os = "macos")]
+    struct BatchBackend {
+        accept: usize,
+        batches: Vec<Vec<usize>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl NetBackend for BatchBackend {
+        fn read_frame(&mut self, _: &mut [u8]) -> Result<usize, ReadError> {
+            Err(ReadError::NothingRead)
+        }
+        fn write_frame(&mut self, _: usize, _: &mut [u8]) -> Result<(), WriteError> {
+            panic!("batched TX must not use single writes")
+        }
+        fn has_unfinished_write(&self) -> bool {
+            false
+        }
+        fn try_finish_write(&mut self, _: usize, _: &[u8]) -> Result<(), WriteError> {
+            Ok(())
+        }
+        fn raw_socket_fd(&self) -> RawFd {
+            -1
+        }
+        fn supports_iov_write(&self) -> bool {
+            true
+        }
+        fn supports_batch_write(&self) -> bool {
+            true
+        }
+        fn write_frames(&mut self, packets: &[VmPktDesc]) -> Result<usize, WriteError> {
+            // Record the payload size of each frame and check the first byte
+            // after the virtio-net header reached the backend intact.
+            self.batches.push(packets.iter().map(|p| p.vm_pkt_size).collect());
+            for packet in packets {
+                let iov = unsafe { &*packet.vm_pkt_iov };
+                assert_eq!(unsafe { *(iov.iov_base as *const u8) }, 0xee, "payload must skip the header");
+            }
+            Ok(self.accept.min(packets.len()))
+        }
+    }
+
+    /// One TX chain: a 12-byte header buffer followed by a payload buffer.
+    #[cfg(target_os = "macos")]
+    fn post_tx_frame(mem: &GuestMemoryMmap, tx: &VirtQueue<'_>, index: usize, payload_len: u32) {
+        let hdr = 0x20000 + index as u64 * 0x2000;
+        let payload = hdr + 0x100;
+        mem.write_slice(&[0u8; VNET_HDR_LEN], GuestAddress(hdr)).unwrap();
+        mem.write_slice(&vec![0xeeu8; payload_len as usize], GuestAddress(payload)).unwrap();
+        let first = index as u16 * 2;
+        tx.dtable[first as usize].set(hdr, VNET_HDR_LEN as u32, crate::virtio::queue::VIRTQ_DESC_F_NEXT, first + 1);
+        tx.dtable[first as usize + 1].set(payload, payload_len, 0, 0);
+        tx.avail.ring[index].set(first);
+        tx.avail.idx.set(index as u16 + 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_tx_batches_a_drain_pass_and_unpops_the_unaccepted_tail() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+        let tx = VirtQueue::new(GuestAddress(0x4000), &mem, 16);
+        for index in 0..5 {
+            post_tx_frame(&mem, &tx, index, 100 + index as u32);
+        }
+        let mut worker = worker(&mem, &rx, true, 0);
+        worker.tx_q = DeviceQueue::new(tx.create_queue(), Arc::new(EventFd::new(0).unwrap()));
+        worker.backend = Box::new(BatchBackend { accept: 3, batches: Vec::new() });
+
+        // The backend takes three of five: three complete, two are un-popped.
+        assert!(matches!(worker.process_tx(), Err(TxError::Backend(WriteError::NothingWritten))));
+        assert_eq!(tx.used.idx.get(), 3);
+        assert_eq!(worker.tx_q.queue.next_avail.0, 3);
+
+        // Now the backend accepts everything: the remaining two go in one batch.
+        worker.backend = Box::new(BatchBackend { accept: usize::MAX, batches: Vec::new() });
+        worker.process_tx().unwrap();
+        assert_eq!(tx.used.idx.get(), 5);
+        let backend = &worker.backend;
+        assert!(backend.has_unfinished_write() == false);
+        assert_eq!(worker.tx_batch.len(), 0);
+        // Frame sizes exclude the header and were delivered in order.
+        assert_eq!(tx.used.ring[3].get().id, 6);
+        assert_eq!(tx.used.ring[4].get().id, 8);
     }
 
     #[test]

@@ -1011,6 +1011,41 @@ int32_t krun_vmnet_write_iov(
 #endif
 }
 
+int32_t krun_vmnet_write_batch(
+    void *opaque, const struct vmpktdesc *packets, size_t count, size_t *written)
+{
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    struct krun_vmnet_bridge *bridge = opaque;
+    if (bridge == NULL || packets == NULL || count == 0 || written == NULL) {
+        return -EINVAL;
+    }
+    *written = 0;
+    if (atomic_load_explicit(&bridge->stopping, memory_order_relaxed)) {
+        return -EPIPE;
+    }
+    if (count > bridge->write_batch_size) {
+        count = bridge->write_batch_size;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (packets[i].vm_pkt_size == 0 || packets[i].vm_pkt_size > bridge->max_packet_size) {
+            return -EMSGSIZE;
+        }
+    }
+    // One vmnet_write for the whole batch; vmnet reports how many leading
+    // packets it accepted, and the caller retries the rest.
+    int accepted = (int)count;
+    vmnet_return_t status = vmnet_write(bridge->interface, (struct vmpktdesc *)packets, &accepted);
+    if (status != VMNET_SUCCESS) {
+        return vmnet_framework_error("vmnet_write", status);
+    }
+    *written = accepted < 0 ? 0 : (size_t)accepted;
+    return 0;
+#else
+    (void)opaque; (void)packets; (void)count; (void)written;
+    return -ENOTSUP;
+#endif
+}
+
 void krun_vmnet_stop(void *opaque)
 {
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000

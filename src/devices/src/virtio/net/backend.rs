@@ -59,6 +59,18 @@ pub trait NetBackend {
         Err(WriteError::Internal(nix::Error::ENOTSUP))
     }
 
+    /// True when write_frames can take a whole drain pass in one call.
+    fn supports_batch_write(&self) -> bool {
+        false
+    }
+
+    /// Write several frames at once; returns how many leading frames were
+    /// accepted (fewer than offered means the backend is full).
+    #[cfg(target_os = "macos")]
+    fn write_frames(&mut self, _packets: &[super::device::VmPktDesc]) -> Result<usize, WriteError> {
+        Err(WriteError::Internal(nix::Error::ENOTSUP))
+    }
+
     /// Delay in microseconds before retrying after NothingWritten.
     /// Returns 0 if no delay-based retry is needed (e.g. on Linux where
     /// EAGAIN + EPOLLET handles retries via writable events).

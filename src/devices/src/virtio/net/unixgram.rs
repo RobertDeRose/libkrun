@@ -389,9 +389,22 @@ impl NetBackend for Unixgram {
     }
 
     #[cfg(target_os = "macos")]
+    fn supports_batch_write(&self) -> bool {
+        self.direct_tx.is_some()
+    }
+
+    #[cfg(target_os = "macos")]
     fn write_frame_iov(&mut self, iovs: &[libc::iovec], frame_len: usize) -> Result<(), WriteError> {
         match self.direct_tx {
             Some(direct) => direct.write(iovs, frame_len),
+            None => Err(WriteError::Internal(nix::Error::ENOTSUP)),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_frames(&mut self, packets: &[super::device::VmPktDesc]) -> Result<usize, WriteError> {
+        match self.direct_tx {
+            Some(direct) => direct.write_frames(packets),
             None => Err(WriteError::Internal(nix::Error::ENOTSUP)),
         }
     }

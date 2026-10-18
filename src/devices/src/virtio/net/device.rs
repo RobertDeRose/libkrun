@@ -88,6 +88,9 @@ pub struct VmnetDirectTx {
     /// Routes received frames to a sink on the bridge's receive queue instead
     /// of the socket pair. None keeps receive on the socket pair.
     pub set_rx_sink: Option<unsafe extern "C" fn(*mut c_void, Option<VmnetRxSink>, *mut c_void) -> i32>,
+    /// Writes several frames with one vmnet_write; reports how many leading
+    /// frames were accepted.
+    pub write_batch: unsafe extern "C" fn(*mut c_void, *const VmPktDesc, usize, *mut usize) -> i32,
 }
 
 // SAFETY: the bridge pointer is only passed back to C, which serializes
@@ -97,6 +100,20 @@ unsafe impl Send for VmnetDirectTx {}
 
 #[cfg(target_os = "macos")]
 impl VmnetDirectTx {
+    /// Write a batch; returns how many leading frames vmnet accepted (0 = full).
+    pub fn write_frames(&self, packets: &[VmPktDesc]) -> std::result::Result<usize, WriteError> {
+        let mut written = 0usize;
+        // SAFETY: packets and their iovecs point into guest memory or worker
+        // buffers, all valid for this synchronous call.
+        let result = unsafe { (self.write_batch)(self.bridge, packets.as_ptr(), packets.len(), &mut written) };
+        match result {
+            0 => Ok(written),
+            r if r == -libc::EPIPE => Err(WriteError::ProcessNotRunning),
+            r if r < 0 => Err(WriteError::Internal(nix::Error::from_raw(-r))),
+            _ => Err(WriteError::Internal(nix::Error::EIO)),
+        }
+    }
+
     /// Write one frame; a full vmnet reports NothingWritten for the retry path.
     pub fn write(&self, iovs: &[libc::iovec], frame_len: usize) -> std::result::Result<(), WriteError> {
         // SAFETY: iovs point into guest memory or a worker buffer, both valid
