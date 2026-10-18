@@ -122,6 +122,15 @@ impl RxState {
         }
         if self.pending.len() >= MAX_PENDING_FRAMES {
             self.dropped += 1;
+            // Rate-limited: every power of two, so a stalled guest is visible
+            // in the VMM log without flooding it.
+            if self.dropped.is_power_of_two() {
+                log::warn!(
+                    "virtio-net rx: guest ring full, {} frames dropped so far ({} waiting)",
+                    self.dropped,
+                    self.pending.len()
+                );
+            }
             return;
         }
         self.pending.push_back(frame.to_vec());
