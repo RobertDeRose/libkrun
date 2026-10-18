@@ -1460,8 +1460,8 @@ unsafe fn add_vmnet_backend(
                     write_iov: krun_vmnet_write_iov,
                     // Receive goes straight from the bridge callback into the
                     // guest ring unless the socket receive path is forced.
-                    set_rx_sink: std::env::var_os("KRUN_VMNET_SOCKET_RX")
-                        .is_none()
+                    // MEASUREMENT BUILD: socket-pair receive forced for an A/B run.
+                    set_rx_sink: false
                         .then_some(krun_vmnet_set_rx_sink as unsafe extern "C" fn(_, _, _) -> _),
                 },
             );
