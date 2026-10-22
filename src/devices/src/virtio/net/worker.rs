@@ -41,6 +41,14 @@ struct HostIovecs(Vec<libc::iovec>);
 #[cfg(target_os = "macos")]
 const TX_BATCH_MAX: usize = 64;
 
+/// A drain that ends with fewer than this many frames pending is held for up
+/// to TX_HOLD_US so paced senders still form bursts of this size. The hold is
+/// bounded by a timer; 0 microseconds disables it.
+#[cfg(target_os = "macos")]
+const TX_HOLD_FRAMES: usize = 32;
+#[cfg(target_os = "macos")]
+const TX_HOLD_US: u64 = 60;
+
 /// Packet descriptors for one batched write; built and consumed within a
 /// single flush on the worker thread.
 #[cfg(target_os = "macos")]
@@ -161,6 +169,12 @@ pub struct NetWorker {
     tx_batch_iovecs: HostIovecs,
     #[cfg(target_os = "macos")]
     tx_batch_descs: PktDescs,
+    #[cfg(target_os = "macos")]
+    tx_hold_us: u64,
+    #[cfg(target_os = "macos")]
+    tx_hold_frames: usize,
+    #[cfg(target_os = "macos")]
+    tx_hold_armed: bool,
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
@@ -259,6 +273,12 @@ impl NetWorker {
             tx_batch_iovecs: HostIovecs(Vec::with_capacity(QUEUE_SIZE as usize)),
             #[cfg(target_os = "macos")]
             tx_batch_descs: PktDescs(Vec::with_capacity(TX_BATCH_MAX)),
+            #[cfg(target_os = "macos")]
+            tx_hold_us: TX_HOLD_US,
+            #[cfg(target_os = "macos")]
+            tx_hold_frames: TX_HOLD_FRAMES,
+            #[cfg(target_os = "macos")]
+            tx_hold_armed: false,
             tx_has_deferred_frame: false,
 
             tx_stats_reset_epoch: tx_stats_handle.reset_epoch(),
@@ -298,6 +318,9 @@ impl NetWorker {
             tx_batch: Vec::with_capacity(TX_BATCH_MAX),
             tx_batch_iovecs: HostIovecs(Vec::with_capacity(QUEUE_SIZE as usize)),
             tx_batch_descs: PktDescs(Vec::with_capacity(TX_BATCH_MAX)),
+            tx_hold_us: TX_HOLD_US,
+            tx_hold_frames: TX_HOLD_FRAMES,
+            tx_hold_armed: false,
             tx_has_deferred_frame: false,
             tx_stats_reset_epoch: tx_stats_handle.reset_epoch(),
             tx_stats_enabled: tx_stats_handle.is_enabled(),
@@ -321,6 +344,8 @@ impl NetWorker {
     fn work(mut self) {
         #[cfg(target_os = "macos")]
         const TX_TIMER_FD: RawFd = -2;
+        #[cfg(target_os = "macos")]
+        const TX_HOLD_TIMER_FD: RawFd = -3;
 
         // TX-only workers have no receive queue, control queue, or socket.
         #[allow(unused_mut)]
@@ -430,12 +455,25 @@ impl NetWorker {
                             _ if event_set.is_empty() && source == TX_TIMER_FD => {
                                 self.process_tx_loop();
                             }
+                            #[cfg(target_os = "macos")]
+                            _ if event_set.is_empty() && source == TX_HOLD_TIMER_FD => {
+                                self.tx_hold_armed = false;
+                                self.flush_held_tx_batch();
+                            }
                             _ => {
                                 log::warn!(
                                     "Received unknown event: {event_set:?} from fd: {source:?}"
                                 );
                             }
                         }
+                    }
+
+                    // A small batch left pending by a drain is flushed by the
+                    // hold timer unless more frames complete it first.
+                    #[cfg(target_os = "macos")]
+                    if !self.tx_batch.is_empty() && !self.tx_hold_armed && self.tx_hold_us > 0 {
+                        epoll.add_oneshot_timer(self.tx_hold_us, TX_HOLD_TIMER_FD as u64);
+                        self.tx_hold_armed = true;
                     }
 
                     // Arm the retry timer after processing all events, so it
@@ -453,6 +491,56 @@ impl NetWorker {
                 }
             }
         }
+    }
+
+    /// Write out a batch that a drain left pending under the hold, then signal
+    /// the guest for the frames it completed.
+    #[cfg(target_os = "macos")]
+    fn flush_held_tx_batch(&mut self) {
+        if self.tx_batch.is_empty() {
+            return;
+        }
+        self.sync_tx_stats();
+        let outcome = match flush_tx_batch(
+            &mut *self.backend,
+            &mut self.tx_q.queue,
+            &self.mem,
+            &mut self.tx_batch,
+            &mut self.tx_batch_iovecs.0,
+            &mut self.tx_batch_descs.0,
+            &mut self.tx_stats,
+            self.tx_stats_enabled,
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                log::error!("Failed to flush held tx batch: {e:?}");
+                return;
+            }
+        };
+        if outcome.written < outcome.offered {
+            self.tx_has_deferred_frame = true;
+        }
+        if outcome.written > 0 {
+            if self.tx_stats_enabled {
+                self.tx_stats.notification_checks += 1;
+            }
+            match self.tx_q.queue.needs_notification(&self.mem) {
+                Ok(true) => {
+                    if self.tx_stats_enabled {
+                        self.tx_stats.notification_true += 1;
+                        self.tx_stats.signal_used_queue_calls += 1;
+                    }
+                    self.interrupt.signal_used_queue();
+                }
+                Ok(false) => {
+                    if self.tx_stats_enabled {
+                        self.tx_stats.notification_false += 1;
+                    }
+                }
+                Err(e) => log::error!("tx needs_notification failed: {e:?}"),
+            }
+        }
+        self.publish_tx_stats();
     }
 
     /// Handle VIRTIO_NET_F_CTRL_VQ commands. Only VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET
@@ -1004,7 +1092,10 @@ impl NetWorker {
         }
 
         #[cfg(target_os = "macos")]
-        if result.is_ok() && !self.tx_batch.is_empty() {
+        if result.is_ok()
+            && !self.tx_batch.is_empty()
+            && (self.tx_hold_us == 0 || self.tx_batch.len() >= self.tx_hold_frames)
+        {
             let outcome = flush_tx_batch(
                 &mut *self.backend,
                 tx_queue,
@@ -1264,6 +1355,12 @@ mod tests {
             tx_batch_iovecs: HostIovecs(Vec::new()),
             #[cfg(target_os = "macos")]
             tx_batch_descs: PktDescs(Vec::new()),
+            #[cfg(target_os = "macos")]
+            tx_hold_us: 0,
+            #[cfg(target_os = "macos")]
+            tx_hold_frames: TX_HOLD_FRAMES,
+            #[cfg(target_os = "macos")]
+            tx_hold_armed: false,
             tx_frame_buf: [0; MAX_BUFFER_SIZE],
             tx_frame_len: 0,
             tx_has_deferred_frame: false,
@@ -1417,6 +1514,34 @@ mod tests {
         // Frame sizes exclude the header and were delivered in order.
         assert_eq!(tx.used.ring[3].get().id, 6);
         assert_eq!(tx.used.ring[4].get().id, 8);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_tx_hold_keeps_a_small_drain_pending_until_flushed() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+        let tx = VirtQueue::new(GuestAddress(0x4000), &mem, 16);
+        for index in 0..5 {
+            post_tx_frame(&mem, &tx, index, 200);
+        }
+        let mut worker = worker(&mem, &rx, true, 0);
+        worker.tx_q = DeviceQueue::new(tx.create_queue(), Arc::new(EventFd::new(0).unwrap()));
+        worker.backend = Box::new(BatchBackend { accept: usize::MAX, batches: Vec::new() });
+        worker.tx_hold_us = 60;
+        worker.tx_hold_frames = 32;
+
+        // Five frames are below the hold threshold: popped, batched, not written.
+        worker.process_tx().unwrap();
+        assert_eq!(tx.used.idx.get(), 0);
+        assert_eq!(worker.tx_batch.len(), 5);
+        assert!(!irq_pending(&worker));
+
+        // The hold timer flushes them as one batch and signals once.
+        worker.flush_held_tx_batch();
+        assert_eq!(tx.used.idx.get(), 5);
+        assert!(worker.tx_batch.is_empty());
+        assert!(irq_pending(&worker));
     }
 
     #[test]
