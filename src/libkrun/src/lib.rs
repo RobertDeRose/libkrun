@@ -1411,7 +1411,13 @@ fn vmnet_queue_pairs() -> u16 {
             return pairs.clamp(1, devices::virtio::net::MAX_QUEUE_PAIRS);
         }
     }
-    0
+    // One pair unless the environment says otherwise. Linux pins a TCP flow
+    // to the TX queue of its first transmit, so bulk workloads gain nothing
+    // from more pairs, and paced senders such as BBR lose: with several
+    // workers each sees only a few frames per drain and the per-call cost
+    // of vmnet_write dominates (measured: 0.68 of Apple's runtime with one
+    // pair per vCPU, 0.83 with one pair, on eight paced streams).
+    1
 }
 
 unsafe fn add_vmnet_backend(
