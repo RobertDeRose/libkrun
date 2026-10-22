@@ -175,11 +175,16 @@ impl Net {
         tx_stats: NetTxStatsHandle,
         queue_pairs: u16,
     ) -> Result<Self> {
-        let avail_features = features as u64
+        let mut avail_features = features as u64
             | (1 << VIRTIO_NET_F_MAC)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
-            | (1 << VIRTIO_F_VERSION_1)
-            | (1 << VIRTIO_F_RING_PACKED);
+            | (1 << VIRTIO_F_VERSION_1);
+        // Packed virtqueues are implemented and measured neutral on the
+        // native vmnet path (eight paced streams 0.77-0.82 of Apple's runtime
+        // against 0.83 split, Reno 1.00 against 1.05), so they stay opt-in.
+        if std::env::var_os("KRUN_NET_PACKED_RING").is_some_and(|v| v == "1") {
+            avail_features |= 1 << VIRTIO_F_RING_PACKED;
+        }
 
         let config = VirtioNetConfig {
             mac,
