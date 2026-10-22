@@ -14,6 +14,9 @@ use std::time::Instant;
 use utils::eventfd::EFD_NONBLOCK;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 
+/// VIRTIO_F_RING_PACKED (virtio 1.1): the driver chose packed virtqueues.
+const VIRTIO_F_RING_PACKED: u64 = 34;
+
 use super::device_status;
 use super::*;
 use crate::bus::BusDevice;
@@ -317,10 +320,12 @@ impl MmioTransport {
             .collect();
 
         let mut locked_device = self.locked_device();
-        let event_idx_enabled =
-            (locked_device.acked_features() & (1 << VIRTIO_RING_F_EVENT_IDX)) != 0;
+        let acked = locked_device.acked_features();
+        let event_idx_enabled = (acked & (1 << VIRTIO_RING_F_EVENT_IDX)) != 0;
+        let packed = (acked & (1u64 << VIRTIO_F_RING_PACKED)) != 0;
         for dq in &mut device_queues {
             dq.queue.set_event_idx(event_idx_enabled);
+            dq.queue.set_packed(packed);
         }
         locked_device
             .activate(self.mem.clone(), self.interrupt.clone(), device_queues)

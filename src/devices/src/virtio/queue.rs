@@ -30,6 +30,16 @@ pub(crate) const VIRTQ_AVAIL_ELEMENT_SIZE: u64 = 2;
 pub(super) const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 pub(super) const VIRTQ_DESC_F_WRITE: u16 = 0x2;
 
+/// Packed ring (virtio 1.1, 2.7): a descriptor's AVAIL and USED bits carry
+/// the ring wrap counters; the event suppression areas use these flags.
+pub(super) const VIRTQ_DESC_F_AVAIL: u16 = 1 << 7;
+pub(super) const VIRTQ_DESC_F_USED: u16 = 1 << 15;
+const VRING_PACKED_EVENT_FLAG_ENABLE: u16 = 0;
+const VRING_PACKED_EVENT_FLAG_DISABLE: u16 = 1;
+const VRING_PACKED_EVENT_FLAG_DESC: u16 = 2;
+const VRING_PACKED_EVENT_F_WRAP_CTR: u16 = 15;
+const PACKED_DESC_SIZE: u64 = 16;
+
 /// Virtio Queue related errors.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
@@ -192,6 +202,19 @@ pub struct Descriptor {
 
 unsafe impl ByteValued for Descriptor {}
 
+/// A packed ring descriptor (`struct pvirtq_desc`): the buffer id replaces
+/// the split ring's next index, and chains are consecutive ring entries.
+#[repr(C)]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct PackedDescriptor {
+    pub addr: u64,
+    pub len: u32,
+    pub id: u16,
+    pub flags: u16,
+}
+
+unsafe impl ByteValued for PackedDescriptor {}
+
 /// A virtio descriptor chain.
 #[derive(Clone)]
 pub struct DescriptorChain<'a> {
@@ -217,6 +240,10 @@ pub struct DescriptorChain<'a> {
     /// Index into the descriptor table of the next descriptor if flags has
     /// the next bit set
     pub next: u16,
+
+    /// Packed ring layout: `next` is the following ring slot and `index`
+    /// stays the head slot for the whole chain.
+    packed: bool,
 }
 
 impl<'a> DescriptorChain<'a> {
@@ -252,6 +279,7 @@ impl<'a> DescriptorChain<'a> {
             len: desc.len,
             flags: desc.flags,
             next: desc.next,
+            packed: false,
         };
 
         if chain.is_valid() {
@@ -259,6 +287,36 @@ impl<'a> DescriptorChain<'a> {
         } else {
             None
         }
+    }
+
+    /// A descriptor of a packed ring at `slot`; `ttl` bounds the chain and
+    /// `head` is the ring slot the chain started at.
+    fn checked_new_packed(
+        mem: &GuestMemoryMmap,
+        ring: GuestAddress,
+        queue_size: u16,
+        slot: u16,
+        head: u16,
+        ttl: u16,
+    ) -> Option<DescriptorChain<'_>> {
+        if slot >= queue_size || ttl == 0 {
+            return None;
+        }
+        let addr = mem.checked_offset(ring, (slot as usize) * PACKED_DESC_SIZE as usize)?;
+        mem.checked_offset(addr, PACKED_DESC_SIZE as usize)?;
+        let desc: PackedDescriptor = mem.read_obj(addr).ok()?;
+        Some(DescriptorChain {
+            mem,
+            desc_table: ring,
+            queue_size,
+            ttl,
+            index: head,
+            addr: GuestAddress(desc.addr),
+            len: desc.len,
+            flags: desc.flags,
+            next: (slot + 1) % queue_size,
+            packed: true,
+        })
     }
 
     fn is_valid(&self) -> bool {
@@ -292,6 +350,16 @@ impl<'a> DescriptorChain<'a> {
     /// the head of the next _available_ descriptor chain.
     pub fn next_descriptor(&self) -> Option<DescriptorChain<'a>> {
         if self.has_next() {
+            if self.packed {
+                return DescriptorChain::checked_new_packed(
+                    self.mem,
+                    self.desc_table,
+                    self.queue_size,
+                    self.next,
+                    self.index,
+                    self.ttl - 1,
+                );
+            }
             DescriptorChain::checked_new(self.mem, self.desc_table, self.queue_size, self.next).map(
                 |mut c| {
                     c.ttl = self.ttl - 1;
@@ -349,6 +417,20 @@ pub struct Queue {
     /// The number of descriptor chains placed in the used ring via `add_used`
     /// since the last time `needs_notification` was called on the associated queue.
     num_added: Wrapping<u16>,
+
+    /// VIRTIO_F_RING_PACKED negotiated: `desc_table` is the descriptor ring,
+    /// `avail_ring` the driver's event suppression area and `used_ring` the
+    /// device's. `next_avail`/`next_used` keep counting freely; the ring slot
+    /// is the value modulo the size and the wrap counter follows from the lap.
+    packed: bool,
+    /// Packed ring, per head slot: buffer id and descriptor count of the chain
+    /// popped there, consumed by `add_used`.
+    packed_chains: Vec<(u16, u16)>,
+    /// Packed ring, per last slot of a popped chain: its descriptor count, so
+    /// `undo_pop` can step back over whole chains.
+    packed_chain_ends: Vec<u16>,
+    /// Packed ring: used positions advanced since the last `needs_notification`.
+    packed_used_added: Wrapping<u16>,
 }
 
 impl Queue {
@@ -365,7 +447,123 @@ impl Queue {
             next_used: Wrapping(0),
             event_idx_enabled: false,
             num_added: Wrapping(0),
+            packed: false,
+            packed_chains: Vec::new(),
+            packed_chain_ends: Vec::new(),
+            packed_used_added: Wrapping(0),
         }
+    }
+
+    /// Select the packed ring layout (VIRTIO_F_RING_PACKED) before use.
+    pub fn set_packed(&mut self, packed: bool) {
+        self.packed = packed;
+        if packed {
+            self.packed_chains = vec![(0, 0); self.max_size as usize];
+            self.packed_chain_ends = vec![0; self.max_size as usize];
+        } else {
+            self.packed_chains.clear();
+            self.packed_chain_ends.clear();
+        }
+    }
+
+    pub fn is_packed(&self) -> bool {
+        self.packed
+    }
+
+    /// Wrap counter the device expects on the next available descriptor.
+    fn avail_wrap(&self) -> bool {
+        (self.next_avail.0 / self.actual_size()) % 2 == 0
+    }
+
+    /// Wrap counter the device writes into the next used descriptor.
+    fn used_wrap(&self) -> bool {
+        (self.next_used.0 / self.actual_size()) % 2 == 0
+    }
+
+    fn packed_desc_addr(&self, slot: u16) -> GuestAddress {
+        self.desc_table
+            .unchecked_add(u64::from(slot) * PACKED_DESC_SIZE)
+    }
+
+    /// Packed ring: whether the driver has made the descriptor at `slot`
+    /// available, judged against `wrap`.
+    fn packed_available(&self, mem: &GuestMemoryMmap, slot: u16, wrap: bool) -> bool {
+        let flags: u16 = match mem.load(
+            self.packed_desc_addr(slot).unchecked_add(14),
+            Ordering::Acquire,
+        ) {
+            Ok(flags) => flags,
+            Err(_) => return false,
+        };
+        let avail = flags & VIRTQ_DESC_F_AVAIL != 0;
+        let used = flags & VIRTQ_DESC_F_USED != 0;
+        avail == wrap && used != wrap
+    }
+
+    fn pop_packed<'b>(&mut self, mem: &'b GuestMemoryMmap) -> Option<DescriptorChain<'b>> {
+        let size = self.actual_size();
+        if size == 0 {
+            return None;
+        }
+        let head = self.next_avail.0 % size;
+        if !self.packed_available(mem, head, self.avail_wrap()) {
+            return None;
+        }
+        // The buffer id travels in the chain's last descriptor; chained
+        // descriptors occupy consecutive slots.
+        let mut count: u16 = 0;
+        let mut slot = head;
+        let id = loop {
+            let desc: PackedDescriptor = mem.read_obj(self.packed_desc_addr(slot)).ok()?;
+            count += 1;
+            if desc.flags & VIRTQ_DESC_F_NEXT == 0 || count >= size {
+                break desc.id;
+            }
+            slot = (slot + 1) % size;
+        };
+        if id >= size {
+            error!("packed virtqueue chain carries an out of range buffer id {id}");
+            return None;
+        }
+        let chain =
+            DescriptorChain::checked_new_packed(mem, self.desc_table, size, head, head, count)?;
+        self.packed_chains[head as usize] = (id, count);
+        self.packed_chain_ends[((head + count - 1) % size) as usize] = count;
+        self.next_avail += Wrapping(count);
+        Some(chain)
+    }
+
+    fn packed_len(&self, mem: &GuestMemoryMmap) -> u16 {
+        let size = self.actual_size();
+        if size == 0 {
+            return 0;
+        }
+        let mut idx = self.next_avail;
+        let mut chains = 0u16;
+        let mut seen = 0u16;
+        while seen < size {
+            let slot = idx.0 % size;
+            if !self.packed_available(mem, slot, (idx.0 / size) % 2 == 0) {
+                break;
+            }
+            let mut count = 1u16;
+            while count < size {
+                let flags: u16 = mem
+                    .load(
+                        self.packed_desc_addr((slot + count - 1) % size).unchecked_add(14),
+                        Ordering::Relaxed,
+                    )
+                    .unwrap_or(0);
+                if flags & VIRTQ_DESC_F_NEXT == 0 {
+                    break;
+                }
+                count += 1;
+            }
+            chains += 1;
+            seen = seen.saturating_add(count);
+            idx += Wrapping(count);
+        }
+        chains
     }
 
     pub fn get_max_size(&self) -> u16 {
@@ -383,9 +581,14 @@ impl Queue {
         let desc_table = self.desc_table;
         let desc_table_size = 16 * queue_size;
         let avail_ring = self.avail_ring;
-        let avail_ring_size = 6 + 2 * queue_size;
         let used_ring = self.used_ring;
-        let used_ring_size = 6 + 8 * queue_size;
+        // A packed ring's driver and device areas are one event suppression
+        // struct each (off_wrap and flags).
+        let (avail_ring_size, used_ring_size) = if self.packed {
+            (4, 4)
+        } else {
+            (6 + 2 * queue_size, 6 + 8 * queue_size)
+        };
         if !self.ready {
             error!("attempt to use virtio queue that is not marked ready");
             false
@@ -440,16 +643,26 @@ impl Queue {
     /// Returns the number of yet-to-be-popped descriptor chains in the avail ring.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self, mem: &GuestMemoryMmap) -> u16 {
+        if self.packed {
+            return self.packed_len(mem);
+        }
         (self.avail_idx(mem, Ordering::Acquire).unwrap() - self.next_avail).0
     }
 
     /// Checks if the driver has made any descriptor chains available in the avail ring.
     pub fn is_empty(&self, mem: &GuestMemoryMmap) -> bool {
+        if self.packed {
+            let size = self.actual_size();
+            return size == 0 || !self.packed_available(mem, self.next_avail.0 % size, self.avail_wrap());
+        }
         self.len(mem) == 0
     }
 
     /// Pop the first available descriptor chain from the avail ring.
     pub fn pop<'b>(&mut self, mem: &'b GuestMemoryMmap) -> Option<DescriptorChain<'b>> {
+        if self.packed {
+            return self.pop_packed(mem);
+        }
         if self.len(mem) == 0 || self.actual_size() == 0 {
             return None;
         }
@@ -496,6 +709,16 @@ impl Queue {
     /// Undo the effects of the last `self.pop()` call.
     /// The caller can use this, if it was unable to consume the last popped descriptor chain.
     pub fn undo_pop(&mut self) {
+        if self.packed {
+            let size = self.actual_size();
+            if size == 0 {
+                return;
+            }
+            let end = (self.next_avail - Wrapping(1)).0 % size;
+            let count = self.packed_chain_ends[end as usize].max(1);
+            self.next_avail -= Wrapping(count);
+            return;
+        }
         self.next_avail -= Wrapping(1);
     }
 
@@ -508,6 +731,10 @@ impl Queue {
         if head_index >= self.size {
             error!("attempted to add out of bounds descriptor to used ring: {head_index}");
             return Err(Error::InvalidDescriptorIndex);
+        }
+
+        if self.packed {
+            return self.add_used_packed(mem, head_index, len);
         }
 
         let next_used_index = u64::from(self.next_used.0 % self.size);
@@ -532,6 +759,43 @@ impl Queue {
             Ordering::Release,
         )
         .map_err(Error::GuestMemory)
+    }
+
+    /// Packed ring: one used descriptor per chain, written where the chain
+    /// started in used order; the position then advances by the chain's
+    /// descriptor count, which is how the driver walks used entries.
+    fn add_used_packed(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        head_index: u16,
+        len: u32,
+    ) -> Result<(), Error> {
+        let size = self.actual_size();
+        let (id, count) = self.packed_chains[head_index as usize];
+        if count == 0 {
+            error!("attempted to complete a packed chain that was not popped: {head_index}");
+            return Err(Error::InvalidDescriptorIndex);
+        }
+        let addr = self.packed_desc_addr(self.next_used.0 % size);
+        mem.write_obj(id, addr.unchecked_add(12))
+            .map_err(Error::GuestMemory)?;
+        mem.write_obj(len, addr.unchecked_add(8))
+            .map_err(Error::GuestMemory)?;
+        // The driver reads the flags first, so id and len must be visible
+        // before the AVAIL/USED bits flip.
+        fence(Ordering::Release);
+        let flags = if self.used_wrap() {
+            VIRTQ_DESC_F_AVAIL | VIRTQ_DESC_F_USED
+        } else {
+            0
+        };
+        mem.store(flags, addr.unchecked_add(14), Ordering::Release)
+            .map_err(Error::GuestMemory)?;
+        self.packed_chains[head_index as usize] = (0, 0);
+        self.next_used += Wrapping(count);
+        self.packed_used_added += Wrapping(count);
+        self.num_added += Wrapping(1);
+        Ok(())
     }
 
     // Return the value present in the used_event field of the avail ring.
@@ -599,6 +863,32 @@ impl Queue {
     // Every access in this method uses `Relaxed` ordering because a fence is added by the caller
     // when appropriate.
     fn set_notification(&mut self, mem: &GuestMemoryMmap, enable: bool) -> Result<(), Error> {
+        if self.packed {
+            // The device area tells the driver when to kick: always, never,
+            // or once it makes the descriptor at off_wrap available.
+            let (off_wrap, flags) = if enable {
+                if self.event_idx_enabled {
+                    let size = self.actual_size();
+                    let off = self.next_avail.0 % size;
+                    (
+                        off | ((self.avail_wrap() as u16) << VRING_PACKED_EVENT_F_WRAP_CTR),
+                        VRING_PACKED_EVENT_FLAG_DESC,
+                    )
+                } else {
+                    (0, VRING_PACKED_EVENT_FLAG_ENABLE)
+                }
+            } else if self.event_idx_enabled {
+                // As with the split ring, a descriptor event only fires once.
+                return Ok(());
+            } else {
+                (0, VRING_PACKED_EVENT_FLAG_DISABLE)
+            };
+            mem.store(off_wrap, self.used_ring, Ordering::Relaxed)
+                .map_err(Error::GuestMemory)?;
+            return mem
+                .store(flags, self.used_ring.unchecked_add(2), Ordering::Relaxed)
+                .map_err(Error::GuestMemory);
+        }
         if enable {
             if self.event_idx_enabled {
                 // We call `set_avail_event` using the `next_avail` value, instead of reading
@@ -648,6 +938,9 @@ impl Queue {
         // entries. There are situations where we intentionally avoid processing everything in the
         // available ring (which will cause this method to return `true`), but in that case we'll
         // probably not re-enable notifications as we already know there are pending entries.
+        if self.packed {
+            return Ok(!self.is_empty(mem));
+        }
         self.avail_idx(mem, Ordering::Relaxed)
             .map(|idx| idx != self.next_avail)
     }
@@ -661,6 +954,10 @@ impl Queue {
 
         // Complete all the writes in add_used() before reading the event.
         fence(Ordering::SeqCst);
+
+        if self.packed {
+            return self.needs_notification_packed(mem);
+        }
 
         // The VRING_AVAIL_F_NO_INTERRUPT flag isn't supported yet.
 
@@ -689,11 +986,43 @@ impl Queue {
         Ok(true)
     }
 
+    /// Packed ring: the driver area says whether to interrupt: never, always,
+    /// or once the device has written the used descriptor named by off_wrap.
+    fn needs_notification_packed(&mut self, mem: &GuestMemoryMmap) -> Result<bool, Error> {
+        let flags: u16 = mem
+            .load(self.avail_ring.unchecked_add(2), Ordering::Relaxed)
+            .map_err(Error::GuestMemory)?;
+        let added = self.packed_used_added;
+        self.packed_used_added = Wrapping(0);
+        self.num_added = Wrapping(0);
+        if flags == VRING_PACKED_EVENT_FLAG_DISABLE {
+            return Ok(false);
+        }
+        if flags != VRING_PACKED_EVENT_FLAG_DESC || !self.event_idx_enabled {
+            return Ok(true);
+        }
+        let off_wrap: u16 = mem
+            .load(self.avail_ring, Ordering::Relaxed)
+            .map_err(Error::GuestMemory)?;
+        let off = off_wrap & !(1 << VRING_PACKED_EVENT_F_WRAP_CTR);
+        let wrap = (off_wrap >> VRING_PACKED_EVENT_F_WRAP_CTR) == 1;
+        let size = self.actual_size();
+        // Place the event in the free-running used index space: in this lap
+        // when its wrap counter matches ours, else in the previous lap.
+        let new = self.next_used.0;
+        let old = new.wrapping_sub(added.0);
+        let mut event = (new - new % size).wrapping_add(off);
+        if wrap != self.used_wrap() {
+            event = event.wrapping_sub(size);
+        }
+        Ok(new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old))
+    }
+
     /// Goes back one position in the available descriptor chain offered by the driver.
     /// Rust does not support bidirectional iterators. This is the only way to revert the effect
     /// of an iterator increment on the queue.
     pub fn go_to_previous_position(&mut self) {
-        self.next_avail -= Wrapping(1);
+        self.undo_pop();
     }
 
     /// Fetch the available ring index (`virtq_avail->idx`) from guest memory.
@@ -949,6 +1278,221 @@ pub(crate) mod tests {
         pub fn end(&self) -> GuestAddress {
             self.used.end()
         }
+    }
+
+    /// A packed ring laid out in guest memory, driven like a virtio 1.1 driver.
+    struct PackedRing<'a> {
+        mem: &'a GuestMemoryMmap,
+        ring: GuestAddress,
+        driver: GuestAddress,
+        device: GuestAddress,
+        size: u16,
+        next: u16,
+        wrap: bool,
+    }
+
+    impl<'a> PackedRing<'a> {
+        fn new(mem: &'a GuestMemoryMmap, size: u16) -> Self {
+            PackedRing {
+                mem,
+                ring: GuestAddress(0x1000),
+                driver: GuestAddress(0x3000),
+                device: GuestAddress(0x3100),
+                size,
+                next: 0,
+                wrap: true,
+            }
+        }
+
+        fn queue(&self) -> Queue {
+            let mut q = Queue::new(self.size);
+            q.size = self.size;
+            q.ready = true;
+            q.desc_table = self.ring;
+            q.avail_ring = self.driver;
+            q.used_ring = self.device;
+            q.set_packed(true);
+            q.set_event_idx(true);
+            q
+        }
+
+        fn desc(&self, slot: u16) -> PackedDescriptor {
+            self.mem.read_obj(self.ring.unchecked_add(u64::from(slot) * 16)).unwrap()
+        }
+
+        /// Make a chain available: one descriptor per buffer, the id in the
+        /// last one, the head written last as a driver would.
+        fn add_chain(&mut self, buffers: &[(u64, u32, bool)], id: u16) -> u16 {
+            let head = self.next;
+            let mut slots = Vec::new();
+            for (i, &(addr, len, write)) in buffers.iter().enumerate() {
+                let last = i + 1 == buffers.len();
+                let mut flags = if write { VIRTQ_DESC_F_WRITE } else { 0 };
+                if !last {
+                    flags |= VIRTQ_DESC_F_NEXT;
+                }
+                if self.wrap {
+                    flags |= VIRTQ_DESC_F_AVAIL;
+                } else {
+                    flags |= VIRTQ_DESC_F_USED;
+                }
+                slots.push((self.next, PackedDescriptor { addr, len, id, flags }));
+                self.next += 1;
+                if self.next == self.size {
+                    self.next = 0;
+                    self.wrap = !self.wrap;
+                }
+            }
+            for (slot, desc) in slots.iter().skip(1) {
+                self.mem.write_obj(*desc, self.ring.unchecked_add(u64::from(*slot) * 16)).unwrap();
+            }
+            let (slot, desc) = slots[0];
+            self.mem.write_obj(desc, self.ring.unchecked_add(u64::from(slot) * 16)).unwrap();
+            head
+        }
+
+        fn set_driver_event(&self, off_wrap: u16, flags: u16) {
+            self.mem.write_obj(off_wrap, self.driver).unwrap();
+            self.mem.write_obj(flags, self.driver.unchecked_add(2)).unwrap();
+        }
+
+        fn device_event(&self) -> (u16, u16) {
+            (
+                self.mem.read_obj(self.device).unwrap(),
+                self.mem.read_obj(self.device.unchecked_add(2)).unwrap(),
+            )
+        }
+    }
+
+    #[test]
+    fn test_packed_pop_follows_chains_and_completes_in_place() {
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut ring = PackedRing::new(m, 8);
+        let mut q = ring.queue();
+        assert!(q.is_valid(m));
+        assert!(q.is_empty(m));
+        assert!(q.pop(m).is_none());
+
+        ring.add_chain(&[(0x5000, 100, false)], 3);
+        ring.add_chain(&[(0x6000, 12, false), (0x6100, 500, false), (0x6200, 64, true)], 5);
+        assert_eq!(q.len(m), 2);
+
+        let first = q.pop(m).unwrap();
+        assert_eq!(first.index, 0);
+        assert_eq!(first.addr, GuestAddress(0x5000));
+        assert_eq!(first.len, 100);
+        assert!(first.next_descriptor().is_none());
+
+        let head = q.pop(m).unwrap();
+        assert_eq!(head.index, 1);
+        assert_eq!(head.addr, GuestAddress(0x6000));
+        let second = head.next_descriptor().unwrap();
+        assert_eq!(second.index, 1, "the chain keeps its head slot as index");
+        assert_eq!(second.addr, GuestAddress(0x6100));
+        let third = second.next_descriptor().unwrap();
+        assert!(third.is_write_only());
+        assert_eq!(third.len, 64);
+        assert!(third.next_descriptor().is_none());
+        assert!(q.pop(m).is_none());
+        assert!(q.is_empty(m));
+
+        // Used descriptors: one per chain where it started, both wrap bits set
+        // in the first lap, and the used position advances by the chain length.
+        q.add_used(m, 0, 0).unwrap();
+        q.add_used(m, 1, 64).unwrap();
+        let used0 = ring.desc(0);
+        assert_eq!((used0.id, used0.len), (3, 0));
+        assert_eq!(used0.flags & (VIRTQ_DESC_F_AVAIL | VIRTQ_DESC_F_USED), VIRTQ_DESC_F_AVAIL | VIRTQ_DESC_F_USED);
+        let used1 = ring.desc(1);
+        assert_eq!((used1.id, used1.len), (5, 64));
+        assert_eq!(ring.desc(2).id, 5, "the chain's other slots are untouched");
+        assert_eq!(q.next_used.0, 4);
+    }
+
+    #[test]
+    fn test_packed_wrap_counters_flip_per_lap() {
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut ring = PackedRing::new(m, 4);
+        let mut q = ring.queue();
+        ring.add_chain(&[(0x5000, 10, false)], 0);
+        ring.add_chain(&[(0x5100, 10, false), (0x5200, 10, false), (0x5300, 10, false)], 1);
+        let a = q.pop(m).unwrap();
+        let b = q.pop(m).unwrap();
+        assert!(q.pop(m).is_none());
+        q.add_used(m, a.index, 0).unwrap();
+        q.add_used(m, b.index, 0).unwrap();
+
+        // Second lap: the driver flips its wrap bit; stale first-lap flags
+        // must not look available, fresh second-lap ones must.
+        assert!(q.is_empty(m));
+        ring.add_chain(&[(0x5400, 10, false)], 2);
+        assert!(!q.is_empty(m));
+        let c = q.pop(m).unwrap();
+        assert_eq!(c.index, 0);
+        assert_eq!(c.addr, GuestAddress(0x5400));
+        q.add_used(m, c.index, 0).unwrap();
+        let used = ring.desc(0);
+        assert_eq!(used.id, 2);
+        assert_eq!(used.flags & (VIRTQ_DESC_F_AVAIL | VIRTQ_DESC_F_USED), 0, "second-lap used flags are both clear");
+    }
+
+    #[test]
+    fn test_packed_undo_pop_steps_back_whole_chains() {
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut ring = PackedRing::new(m, 8);
+        let mut q = ring.queue();
+        ring.add_chain(&[(0x5000, 10, false)], 0);
+        ring.add_chain(&[(0x5100, 10, false), (0x5200, 10, false)], 1);
+        ring.add_chain(&[(0x5300, 10, false)], 2);
+        q.pop(m).unwrap();
+        q.pop(m).unwrap();
+        q.pop(m).unwrap();
+        assert_eq!(q.next_avail.0, 4);
+        q.undo_pop();
+        assert_eq!(q.next_avail.0, 3);
+        q.undo_pop();
+        assert_eq!(q.next_avail.0, 1);
+        let again = q.pop(m).unwrap();
+        assert_eq!(again.index, 1);
+        assert_eq!(again.addr, GuestAddress(0x5100));
+    }
+
+    #[test]
+    fn test_packed_event_suppression() {
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut ring = PackedRing::new(m, 8);
+        let mut q = ring.queue();
+        for i in 0..3u16 {
+            ring.add_chain(&[(0x5000 + u64::from(i) * 0x100, 10, false)], i);
+        }
+
+        // Enabling notifications publishes the next slot and our wrap bit.
+        assert!(q.enable_notification(m).unwrap(), "entries are pending");
+        assert_eq!(ring.device_event(), (0 | (1 << 15), VRING_PACKED_EVENT_FLAG_DESC));
+
+        let a = q.pop(m).unwrap();
+        let b = q.pop(m).unwrap();
+        ring.set_driver_event(0, VRING_PACKED_EVENT_FLAG_DISABLE);
+        q.add_used(m, a.index, 0).unwrap();
+        assert!(!q.needs_notification(m).unwrap());
+
+        ring.set_driver_event(0, VRING_PACKED_EVENT_FLAG_ENABLE);
+        q.add_used(m, b.index, 0).unwrap();
+        assert!(q.needs_notification(m).unwrap());
+
+        // Descriptor events: wanted at used slot 2 (first lap). Not reached yet.
+        ring.set_driver_event(2 | (1 << 15), VRING_PACKED_EVENT_FLAG_DESC);
+        assert!(!q.needs_notification(m).unwrap(), "nothing used since the last check");
+        let c = q.pop(m).unwrap();
+        q.add_used(m, c.index, 0).unwrap();
+        assert!(q.needs_notification(m).unwrap(), "used slot 2 was just written");
+
+        // An event in the next lap (wrap bit differs, slot ahead) is not due.
+        ring.add_chain(&[(0x5900, 10, false)], 3);
+        ring.set_driver_event(6, VRING_PACKED_EVENT_FLAG_DESC);
+        let d = q.pop(m).unwrap();
+        q.add_used(m, d.index, 0).unwrap();
+        assert!(!q.needs_notification(m).unwrap());
     }
 
     #[test]
