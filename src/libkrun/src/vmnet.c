@@ -711,6 +711,7 @@ static int allocate_packet_batch(
 static int32_t start_interface(
     vmnet_network_ref network,
     xpc_object_t descriptor,
+    size_t header_len,
     int *out_fd,
     void **out_bridge)
     __attribute__((availability(macos, introduced = 26.0)));
@@ -718,6 +719,7 @@ static int32_t start_interface(
 static int32_t start_interface(
     vmnet_network_ref network,
     xpc_object_t descriptor,
+    size_t header_len,
     int *out_fd,
     void **out_bridge)
 {
@@ -799,12 +801,14 @@ static int32_t start_interface(
         (void)stop_bridge(bridge);
         return error;
     }
-    if (max_packet_size < 1514 || max_packet_size > KRUN_VMNET_MAX_FRAME_SIZE + KRUN_VMNET_VNET_HDR_LEN) {
+    if (max_packet_size < 1514 || max_packet_size > KRUN_VMNET_MAX_FRAME_SIZE) {
         close(sockets[0]);
         (void)stop_bridge(bridge);
         return -EMSGSIZE;
     }
-    bridge->max_packet_size = (size_t)max_packet_size;
+    // vmnet reports the frame limit without the virtio-net header, but every
+    // packet buffer and size in header mode carries it in front of the frame.
+    bridge->max_packet_size = (size_t)max_packet_size + header_len;
     bridge->read_batch_size = batch_size(read_max_packets);
     bridge->write_batch_size = batch_size(write_max_packets);
     result = allocate_packet_batch(
@@ -869,6 +873,11 @@ static void set_offload_keys(xpc_object_t descriptor, int offload)
     }
 }
 
+static size_t offload_header_len(int offload)
+{
+    return offload == KRUN_VMNET_OFFLOAD_VIRTIO_HEADER ? KRUN_VMNET_VNET_HDR_LEN : 0;
+}
+
 static int32_t start_network(
     vmnet_network_ref network, bool isolated, int offload, int *out_fd, void **out_bridge)
     __attribute__((availability(macos, introduced = 26.0)));
@@ -884,7 +893,7 @@ static int32_t start_network(
     xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, false);
     xpc_dictionary_set_bool(descriptor, vmnet_enable_isolation_key, isolated);
     set_offload_keys(descriptor, offload);
-    return start_interface(network, descriptor, out_fd, out_bridge);
+    return start_interface(network, descriptor, offload_header_len(offload), out_fd, out_bridge);
 }
 
 static int32_t start_shared(
@@ -932,7 +941,7 @@ static int32_t start_shared(
     xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, false);
     xpc_dictionary_set_bool(descriptor, vmnet_enable_isolation_key, true);
     set_offload_keys(descriptor, offload);
-    return start_interface(NULL, descriptor, out_fd, out_bridge);
+    return start_interface(NULL, descriptor, offload_header_len(offload), out_fd, out_bridge);
 }
 #endif
 

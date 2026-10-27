@@ -135,8 +135,8 @@ static interface_ref fake_start(xpc_object_t descriptor, dispatch_queue_t queue,
         assert(!descriptor->allocate_mac); // Descriptor must outlive asynchronous start.
         struct fake_xpc parameters = {
             .size = is("invalid_packet_size") ? 0
-                : (is("virtio_header") ? KRUN_VMNET_MAX_FRAME_SIZE + KRUN_VMNET_VNET_HDR_LEN
-                : (is("offload") || is("serialized_offload") ? KRUN_VMNET_MAX_FRAME_SIZE : 2048)),
+                : (is("offload") || is("serialized_offload") || is("virtio_header")
+                    ? KRUN_VMNET_MAX_FRAME_SIZE : 2048),
             .read_max_packets = is("batch_cap") ? 128 : 8,
             .write_max_packets = is("batch_cap") ? 128 : 8,
         };
@@ -394,6 +394,16 @@ int main(int argc, char **argv)
             for (int i = 0; i < 100 && atomic_load(&writes) < 2; i++) usleep(1000);
             assert(atomic_load(&writes) == 2);
             assert(atomic_load(&max_write_packet_size) == (int)large_size);
+        }
+        if (is("virtio_header")) {
+            // The largest frame plus its header fits; one byte more does not.
+            assert(((struct krun_vmnet_bridge *)bridge)->max_packet_size
+                   == KRUN_VMNET_MAX_FRAME_SIZE + KRUN_VMNET_VNET_HDR_LEN);
+            uint8_t frame[64] = {0};
+            struct iovec iov = {frame, sizeof(frame)};
+            assert(krun_vmnet_write_iov(
+                       bridge, &iov, 1, KRUN_VMNET_MAX_FRAME_SIZE + KRUN_VMNET_VNET_HDR_LEN + 1)
+                   == -EMSGSIZE);
         }
         atomic_store(&reads_pending, 1);
         dispatch_sync(active_interface->queue, ^{
