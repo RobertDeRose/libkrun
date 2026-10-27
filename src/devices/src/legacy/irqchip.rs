@@ -150,7 +150,10 @@ pub mod test_utils {
     use super::*;
 
     #[derive(Clone, Default, Debug)]
-    pub struct DummyIrqChip {}
+    pub struct DummyIrqChip {
+        /// Number of set_irq calls, shared by clones.
+        pub raised: Arc<std::sync::atomic::AtomicUsize>,
+    }
 
     impl DummyIrqChip {
         pub fn new() -> Self {
@@ -160,9 +163,7 @@ pub mod test_utils {
 
     impl Into<IrqChip> for DummyIrqChip {
         fn into(self) -> IrqChip {
-            Arc::new(Mutex::new(IrqChipDevice::new(
-                Box::new(DummyIrqChip::new()),
-            )))
+            Arc::new(Mutex::new(IrqChipDevice::new(Box::new(self))))
         }
     }
 
@@ -221,6 +222,7 @@ pub mod test_utils {
             _irq_line: Option<u32>,
             _interrupt_evt: Option<&EventFd>,
         ) -> Result<(), DeviceError> {
+            self.raised.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }

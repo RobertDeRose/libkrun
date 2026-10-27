@@ -137,7 +137,14 @@ impl InterruptTransport {
     }
 
     fn try_signal(&self, status: u32) -> Result<(), crate::Error> {
-        self.status().fetch_or(status as usize, Ordering::SeqCst);
+        let pending = self.status().fetch_or(status as usize, Ordering::SeqCst);
+        // A used-ring interrupt the guest has not acknowledged yet covers this
+        // one: the driver acknowledges before walking every queue, so it sees
+        // whatever was published before this call. Raising again would cost
+        // the guest another exit and interrupt for no new work.
+        if status == VIRTIO_MMIO_INT_VRING && pending & status as usize != 0 {
+            return Ok(());
+        }
         self.intc()
             .lock()
             .unwrap()
@@ -312,6 +319,9 @@ impl MmioTransport {
         let Some(queues) = self.queues.take() else {
             return;
         };
+        // A cause left pending by an earlier driver instance would otherwise
+        // suppress every used-ring interrupt of this one.
+        self.interrupt.status().store(0, Ordering::SeqCst);
 
         let mut device_queues: Vec<DeviceQueue> = queues
             .into_iter()
@@ -561,6 +571,23 @@ pub(crate) mod tests {
     use super::*;
     use crate::legacy::DummyIrqChip;
     use vm_memory::GuestMemoryMmap;
+
+    #[test]
+    fn test_unacknowledged_used_ring_interrupt_is_not_raised_again() {
+        let chip = DummyIrqChip::new();
+        let raised = chip.raised.clone();
+        let interrupt = InterruptTransport::new(chip.into(), "coalesce-test".into()).unwrap();
+        interrupt.try_signal_used_queue().unwrap();
+        interrupt.try_signal_used_queue().unwrap();
+        assert_eq!(raised.load(Ordering::SeqCst), 1, "pending cause covers the second signal");
+        // Config changes are never coalesced with a pending used-ring cause.
+        interrupt.try_signal_config_change().unwrap();
+        assert_eq!(raised.load(Ordering::SeqCst), 2);
+        // Once the guest acknowledges, the next signal raises again.
+        interrupt.status().fetch_and(!(VIRTIO_MMIO_INT_VRING as usize), Ordering::SeqCst);
+        interrupt.try_signal_used_queue().unwrap();
+        assert_eq!(raised.load(Ordering::SeqCst), 3);
+    }
 
     static QUEUE_CONFIG: [QueueConfig; 2] = [QueueConfig::new(16), QueueConfig::new(32)];
 
