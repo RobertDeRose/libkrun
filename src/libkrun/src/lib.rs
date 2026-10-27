@@ -1476,6 +1476,7 @@ unsafe fn add_vmnet_backend(
                         .is_none()
                         .then_some(krun_vmnet_set_rx_sink as unsafe extern "C" fn(_, _, _) -> _),
                     write_batch: krun_vmnet_write_batch,
+                    vnet_hdr: vmnet_offload_mode(features) == 2,
                 },
             );
             // One TX queue per vCPU (capped) when frames go to vmnet directly, so
@@ -1506,6 +1507,25 @@ unsafe fn add_vmnet_backend(
     KRUN_SUCCESS
 }
 
+/// vmnet offload mode for the bridge: 0 none, 1 vmnet computes checksums,
+/// 2 the guest's virtio-net header passes through (the default;
+/// KRUN_VMNET_VIRTIO_HDR=0 selects checksum mode). Header mode needs both
+/// direct paths, since the socket pair carries raw frames.
+#[cfg(all(target_os = "macos", feature = "net"))]
+fn vmnet_offload_mode(features: u32) -> c_int {
+    if features != NET_VMNET_NATIVE_TCP_FEATURES {
+        return 0;
+    }
+    let header = std::env::var_os("KRUN_VMNET_VIRTIO_HDR").is_none_or(|v| v != "0")
+        && std::env::var_os("KRUN_VMNET_SOCKET_TX").is_none()
+        && std::env::var_os("KRUN_VMNET_SOCKET_RX").is_none();
+    if header {
+        2
+    } else {
+        1
+    }
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 #[cfg(all(target_os = "macos", feature = "net"))]
@@ -1519,7 +1539,7 @@ pub unsafe extern "C" fn krun_add_net_vmnet(
     if network_serialization.is_null() {
         return -libc::EINVAL;
     }
-    let enable_offload = (features == NET_VMNET_NATIVE_TCP_FEATURES) as c_int;
+    let enable_offload = vmnet_offload_mode(features);
     add_vmnet_backend(ctx_id, c_mac, features, flags, |fd, bridge| {
         krun_vmnet_start(network_serialization, enable_offload, fd, bridge)
     })
@@ -1540,7 +1560,7 @@ pub unsafe extern "C" fn krun_add_net_vmnet_shared(
     if gateway.is_null() || netmask.is_null() || flags != 0 {
         return -libc::EINVAL;
     }
-    let enable_offload = (features == NET_VMNET_NATIVE_TCP_FEATURES) as c_int;
+    let enable_offload = vmnet_offload_mode(features);
     add_vmnet_backend(ctx_id, c_mac, features, flags, |fd, bridge| {
         krun_vmnet_start_shared(gateway, netmask, enable_offload, fd, bridge)
     })

@@ -394,6 +394,11 @@ impl NetBackend for Unixgram {
     }
 
     #[cfg(target_os = "macos")]
+    fn passes_vnet_hdr(&self) -> bool {
+        self.direct_tx.is_some_and(|direct| direct.vnet_hdr)
+    }
+
+    #[cfg(target_os = "macos")]
     fn write_frame_iov(&mut self, iovs: &[libc::iovec], frame_len: usize) -> Result<(), WriteError> {
         match self.direct_tx {
             Some(direct) => direct.write(iovs, frame_len),

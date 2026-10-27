@@ -21,6 +21,11 @@
 #include <xpc/xpc.h>
 
 #define KRUN_VMNET_MAX_FRAME_SIZE 65550
+// virtio_net_hdr_v1, prepended to every packet in virtio-header mode.
+#define KRUN_VMNET_VNET_HDR_LEN 12
+#define KRUN_VMNET_OFFLOAD_NONE 0
+#define KRUN_VMNET_OFFLOAD_CHECKSUM 1
+#define KRUN_VMNET_OFFLOAD_VIRTIO_HEADER 2
 #define KRUN_VMNET_SOCKET_RCVBUF (7 * 1024 * 1024)
 #define KRUN_VMNET_MAX_BATCH_PACKETS 64
 #define KRUN_VMNET_SOCKET_BATCH_MAGIC "KRUNVMN1"
@@ -794,7 +799,7 @@ static int32_t start_interface(
         (void)stop_bridge(bridge);
         return error;
     }
-    if (max_packet_size < 1514 || max_packet_size > KRUN_VMNET_MAX_FRAME_SIZE) {
+    if (max_packet_size < 1514 || max_packet_size > KRUN_VMNET_MAX_FRAME_SIZE + KRUN_VMNET_VNET_HDR_LEN) {
         close(sockets[0]);
         (void)stop_bridge(bridge);
         return -EMSGSIZE;
@@ -847,12 +852,29 @@ static int32_t start_interface(
     return 0;
 }
 
+// Checksum mode has vmnet compute every TX checksum in software. Virtio-header
+// mode instead carries the guest's virtio_net_hdr (partial checksum, GSO) in
+// each packet, as Virtualization.framework does; vmnet forbids combining them.
+static void set_offload_keys(xpc_object_t descriptor, int offload)
+    __attribute__((availability(macos, introduced = 26.0)));
+
+static void set_offload_keys(xpc_object_t descriptor, int offload)
+{
+    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, offload != KRUN_VMNET_OFFLOAD_NONE);
+    if (offload == KRUN_VMNET_OFFLOAD_VIRTIO_HEADER) {
+        xpc_dictionary_set_bool(descriptor, vmnet_enable_virtio_header_key, true);
+    } else {
+        xpc_dictionary_set_bool(
+            descriptor, vmnet_enable_checksum_offload_key, offload == KRUN_VMNET_OFFLOAD_CHECKSUM);
+    }
+}
+
 static int32_t start_network(
-    vmnet_network_ref network, bool isolated, bool enable_offload, int *out_fd, void **out_bridge)
+    vmnet_network_ref network, bool isolated, int offload, int *out_fd, void **out_bridge)
     __attribute__((availability(macos, introduced = 26.0)));
 
 static int32_t start_network(
-    vmnet_network_ref network, bool isolated, bool enable_offload, int *out_fd, void **out_bridge)
+    vmnet_network_ref network, bool isolated, int offload, int *out_fd, void **out_bridge)
 {
     xpc_object_t descriptor = xpc_dictionary_create(NULL, NULL, 0);
     if (descriptor == NULL) {
@@ -861,17 +883,16 @@ static int32_t start_network(
     }
     xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, false);
     xpc_dictionary_set_bool(descriptor, vmnet_enable_isolation_key, isolated);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, enable_offload);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, enable_offload);
+    set_offload_keys(descriptor, offload);
     return start_interface(network, descriptor, out_fd, out_bridge);
 }
 
 static int32_t start_shared(
-    const char *gateway, const char *netmask, bool enable_offload, int *out_fd, void **out_bridge)
+    const char *gateway, const char *netmask, int offload, int *out_fd, void **out_bridge)
     __attribute__((availability(macos, introduced = 26.0)));
 
 static int32_t start_shared(
-    const char *gateway, const char *netmask, bool enable_offload, int *out_fd, void **out_bridge)
+    const char *gateway, const char *netmask, int offload, int *out_fd, void **out_bridge)
 {
     struct in_addr address, mask;
     if (inet_pton(AF_INET, gateway, &address) != 1 || inet_pton(AF_INET, netmask, &mask) != 1) {
@@ -910,8 +931,7 @@ static int32_t start_shared(
     xpc_dictionary_set_string(descriptor, vmnet_subnet_mask_key, netmask);
     xpc_dictionary_set_bool(descriptor, vmnet_allocate_mac_address_key, false);
     xpc_dictionary_set_bool(descriptor, vmnet_enable_isolation_key, true);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_tso_key, enable_offload);
-    xpc_dictionary_set_bool(descriptor, vmnet_enable_checksum_offload_key, enable_offload);
+    set_offload_keys(descriptor, offload);
     return start_interface(NULL, descriptor, out_fd, out_bridge);
 }
 #endif
@@ -919,7 +939,7 @@ static int32_t start_shared(
 int32_t krun_vmnet_start(
     const void *network_serialization, int enable_offload, int *out_fd, void **out_bridge)
 {
-    if (network_serialization == NULL || (enable_offload != 0 && enable_offload != 1)
+    if (network_serialization == NULL || (enable_offload < KRUN_VMNET_OFFLOAD_NONE || enable_offload > KRUN_VMNET_OFFLOAD_VIRTIO_HEADER)
         || out_fd == NULL || out_bridge == NULL) {
         return -EINVAL;
     }
@@ -935,7 +955,7 @@ int32_t krun_vmnet_start(
             }
             return vmnet_framework_error("vmnet_network_create_with_serialization", status);
         }
-        return start_network(network, false, enable_offload != 0, out_fd, out_bridge);
+        return start_network(network, false, enable_offload, out_fd, out_bridge);
     }
 #endif
     return -ENOTSUP;
@@ -944,7 +964,7 @@ int32_t krun_vmnet_start(
 int32_t krun_vmnet_start_shared(
     const char *gateway, const char *netmask, int enable_offload, int *out_fd, void **out_bridge)
 {
-    if (gateway == NULL || netmask == NULL || (enable_offload != 0 && enable_offload != 1)
+    if (gateway == NULL || netmask == NULL || (enable_offload < KRUN_VMNET_OFFLOAD_NONE || enable_offload > KRUN_VMNET_OFFLOAD_VIRTIO_HEADER)
         || out_fd == NULL || out_bridge == NULL) {
         return -EINVAL;
     }
@@ -952,7 +972,7 @@ int32_t krun_vmnet_start_shared(
     *out_bridge = NULL;
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
     if (__builtin_available(macOS 26.0, *)) {
-        return start_shared(gateway, netmask, enable_offload != 0, out_fd, out_bridge);
+        return start_shared(gateway, netmask, enable_offload, out_fd, out_bridge);
     }
 #endif
     return -ENOTSUP;

@@ -92,6 +92,9 @@ pub struct VmnetDirectTx {
     /// Writes several frames with one vmnet_write; reports how many leading
     /// frames were accepted.
     pub write_batch: unsafe extern "C" fn(*mut c_void, *const VmPktDesc, usize, *mut usize) -> i32,
+    /// vmnet packets start with the virtio-net header in both directions, so
+    /// TX passes the guest's header through and RX hands vmnet's to the guest.
+    pub vnet_hdr: bool,
 }
 
 // SAFETY: the bridge pointer is only passed back to C, which serializes
@@ -328,12 +331,14 @@ impl VirtioDevice for Net {
                     Some(VmnetDirectTx {
                         bridge,
                         set_rx_sink: Some(set_rx_sink),
+                        vnet_hdr,
                         ..
                     }),
                 ..
             } => Some(super::rx_direct::RxDirect::install(
                 *bridge,
                 *set_rx_sink,
+                *vnet_hdr,
                 interrupt.clone(),
                 mem.clone(),
             )),

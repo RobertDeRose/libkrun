@@ -799,14 +799,20 @@ impl NetWorker {
             };
 
             // Direct backends take the frame straight from guest memory; the
-            // virtio-net header at the start of the chain is skipped, never copied.
+            // virtio-net header at the start of the chain is skipped, never
+            // copied, unless the backend wants it passed through.
             let direct = self.backend.supports_iov_write();
+            let hdr_skip = if direct && self.backend.passes_vnet_hdr() {
+                0
+            } else {
+                VNET_HDR_LEN
+            };
             #[cfg(target_os = "macos")]
             let batching = direct && self.backend.supports_batch_write();
             let mut direct_len = 0usize;
             if direct {
                 self.tx_host_iovec.0.clear();
-                let mut skip = VNET_HDR_LEN;
+                let mut skip = hdr_skip;
                 for &(desc_addr, desc_len) in &self.tx_iovec {
                     let offset = cmp::min(skip, desc_len);
                     skip -= offset;
@@ -814,7 +820,7 @@ impl NetWorker {
                     if len == 0 {
                         continue;
                     }
-                    if direct_len + len > MAX_BUFFER_SIZE - VNET_HDR_LEN {
+                    if direct_len + len > MAX_BUFFER_SIZE - hdr_skip {
                         direct_len = 0;
                         break;
                     }
@@ -841,7 +847,7 @@ impl NetWorker {
             let mut read_count = 0;
             if direct && direct_len > 0 {
                 self.tx_iovec.clear();
-                read_count = direct_len + VNET_HDR_LEN;
+                read_count = direct_len + hdr_skip;
             }
             for (desc_addr, desc_len) in self.tx_iovec.drain(..) {
                 let limit = cmp::min(read_count + desc_len, self.tx_frame_buf.len());
@@ -869,7 +875,7 @@ impl NetWorker {
             };
 
             self.tx_frame_len = read_count;
-            let backend_bytes = read_count.saturating_sub(VNET_HDR_LEN) as u64;
+            let backend_bytes = read_count.saturating_sub(hdr_skip) as u64;
             if self.tx_stats_enabled {
                 self.tx_stats.frames += 1;
                 self.tx_stats.bytes += backend_bytes;
@@ -935,7 +941,7 @@ impl NetWorker {
                     // Fallback for an unmappable chain: write the copied frame as one iovec.
                     self.tx_host_iovec.0.clear();
                     self.tx_host_iovec.0.push(libc::iovec {
-                        iov_base: self.tx_frame_buf[VNET_HDR_LEN..].as_mut_ptr() as *mut libc::c_void,
+                        iov_base: self.tx_frame_buf[hdr_skip..].as_mut_ptr() as *mut libc::c_void,
                         iov_len: backend_bytes as usize,
                     });
                 }
@@ -1338,6 +1344,7 @@ mod tests {
     struct BatchBackend {
         accept: usize,
         batches: Vec<Vec<usize>>,
+        vnet_hdr: bool,
     }
 
     #[cfg(target_os = "macos")]
@@ -1363,13 +1370,17 @@ mod tests {
         fn supports_batch_write(&self) -> bool {
             true
         }
+        fn passes_vnet_hdr(&self) -> bool {
+            self.vnet_hdr
+        }
         fn write_frames(&mut self, packets: &[VmPktDesc]) -> Result<usize, WriteError> {
-            // Record the payload size of each frame and check the first byte
-            // after the virtio-net header reached the backend intact.
+            // Record the size of each frame and check its first byte: the
+            // payload, or the header (0x01, NEEDS_CSUM) when it passes through.
             self.batches.push(packets.iter().map(|p| p.vm_pkt_size).collect());
+            let first = if self.vnet_hdr { 0x01 } else { 0xee };
             for packet in packets {
                 let iov = unsafe { &*packet.vm_pkt_iov };
-                assert_eq!(unsafe { *(iov.iov_base as *const u8) }, 0xee, "payload must skip the header");
+                assert_eq!(unsafe { *(iov.iov_base as *const u8) }, first, "frame must start at the right byte");
             }
             Ok(self.accept.min(packets.len()))
         }
@@ -1380,7 +1391,9 @@ mod tests {
     fn post_tx_frame(mem: &GuestMemoryMmap, tx: &VirtQueue<'_>, index: usize, payload_len: u32) {
         let hdr = 0x20000 + index as u64 * 0x2000;
         let payload = hdr + 0x100;
-        mem.write_slice(&[0u8; VNET_HDR_LEN], GuestAddress(hdr)).unwrap();
+        let mut header = [0u8; VNET_HDR_LEN];
+        header[0] = 0x01; // VIRTIO_NET_HDR_F_NEEDS_CSUM
+        mem.write_slice(&header, GuestAddress(hdr)).unwrap();
         mem.write_slice(&vec![0xeeu8; payload_len as usize], GuestAddress(payload)).unwrap();
         let first = index as u16 * 2;
         tx.dtable[first as usize].set(hdr, VNET_HDR_LEN as u32, crate::virtio::queue::VIRTQ_DESC_F_NEXT, first + 1);
@@ -1400,7 +1413,7 @@ mod tests {
         }
         let mut worker = worker(&mem, &rx, true, 0);
         worker.tx_q = DeviceQueue::new(tx.create_queue(), Arc::new(EventFd::new(0).unwrap()));
-        worker.backend = Box::new(BatchBackend { accept: 3, batches: Vec::new() });
+        worker.backend = Box::new(BatchBackend { accept: 3, batches: Vec::new(), vnet_hdr: false });
 
         // The backend takes three of five: three complete, two are un-popped.
         assert!(matches!(worker.process_tx(), Err(TxError::Backend(WriteError::NothingWritten))));
@@ -1408,7 +1421,7 @@ mod tests {
         assert_eq!(worker.tx_q.queue.next_avail.0, 3);
 
         // Now the backend accepts everything: the remaining two go in one batch.
-        worker.backend = Box::new(BatchBackend { accept: usize::MAX, batches: Vec::new() });
+        worker.backend = Box::new(BatchBackend { accept: usize::MAX, batches: Vec::new(), vnet_hdr: false });
         worker.process_tx().unwrap();
         assert_eq!(tx.used.idx.get(), 5);
         let backend = &worker.backend;
@@ -1417,6 +1430,23 @@ mod tests {
         // Frame sizes exclude the header and were delivered in order.
         assert_eq!(tx.used.ring[3].get().id, 6);
         assert_eq!(tx.used.ring[4].get().id, 8);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_tx_passes_the_guest_header_through_when_the_backend_wants_it() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+        let tx = VirtQueue::new(GuestAddress(0x4000), &mem, 16);
+        post_tx_frame(&mem, &tx, 0, 100);
+        let mut worker = worker(&mem, &rx, true, 0);
+        worker.tx_q = DeviceQueue::new(tx.create_queue(), Arc::new(EventFd::new(0).unwrap()));
+        let backend = Box::into_raw(Box::new(BatchBackend { accept: usize::MAX, batches: Vec::new(), vnet_hdr: true }));
+        // SAFETY: the worker owns the box; the raw pointer only reads it back below.
+        worker.backend = unsafe { Box::from_raw(backend) };
+        worker.process_tx().unwrap();
+        assert_eq!(tx.used.idx.get(), 1);
+        assert_eq!(unsafe { &(*backend).batches }, &vec![vec![VNET_HDR_LEN + 100]]);
     }
 
     #[test]

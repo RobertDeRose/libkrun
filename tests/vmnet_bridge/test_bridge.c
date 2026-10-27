@@ -11,6 +11,7 @@ struct fake_xpc {
     bool allocate_mac;
     bool tso;
     bool checksum;
+    bool virtio_header;
     uint64_t size;
     uint64_t read_max_packets;
     uint64_t write_max_packets;
@@ -49,6 +50,7 @@ void xpc_dictionary_set_bool(xpc_object_t object, const char *key, bool value)
     else if (strcmp(key, "allocate_mac") == 0) object->allocate_mac = value;
     else if (strcmp(key, "tso") == 0) object->tso = value;
     else if (strcmp(key, "checksum") == 0) object->checksum = value;
+    else if (strcmp(key, "virtio_header") == 0) object->virtio_header = value;
     else abort();
 }
 void xpc_dictionary_set_uint64(xpc_object_t object, const char *key, uint64_t value)
@@ -133,7 +135,8 @@ static interface_ref fake_start(xpc_object_t descriptor, dispatch_queue_t queue,
         assert(!descriptor->allocate_mac); // Descriptor must outlive asynchronous start.
         struct fake_xpc parameters = {
             .size = is("invalid_packet_size") ? 0
-                : (is("offload") || is("serialized_offload") ? KRUN_VMNET_MAX_FRAME_SIZE : 2048),
+                : (is("virtio_header") ? KRUN_VMNET_MAX_FRAME_SIZE + KRUN_VMNET_VNET_HDR_LEN
+                : (is("offload") || is("serialized_offload") ? KRUN_VMNET_MAX_FRAME_SIZE : 2048)),
             .read_max_packets = is("batch_cap") ? 128 : 8,
             .write_max_packets = is("batch_cap") ? 128 : 8,
         };
@@ -148,7 +151,7 @@ interface_ref vmnet_interface_start_with_network(vmnet_network_ref network, xpc_
     assert(!descriptor->isolation);
     bool offload = is("serialized_offload");
     assert(!descriptor->allocate_mac);
-    assert(descriptor->tso == offload && descriptor->checksum == offload);
+    assert(descriptor->tso == offload && descriptor->checksum == offload && !descriptor->virtio_header);
     return fake_start(descriptor, queue, callback);
 }
 interface_ref vmnet_start_interface(xpc_object_t descriptor, dispatch_queue_t queue,
@@ -158,8 +161,11 @@ interface_ref vmnet_start_interface(xpc_object_t descriptor, dispatch_queue_t qu
     assert(descriptor->mode == VMNET_SHARED_MODE);
     assert(descriptor->isolation);
     bool offload = is("offload");
+    bool header = is("virtio_header");
     assert(!descriptor->allocate_mac);
-    assert(descriptor->tso == offload && descriptor->checksum == offload);
+    // vmnet rejects checksum offload combined with virtio headers.
+    assert(descriptor->tso == (offload || header) && descriptor->checksum == offload
+           && descriptor->virtio_header == header);
     assert(strcmp(descriptor->start, "192.168.200.1") == 0);
     assert(strcmp(descriptor->end, "192.168.200.254") == 0);
     assert(strcmp(descriptor->mask, "255.255.255.0") == 0);
@@ -344,13 +350,13 @@ int main(int argc, char **argv)
         assert(krun_vmnet_start_shared("192.168.200.1", "255.255.255.255", 0, &fd, &bridge) == -EINVAL);
         assert(krun_vmnet_start_shared("192.168.200.1", "0.0.0.0", 0, &fd, &bridge) == -EINVAL);
         assert(krun_vmnet_start_shared(
-            "192.168.200.1", "255.255.255.0", 2, &fd, &bridge) == -EINVAL);
+            "192.168.200.1", "255.255.255.0", 3, &fd, &bridge) == -EINVAL);
         puts("PASS: invalid_arguments");
         return 0;
     }
     bool serialized = is("serialized") || is("serialized_not_authorized")
         || is("serialized_offload");
-    int enable_offload = is("offload") || is("serialized_offload");
+    int enable_offload = is("virtio_header") ? 2 : (is("offload") || is("serialized_offload"));
     int result = serialized ? krun_vmnet_start((void *)1, enable_offload, &fd, &bridge)
                             : krun_vmnet_start_shared(
                                   "192.168.200.1", "255.255.255.0", enable_offload, &fd, &bridge);

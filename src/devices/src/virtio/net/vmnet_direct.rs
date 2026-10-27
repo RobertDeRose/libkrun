@@ -36,6 +36,10 @@ impl NetBackend for VmnetDirect {
         true
     }
 
+    fn passes_vnet_hdr(&self) -> bool {
+        self.0.vnet_hdr
+    }
+
     fn write_frame_iov(&mut self, iovs: &[libc::iovec], frame_len: usize) -> Result<(), WriteError> {
         self.0.write(iovs, frame_len)
     }

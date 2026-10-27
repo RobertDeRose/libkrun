@@ -22,17 +22,20 @@ pub struct RxState {
     interrupt: InterruptTransport,
     frame: Vec<u8>,
     pending: VecDeque<Vec<u8>>,
+    /// vmnet frames already start with a virtio-net header for the guest.
+    vnet_hdr: bool,
     pub dropped: u64,
 }
 
 impl RxState {
-    fn new(interrupt: InterruptTransport, mem: GuestMemoryMmap) -> Self {
+    fn new(interrupt: InterruptTransport, mem: GuestMemoryMmap, vnet_hdr: bool) -> Self {
         Self {
             rx_q: None,
             mem,
             interrupt,
             frame: vec![0u8; MAX_BUFFER_SIZE],
             pending: VecDeque::new(),
+            vnet_hdr,
             dropped: 0,
         }
     }
@@ -42,22 +45,32 @@ impl RxState {
         self.rx_q = Some(rx_q);
     }
 
-    /// Copy one frame, with a zero virtio-net header, into the next guest
-    /// buffer chain. Returns false when no chain is available.
+    /// Copy one frame into the next guest buffer chain, behind a zero
+    /// virtio-net header unless vmnet supplied one. Returns false when no chain
+    /// is available.
     fn write_frame(&mut self, frame: &[u8], used_queue: &mut bool) -> bool {
         let Some(rx_q) = self.rx_q.as_mut() else {
             return false;
         };
-        let hdr_len = write_virtio_net_hdr(&mut self.frame);
-        let total = hdr_len + frame.len();
-        if total > self.frame.len() {
-            self.dropped += 1;
-            return true; // Oversized frames cannot be delivered; do not stall the queue.
-        }
-        self.frame[hdr_len..total].copy_from_slice(frame);
+        let data = if self.vnet_hdr {
+            if frame.len() > self.frame.len() {
+                self.dropped += 1;
+                return true; // Oversized frames cannot be delivered; do not stall the queue.
+            }
+            frame
+        } else {
+            let hdr_len = write_virtio_net_hdr(&mut self.frame);
+            let total = hdr_len + frame.len();
+            if total > self.frame.len() {
+                self.dropped += 1;
+                return true; // Oversized frames cannot be delivered; do not stall the queue.
+            }
+            self.frame[hdr_len..total].copy_from_slice(frame);
+            &self.frame[..total]
+        };
         let max_iterations = rx_q.queue.actual_size();
         for _ in 0..max_iterations {
-            match Self::write_chain(&mut rx_q.queue, &self.mem, &self.frame[..total], used_queue) {
+            match Self::write_chain(&mut rx_q.queue, &self.mem, data, used_queue) {
                 Ok(()) => return true,
                 Err(FrontendError::EmptyQueue) => return false,
                 Err(_) => continue, // Bad chain was marked used; try the next one.
@@ -202,10 +215,11 @@ impl RxDirect {
     pub fn install(
         bridge: *mut c_void,
         set_rx_sink: unsafe extern "C" fn(*mut c_void, Option<VmnetRxSink>, *mut c_void) -> i32,
+        vnet_hdr: bool,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
     ) -> Self {
-        let state = Arc::new(Mutex::new(RxState::new(interrupt, mem)));
+        let state = Arc::new(Mutex::new(RxState::new(interrupt, mem, vnet_hdr)));
         let opaque = Box::into_raw(Box::new(state.clone())) as *mut c_void;
         // SAFETY: the bridge outlives the device; the opaque is a leaked Arc.
         let result = unsafe { set_rx_sink(bridge, Some(rx_sink), opaque) };
@@ -265,7 +279,7 @@ mod tests {
         let mut queue = rx.create_queue();
         queue.set_event_idx(true);
         let interrupt = InterruptTransport::new(DummyIrqChip::new().into(), "rx-direct-test".into()).unwrap();
-        let mut state = RxState::new(interrupt, mem.clone());
+        let mut state = RxState::new(interrupt, mem.clone(), false);
         state.attach_queue(DeviceQueue::new(queue, Arc::new(EventFd::new(0).unwrap())));
         state
     }
@@ -301,6 +315,22 @@ mod tests {
         assert_eq!(payload, a);
         assert!(irq_pending(&state));
         assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn vnet_hdr_frames_land_with_vmnet_header_unchanged() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let rx = VirtQueue::new(GuestAddress(0x1000), &mem, 8);
+        post_buffer(&rx, 0);
+        let mut state = state(&mem, &rx);
+        state.vnet_hdr = true;
+        let mut frame = vec![0xccu8; VNET_HDR_LEN + 60];
+        frame[0] = 2; // VIRTIO_NET_HDR_F_DATA_VALID from vmnet.
+        state.on_frames([&frame[..]].into_iter());
+        assert_eq!(rx.used.ring[0].get().len as usize, frame.len());
+        let mut delivered = vec![0u8; frame.len()];
+        mem.read_slice(&mut delivered, GuestAddress(0x10000)).unwrap();
+        assert_eq!(delivered, frame);
     }
 
     #[test]

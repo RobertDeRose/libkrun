@@ -64,6 +64,12 @@ pub trait NetBackend {
         false
     }
 
+    /// True when iov and batch writes carry the guest's virtio-net header
+    /// in front of the frame instead of the bare frame.
+    fn passes_vnet_hdr(&self) -> bool {
+        false
+    }
+
     /// Write several frames at once; returns how many leading frames were
     /// accepted (fewer than offered means the backend is full).
     #[cfg(target_os = "macos")]
