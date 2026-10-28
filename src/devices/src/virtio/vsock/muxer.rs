@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::io;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::super::Queue as VirtQueue;
 use super::defs;
+use super::device::VsockConnection;
 use super::defs::uapi;
 use super::muxer_rxq::{rx_to_pkt, MuxerRxQ};
 use super::muxer_thread::MuxerThread;
@@ -18,7 +20,8 @@ use super::tsi_stream::TsiStreamProxy;
 use super::unix::UnixProxy;
 use super::TsiFlags;
 use super::VsockError;
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::{bounded, unbounded, Sender};
+use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
@@ -108,6 +111,8 @@ pub struct VsockMuxer {
     reaper_sender: Option<Sender<u64>>,
     unix_ipc_port_map: Option<HashMap<u32, (PathBuf, bool)>>,
     tsi_flags: TsiFlags,
+    pending_dials: HashMap<u64, Sender<i32>>,
+    next_dial_port: u32,
 }
 
 impl VsockMuxer {
@@ -129,6 +134,8 @@ impl VsockMuxer {
             reaper_sender: None,
             unix_ipc_port_map,
             tsi_flags,
+            pending_dials: HashMap::new(),
+            next_dial_port: 0x8000_0000,
         }
     }
 
@@ -171,6 +178,93 @@ impl VsockMuxer {
 
     pub(crate) fn has_pending_rx(&self) -> bool {
         !self.rxq.lock().unwrap().is_empty()
+    }
+
+    fn allocate_dial_port(
+        proxy_map: &HashMap<u64, Mutex<Box<dyn Proxy>>>,
+        next_dial_port: &mut u32,
+    ) -> io::Result<u32> {
+        let start = *next_dial_port;
+        let mut local_port = start;
+
+        loop {
+            let in_use = proxy_map.keys().any(|id| *id as u32 == local_port);
+            if !in_use {
+                *next_dial_port = if local_port == u32::MAX {
+                    0x8000_0000
+                } else {
+                    local_port + 1
+                };
+                return Ok(local_port);
+            }
+
+            local_port = if local_port == u32::MAX {
+                0x8000_0000
+            } else {
+                local_port + 1
+            };
+            if local_port == start {
+                return Err(io::Error::from_raw_os_error(libc::EADDRINUSE));
+            }
+        }
+    }
+
+    pub(crate) fn connect(&mut self, peer_port: u32) -> io::Result<VsockConnection> {
+        if peer_port == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        let mem = self
+            .mem
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
+        let queue = self
+            .queue
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
+        let interrupt = self
+            .interrupt
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
+
+        let (caller_fd, proxy_fd) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .map_err(|errno| io::Error::from_raw_os_error(errno as i32))?;
+
+        let (sender, receiver) = bounded(1);
+        let id = {
+            let mut proxy_map = self.proxy_map.write().unwrap();
+            let local_port =
+                Self::allocate_dial_port(&proxy_map, &mut self.next_dial_port)?;
+            let id = ((peer_port as u64) << 32) | local_port as u64;
+            let proxy = UnixProxy::new_reverse(
+                id,
+                self.cid,
+                local_port,
+                peer_port,
+                proxy_fd,
+                mem,
+                queue,
+                self.rxq.clone(),
+            );
+            proxy_map.insert(id, Mutex::new(Box::new(proxy)));
+            id
+        };
+
+        self.pending_dials.insert(id, sender);
+        if let Some(proxy) = self.proxy_map.read().unwrap().get(&id) {
+            proxy.lock().unwrap().push_op_request();
+        }
+        interrupt.signal_used_queue();
+
+        Ok(VsockConnection::new(caller_fd, receiver))
     }
 
     pub(crate) fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> super::Result<()> {
@@ -583,7 +677,7 @@ impl VsockMuxer {
         }
     }
 
-    fn process_op_response(&self, pkt: &VsockPacket) {
+    fn process_op_response(&mut self, pkt: &VsockPacket) {
         debug!("OP_RESPONSE");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
         let update = self
@@ -605,6 +699,9 @@ impl VsockMuxer {
 
         if let Some(update) = update {
             self.process_proxy_update(id, update);
+            if let Some(sender) = self.pending_dials.remove(&id) {
+                let _ = sender.send(0);
+            }
         }
     }
 
@@ -674,21 +771,27 @@ impl VsockMuxer {
         }
     }
 
-    fn process_stream_rst(&self, pkt: &VsockPacket) {
+    fn process_stream_rst(&mut self, pkt: &VsockPacket) {
         debug!("OP_RST");
         let id: u64 = ((pkt.src_port() as u64) << 32) | (pkt.dst_port() as u64);
-        if let Some(proxy_lock) = self.proxy_map.read().unwrap().get(&id) {
+        let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
             debug!(
                 "allowing OP_RST: id={} src={} dst={}",
                 id,
                 pkt.src_port(),
                 pkt.dst_port()
             );
-            let mut proxy = proxy_lock.lock().unwrap();
-            let update = proxy.release();
+            proxy_lock.lock().unwrap().release()
+        });
+
+        if let Some(update) = update {
             self.process_proxy_update(id, update);
         } else {
             debug!("invalid OP_RST for {}", pkt.src_port());
+        }
+
+        if let Some(sender) = self.pending_dials.remove(&id) {
+            let _ = sender.send(libc::ECONNREFUSED);
         }
     }
 

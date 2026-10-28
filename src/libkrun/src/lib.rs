@@ -4,6 +4,7 @@ extern crate log;
 use crossbeam_channel::unbounded;
 #[cfg(feature = "blk")]
 use devices::virtio::block::{ImageType, SyncMode};
+use devices::virtio::Vsock;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::passthrough::PermissionSemantics;
 #[cfg(feature = "gpu")]
@@ -31,12 +32,12 @@ use std::fs::File;
 use std::io::IsTerminal;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
+use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, RawFd};
 use std::path::PathBuf;
 use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use utils::eventfd::EventFd;
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
@@ -55,6 +56,8 @@ use vmm::vmm_config::kernel_bundle::KernelBundle;
 use vmm::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle};
 use vmm::vmm_config::kernel_cmdline::{KernelCmdlineConfig, DEFAULT_KERNEL_CMDLINE};
 use vmm::vmm_config::machine_config::VmConfig;
+#[cfg(feature = "net")]
+use devices::virtio::net::stats::NetTxStatsHandle;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
 use vmm::vmm_config::vsock::VsockDeviceConfig;
@@ -151,14 +154,33 @@ impl KrunfwBindings {
 extern "C" {
     fn krun_vmnet_start(
         network_serialization: *const c_void,
+        enable_offload: c_int,
         out_fd: *mut c_int,
         out_bridge: *mut *mut c_void,
     ) -> c_int;
     fn krun_vmnet_start_shared(
         gateway: *const c_char,
         netmask: *const c_char,
+        enable_offload: c_int,
         out_fd: *mut c_int,
         out_bridge: *mut *mut c_void,
+    ) -> c_int;
+    fn krun_vmnet_write_iov(
+        bridge: *mut c_void,
+        iovs: *const libc::iovec,
+        iov_count: usize,
+        frame_len: usize,
+    ) -> c_int;
+    fn krun_vmnet_write_batch(
+        bridge: *mut c_void,
+        packets: *const devices::virtio::net::device::VmPktDesc,
+        count: usize,
+        written: *mut usize,
+    ) -> c_int;
+    fn krun_vmnet_set_rx_sink(
+        bridge: *mut c_void,
+        sink: Option<devices::virtio::net::device::VmnetRxSink>,
+        opaque: *mut c_void,
     ) -> c_int;
     fn krun_vmnet_stop(bridge: *mut c_void);
 }
@@ -202,6 +224,8 @@ struct ContextConfig {
     legacy_mac: Option<[u8; 6]>,
     #[cfg(all(target_os = "macos", feature = "net"))]
     vmnet_bridges: Vec<VmnetBridge>,
+    #[cfg(feature = "net")]
+    net_tx_stats: Vec<NetTxStatsHandle>,
     net_index: u8,
     tsi_port_map: Option<HashMap<u16, u16>>,
     vsock_config: VsockConfig,
@@ -492,7 +516,12 @@ fn with_cfg(ctx_id: u32, f: impl FnOnce(&mut ContextConfig) -> i32) -> i32 {
 }
 
 static CTX_MAP: Lazy<Mutex<HashMap<u32, ContextConfig>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+#[cfg(feature = "net")]
+static RUNNING_NET_TX_STATS: Lazy<Mutex<HashMap<u32, Vec<NetTxStatsHandle>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 static RUNNING_VMM_STOPS: Lazy<Mutex<HashMap<u32, EventFd>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static RUNNING_VSOCKS: Lazy<Mutex<HashMap<u32, Arc<Mutex<Vsock>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static CTX_IDS: AtomicI32 = AtomicI32::new(0);
 
@@ -501,6 +530,9 @@ struct RunningVmmStopGuard(u32);
 impl Drop for RunningVmmStopGuard {
     fn drop(&mut self) {
         RUNNING_VMM_STOPS.lock().unwrap().remove(&self.0);
+        RUNNING_VSOCKS.lock().unwrap().remove(&self.0);
+        #[cfg(feature = "net")]
+        RUNNING_NET_TX_STATS.lock().unwrap().remove(&self.0);
     }
 }
 
@@ -632,6 +664,161 @@ pub extern "C" fn krun_free_ctx(ctx_id: u32) -> i32 {
         Some(_) => KRUN_SUCCESS,
         None => -libc::ENOENT,
     }
+}
+
+#[no_mangle]
+#[cfg(feature = "net")]
+pub extern "C" fn krun_debug_reset_net_tx_stats(ctx_id: u32, network_index: u32) -> i32 {
+    let running = RUNNING_NET_TX_STATS.lock().unwrap();
+    let Some(stats) = running
+        .get(&ctx_id)
+        .and_then(|interfaces| interfaces.get(network_index as usize))
+    else {
+        return -libc::ENOENT;
+    };
+    stats.reset_and_enable();
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(feature = "net")]
+pub unsafe extern "C" fn krun_debug_get_net_tx_stats_json(
+    ctx_id: u32,
+    network_index: u32,
+    buffer: *mut c_char,
+    buffer_len: u32,
+) -> i32 {
+    if buffer.is_null() || buffer_len == 0 {
+        return -libc::EINVAL;
+    }
+    let running = RUNNING_NET_TX_STATS.lock().unwrap();
+    let Some(stats) = running
+        .get(&ctx_id)
+        .and_then(|interfaces| interfaces.get(network_index as usize))
+    else {
+        return -libc::ENOENT;
+    };
+    let (queue_notify_writes, queue_notification_timing, snapshot) =
+        stats.snapshot_and_disable();
+    drop(running);
+
+    let json = format!(
+        concat!(
+            "{{\"network_index\":{},",
+            "\"queue_notify_writes\":{},",
+            "\"eventfd_wakeups\":{},\"eventfd_values\":{},",
+            "\"drain_passes\":{},\"empty_drain_passes\":{},",
+            "\"frames\":{},\"bytes\":{},",
+            "\"descriptor_chains\":{},\"descriptors\":{},",
+            "\"max_frames_per_drain\":{},\"max_bytes_per_drain\":{},",
+            "\"write_frame_calls\":{},\"backend_bytes\":{},",
+            "\"nothing_written\":{},\"partial_writes\":{},",
+            "\"flush_calls\":{},\"frames_between_flushes\":{},",
+            "\"bytes_between_flushes\":{},",
+            "\"max_frames_between_flush\":{},\"max_bytes_between_flush\":{},",
+            "\"notification_checks\":{},\"notification_true\":{},",
+            "\"notification_false\":{},\"signal_used_queue_calls\":{},",
+            "\"timing_collected\":true,\"timing_sample_stride\":64,",
+            "\"timing_sampled_frames\":{},",
+            "\"descriptor_parse_sample_ns\":{},",
+            "\"guest_copy_sample_ns\":{},",
+            "\"backend_write_sample_ns\":{},",
+            "\"timing_sampled_flushes\":{},\"flush_sample_ns\":{},",
+            "\"timing_sampled_drain_cycles\":{},",
+            "\"timing_sampled_drain_frames\":{},",
+            "\"drain_cycle_sample_ns\":{},",
+            "\"tx_queue_disable_sample_ns\":{},",
+            "\"tx_queue_enable_sample_ns\":{},",
+            "\"add_used_sample_ns\":{},",
+            "\"timing_sampled_notification_checks\":{},",
+            "\"notification_check_sample_ns\":{},",
+            "\"timing_sampled_irq_signals\":{},",
+            "\"irq_signal_sample_ns\":{},",
+            "\"notify_to_eventfd_samples\":{},",
+            "\"notify_to_eventfd_sample_ns\":{},",
+            "\"notify_to_eventfd_max_ns\":{},",
+            "\"eventfd_write_samples\":{},",
+            "\"eventfd_write_sample_ns\":{},",
+            "\"eventfd_write_max_ns\":{},",
+            "\"notify_while_worker_waiting_samples\":{},",
+            "\"notify_while_worker_busy_samples\":{},",
+            "\"notify_to_kqueue_ready_samples\":{},",
+            "\"notify_to_kqueue_ready_sample_ns\":{},",
+            "\"notify_to_kqueue_ready_max_ns\":{},",
+            "\"kqueue_ready_to_eventfd_samples\":{},",
+            "\"kqueue_ready_to_eventfd_sample_ns\":{},",
+            "\"kqueue_ready_to_eventfd_max_ns\":{},",
+            "\"irq_to_next_notify_samples\":{},",
+            "\"irq_to_next_notify_sample_ns\":{},",
+            "\"irq_to_next_notify_max_ns\":{}}}"
+        ),
+        network_index,
+        queue_notify_writes,
+        snapshot.eventfd_wakeups,
+        snapshot.eventfd_values,
+        snapshot.drain_passes,
+        snapshot.empty_drain_passes,
+        snapshot.frames,
+        snapshot.bytes,
+        snapshot.descriptor_chains,
+        snapshot.descriptors,
+        snapshot.max_frames_per_drain,
+        snapshot.max_bytes_per_drain,
+        snapshot.write_frame_calls,
+        snapshot.backend_bytes,
+        snapshot.nothing_written,
+        snapshot.partial_writes,
+        snapshot.flush_calls,
+        snapshot.frames_between_flushes,
+        snapshot.bytes_between_flushes,
+        snapshot.max_frames_between_flush,
+        snapshot.max_bytes_between_flush,
+        snapshot.notification_checks,
+        snapshot.notification_true,
+        snapshot.notification_false,
+        snapshot.signal_used_queue_calls,
+        snapshot.timing_sampled_frames,
+        snapshot.descriptor_parse_sample_ns,
+        snapshot.guest_copy_sample_ns,
+        snapshot.backend_write_sample_ns,
+        snapshot.timing_sampled_flushes,
+        snapshot.flush_sample_ns,
+        snapshot.timing_sampled_drain_cycles,
+        snapshot.timing_sampled_drain_frames,
+        snapshot.drain_cycle_sample_ns,
+        snapshot.tx_queue_disable_sample_ns,
+        snapshot.tx_queue_enable_sample_ns,
+        snapshot.add_used_sample_ns,
+        snapshot.timing_sampled_notification_checks,
+        snapshot.notification_check_sample_ns,
+        snapshot.timing_sampled_irq_signals,
+        snapshot.irq_signal_sample_ns,
+        queue_notification_timing.notify_to_eventfd_samples,
+        queue_notification_timing.notify_to_eventfd_sample_ns,
+        queue_notification_timing.notify_to_eventfd_max_ns,
+        queue_notification_timing.eventfd_write_samples,
+        queue_notification_timing.eventfd_write_sample_ns,
+        queue_notification_timing.eventfd_write_max_ns,
+        queue_notification_timing.notify_while_worker_waiting_samples,
+        queue_notification_timing.notify_while_worker_busy_samples,
+        queue_notification_timing.notify_to_kqueue_ready_samples,
+        queue_notification_timing.notify_to_kqueue_ready_sample_ns,
+        queue_notification_timing.notify_to_kqueue_ready_max_ns,
+        queue_notification_timing.kqueue_ready_to_eventfd_samples,
+        queue_notification_timing.kqueue_ready_to_eventfd_sample_ns,
+        queue_notification_timing.kqueue_ready_to_eventfd_max_ns,
+        queue_notification_timing.irq_to_next_notify_samples,
+        queue_notification_timing.irq_to_next_notify_sample_ns,
+        queue_notification_timing.irq_to_next_notify_max_ns,
+    );
+    let bytes = json.as_bytes();
+    if bytes.len() + 1 > buffer_len as usize {
+        return -libc::ENOSPC;
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), bytes.len());
+    *buffer.add(bytes.len()) = 0;
+    KRUN_SUCCESS
 }
 
 #[no_mangle]
@@ -1085,6 +1272,13 @@ const NET_ALL_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_HOST_TSO4
     | NET_FEATURE_HOST_TSO6
     | NET_FEATURE_HOST_UFO;
+#[cfg(feature = "net")]
+const NET_VMNET_NATIVE_TCP_FEATURES: u32 = NET_FEATURE_CSUM
+    | NET_FEATURE_GUEST_CSUM
+    | NET_FEATURE_GUEST_TSO4
+    | NET_FEATURE_GUEST_TSO6
+    | NET_FEATURE_HOST_TSO4
+    | NET_FEATURE_HOST_TSO6;
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
@@ -1135,7 +1329,7 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            create_virtio_net(cfg, backend, mac, features);
+            create_virtio_net(cfg, backend, mac, features, 1);
             if enable_dhcp_client {
                 cfg.vmr.dhcp_client = true;
             }
@@ -1196,7 +1390,7 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            create_virtio_net(cfg, backend, mac, features);
+            create_virtio_net(cfg, backend, mac, features, 1);
             if enable_dhcp_client {
                 cfg.vmr.dhcp_client = true;
             }
@@ -1207,6 +1401,25 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
 }
 
 #[cfg(all(target_os = "macos", feature = "net"))]
+/// 0 lets the VMM builder pick min(vCPUs, 8) once the VM configuration is
+/// final, since networks may be added before krun_set_vm_config.
+/// KRUN_NET_QUEUE_PAIRS forces a count.
+#[cfg(all(target_os = "macos", feature = "net"))]
+fn vmnet_queue_pairs() -> u16 {
+    if let Some(value) = std::env::var_os("KRUN_NET_QUEUE_PAIRS") {
+        if let Some(pairs) = value.to_str().and_then(|v| v.parse::<u16>().ok()) {
+            return pairs.clamp(1, devices::virtio::net::MAX_QUEUE_PAIRS);
+        }
+    }
+    // One pair unless the environment says otherwise. Linux pins a TCP flow
+    // to the TX queue of its first transmit, so bulk workloads gain nothing
+    // from more pairs, and paced senders such as BBR lose: with several
+    // workers each sees only a few frames per drain and the per-call cost
+    // of vmnet_write dominates (measured: 0.68 of Apple's runtime with one
+    // pair per vCPU, 0.83 with one pair, on eight paced streams).
+    1
+}
+
 unsafe fn add_vmnet_backend(
     ctx_id: u32,
     c_mac: *const u8,
@@ -1220,8 +1433,10 @@ unsafe fn add_vmnet_backend(
     {
         return -libc::EINVAL;
     }
-    // Raw Ethernet only: do not advertise unsupported virtio offloads.
-    if features != 0 {
+    // Native vmnet TSO is bidirectional: vmnet_read() may return large TCP
+    // frames as well as vmnet_write() accepting them. Advertise matching guest
+    // receive offloads so Linux provisions virtio RX buffers for those frames.
+    if features != 0 && features != NET_VMNET_NATIVE_TCP_FEATURES {
         return -libc::ENOTSUP;
     }
     if !CTX_MAP.lock().unwrap().contains_key(&ctx_id) {
@@ -1249,7 +1464,34 @@ unsafe fn add_vmnet_backend(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            create_virtio_net(cfg, VirtioNetBackend::UnixgramFd(fd), mac, features);
+            // Frames go to vmnet from the worker thread unless the socket
+            // transport is forced for comparison.
+            let direct_tx = std::env::var_os("KRUN_VMNET_SOCKET_TX").is_none().then_some(
+                devices::virtio::net::device::VmnetDirectTx {
+                    bridge,
+                    write_iov: krun_vmnet_write_iov,
+                    // Receive goes straight from the bridge callback into the
+                    // guest ring unless the socket receive path is forced.
+                    set_rx_sink: std::env::var_os("KRUN_VMNET_SOCKET_RX")
+                        .is_none()
+                        .then_some(krun_vmnet_set_rx_sink as unsafe extern "C" fn(_, _, _) -> _),
+                    write_batch: krun_vmnet_write_batch,
+                },
+            );
+            // One TX queue per vCPU (capped) when frames go to vmnet directly, so
+            // the guest can spread flows over independent writer threads.
+            let queue_pairs = if direct_tx.is_some() {
+                vmnet_queue_pairs()
+            } else {
+                1
+            };
+            create_virtio_net(
+                cfg,
+                VirtioNetBackend::VmnetFd { fd, direct_tx },
+                mac,
+                features,
+                queue_pairs,
+            );
             cfg.vmnet_bridges.push(VmnetBridge(bridge));
             if flags & NET_FLAG_DHCP_CLIENT != 0 {
                 cfg.vmr.dhcp_client = true;
@@ -1277,8 +1519,9 @@ pub unsafe extern "C" fn krun_add_net_vmnet(
     if network_serialization.is_null() {
         return -libc::EINVAL;
     }
+    let enable_offload = (features == NET_VMNET_NATIVE_TCP_FEATURES) as c_int;
     add_vmnet_backend(ctx_id, c_mac, features, flags, |fd, bridge| {
-        krun_vmnet_start(network_serialization, fd, bridge)
+        krun_vmnet_start(network_serialization, enable_offload, fd, bridge)
     })
 }
 
@@ -1297,8 +1540,9 @@ pub unsafe extern "C" fn krun_add_net_vmnet_shared(
     if gateway.is_null() || netmask.is_null() || flags != 0 {
         return -libc::EINVAL;
     }
+    let enable_offload = (features == NET_VMNET_NATIVE_TCP_FEATURES) as c_int;
     add_vmnet_backend(ctx_id, c_mac, features, flags, |fd, bridge| {
-        krun_vmnet_start_shared(gateway, netmask, fd, bridge)
+        krun_vmnet_start_shared(gateway, netmask, enable_offload, fd, bridge)
     })
 }
 
@@ -1371,7 +1615,7 @@ pub unsafe extern "C" fn krun_add_net_tap(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            create_virtio_net(cfg, VirtioNetBackend::Tap(tap_name), mac, features);
+            create_virtio_net(cfg, VirtioNetBackend::Tap(tap_name), mac, features, 1);
             if enable_dhcp_client {
                 cfg.vmr.dhcp_client = true;
             }
@@ -2083,6 +2327,31 @@ pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
     }
 }
 
+#[no_mangle]
+pub extern "C" fn krun_vsock_connect(ctx_id: u32, port: u32) -> i32 {
+    if port == 0 {
+        return -libc::EINVAL;
+    }
+
+    let vsock = match RUNNING_VSOCKS.lock().unwrap().get(&ctx_id).cloned() {
+        Some(vsock) => vsock,
+        None => return -libc::ENOENT,
+    };
+
+    let connection = {
+        let mut vsock = vsock.lock().unwrap();
+        match vsock.connect(port) {
+            Ok(connection) => connection,
+            Err(error) => return -error.raw_os_error().unwrap_or(libc::EIO),
+        }
+    };
+
+    match connection.wait() {
+        Ok(fd) => fd.into_raw_fd(),
+        Err(error) => -error.raw_os_error().unwrap_or(libc::EIO),
+    }
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_console_output(ctx_id: u32, c_filepath: *const c_char) -> i32 {
@@ -2270,13 +2539,18 @@ fn create_virtio_net(
     backend: VirtioNetBackend,
     mac: [u8; 6],
     features: u32,
+    queue_pairs: u16,
 ) {
+    let tx_stats = NetTxStatsHandle::default();
     let network_interface_config = NetworkInterfaceConfig {
         iface_id: format!("eth{}", ctx_cfg.net_index),
         backend,
         mac,
         features,
+        tx_stats: tx_stats.clone(),
+        queue_pairs,
     };
+    ctx_cfg.net_tx_stats.push(tx_stats);
     ctx_cfg.net_index += 1;
     ctx_cfg
         .vmr
@@ -3127,7 +3401,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             let mac = ctx_cfg
                 .legacy_mac
                 .unwrap_or([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee]);
-            create_virtio_net(&mut ctx_cfg, backend, mac, NET_COMPAT_FEATURES);
+            create_virtio_net(&mut ctx_cfg, backend, mac, NET_COMPAT_FEATURES, 1);
         }
     }
 
@@ -3200,6 +3474,8 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     }
 
+    let running_vsock = ctx_cfg.vmr.vsock.get().cloned();
+
     let (sender, _receiver) = unbounded();
 
     let _vmm = match vmm::builder::build_microvm(
@@ -3233,7 +3509,15 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -error.raw_os_error().unwrap_or(libc::EIO);
         }
     };
+    #[cfg(feature = "net")]
+    RUNNING_NET_TX_STATS
+        .lock()
+        .unwrap()
+        .insert(ctx_id, ctx_cfg.net_tx_stats.clone());
     RUNNING_VMM_STOPS.lock().unwrap().insert(ctx_id, stop_event);
+    if let Some(vsock) = running_vsock {
+        RUNNING_VSOCKS.lock().unwrap().insert(ctx_id, vsock);
+    }
     let _running_vmm_stop_guard = RunningVmmStopGuard(ctx_id);
 
     #[cfg(target_os = "macos")]
@@ -3333,6 +3617,12 @@ mod native_context_tests {
     }
 
     #[test]
+    fn vsock_connect_rejects_invalid_requests() {
+        assert_eq!(krun_vsock_connect(u32::MAX, 0), -libc::EINVAL);
+        assert_eq!(krun_vsock_connect(u32::MAX, 1024), -libc::ENOENT);
+    }
+
+    #[test]
     #[cfg(all(target_os = "macos", feature = "net"))]
     fn native_shared_rejects_unsupported_flags_before_framework_setup() {
         let context = krun_create_ctx2(KRUN_CTX_NO_DEFAULT_FIRMWARE) as u32;
@@ -3359,6 +3649,17 @@ mod native_context_tests {
                     0,
                 ),
                 -libc::ENOTSUP
+            );
+            assert_eq!(
+                krun_add_net_vmnet_shared(
+                    u32::MAX,
+                    c"192.168.200.1".as_ptr(),
+                    c"255.255.255.0".as_ptr(),
+                    mac.as_ptr(),
+                    NET_VMNET_NATIVE_TCP_FEATURES,
+                    0,
+                ),
+                -libc::ENOENT
             );
         }
         assert_eq!(krun_free_ctx(context), KRUN_SUCCESS);

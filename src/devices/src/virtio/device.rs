@@ -5,7 +5,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use super::{ActivateResult, InterruptTransport, Queue};
 use crate::virtio::AsAny;
@@ -37,6 +39,195 @@ pub struct DeviceQueue {
 impl DeviceQueue {
     pub fn new(queue: Queue, event: Arc<EventFd>) -> Self {
         Self { queue, event }
+    }
+}
+
+const QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE: u64 = 64;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueueNotificationTimingSnapshot {
+    pub notify_to_eventfd_samples: u64,
+    pub notify_to_eventfd_sample_ns: u64,
+    pub notify_to_eventfd_max_ns: u64,
+    pub eventfd_write_samples: u64,
+    pub eventfd_write_sample_ns: u64,
+    pub eventfd_write_max_ns: u64,
+    pub notify_while_worker_waiting_samples: u64,
+    pub notify_while_worker_busy_samples: u64,
+    pub notify_to_kqueue_ready_samples: u64,
+    pub notify_to_kqueue_ready_sample_ns: u64,
+    pub notify_to_kqueue_ready_max_ns: u64,
+    pub kqueue_ready_to_eventfd_samples: u64,
+    pub kqueue_ready_to_eventfd_sample_ns: u64,
+    pub kqueue_ready_to_eventfd_max_ns: u64,
+    pub irq_to_next_notify_samples: u64,
+    pub irq_to_next_notify_sample_ns: u64,
+    pub irq_to_next_notify_max_ns: u64,
+}
+
+#[derive(Default)]
+struct QueueNotificationTimingState {
+    sampled_notify_sequence: u64,
+    sampled_notify_started: Option<Instant>,
+    sampled_kqueue_ready_sequence: u64,
+    sampled_kqueue_ready_started: Option<Instant>,
+    pending_irq_started: Option<Instant>,
+    snapshot: QueueNotificationTimingSnapshot,
+}
+
+/// Optional low-overhead queue-notification counter used by targeted profiling.
+#[derive(Default)]
+pub struct QueueNotificationCounter {
+    enabled: AtomicBool,
+    count: AtomicU64,
+    irq_sample_pending: AtomicBool,
+    worker_waiting: AtomicBool,
+    timing: Mutex<QueueNotificationTimingState>,
+}
+
+impl QueueNotificationCounter {
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Release);
+    }
+
+    pub fn set_worker_waiting(&self, waiting: bool) {
+        self.worker_waiting.store(waiting, Ordering::Release);
+    }
+
+    pub fn reset(&self) {
+        self.count.store(0, Ordering::Relaxed);
+        self.irq_sample_pending.store(false, Ordering::Relaxed);
+        self.worker_waiting.store(false, Ordering::Relaxed);
+        *self.timing.lock().unwrap() = QueueNotificationTimingState::default();
+    }
+
+    pub fn increment(&self) -> Option<u64> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let sequence = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        let sample_notify = sequence % QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE == 0;
+        let consume_irq = self.irq_sample_pending.swap(false, Ordering::AcqRel);
+        if !sample_notify && !consume_irq {
+            return None;
+        }
+
+        let now = Instant::now();
+        let mut timing = self.timing.lock().unwrap();
+        if consume_irq {
+            if let Some(started) = timing.pending_irq_started.take() {
+                let elapsed = now.duration_since(started).as_nanos() as u64;
+                timing.snapshot.irq_to_next_notify_samples += 1;
+                timing.snapshot.irq_to_next_notify_sample_ns += elapsed;
+                timing.snapshot.irq_to_next_notify_max_ns =
+                    timing.snapshot.irq_to_next_notify_max_ns.max(elapsed);
+            }
+        }
+        if sample_notify {
+            if self.worker_waiting.load(Ordering::Acquire) {
+                timing.snapshot.notify_while_worker_waiting_samples += 1;
+            } else {
+                timing.snapshot.notify_while_worker_busy_samples += 1;
+            }
+            timing.sampled_notify_sequence = sequence;
+            timing.sampled_notify_started = Some(now);
+            timing.sampled_kqueue_ready_sequence = 0;
+            timing.sampled_kqueue_ready_started = None;
+            Some(sequence)
+        } else {
+            None
+        }
+    }
+
+    pub fn record_eventfd_write(&self, sequence: u64, elapsed_ns: u64) {
+        if !self.enabled.load(Ordering::Acquire)
+            || sequence % QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE != 0
+        {
+            return;
+        }
+
+        let mut timing = self.timing.lock().unwrap();
+        if timing.sampled_notify_sequence != sequence {
+            return;
+        }
+        timing.snapshot.eventfd_write_samples += 1;
+        timing.snapshot.eventfd_write_sample_ns += elapsed_ns;
+        timing.snapshot.eventfd_write_max_ns =
+            timing.snapshot.eventfd_write_max_ns.max(elapsed_ns);
+    }
+
+    pub fn observe_kqueue_ready(&self, eventfd_sequence: u64) {
+        if !self.enabled.load(Ordering::Acquire)
+            || eventfd_sequence % QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE != 0
+        {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut timing = self.timing.lock().unwrap();
+        if timing.sampled_notify_sequence != eventfd_sequence {
+            return;
+        }
+        if let Some(started) = timing.sampled_notify_started {
+            let elapsed = now.duration_since(started).as_nanos() as u64;
+            timing.snapshot.notify_to_kqueue_ready_samples += 1;
+            timing.snapshot.notify_to_kqueue_ready_sample_ns += elapsed;
+            timing.snapshot.notify_to_kqueue_ready_max_ns =
+                timing.snapshot.notify_to_kqueue_ready_max_ns.max(elapsed);
+            timing.sampled_kqueue_ready_sequence = eventfd_sequence;
+            timing.sampled_kqueue_ready_started = Some(now);
+        }
+    }
+
+    pub fn observe_eventfd(&self, eventfd_sequence: u64, value: u64) {
+        if !self.enabled.load(Ordering::Acquire)
+            || value != 1
+            || eventfd_sequence % QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE != 0
+        {
+            return;
+        }
+
+        let mut timing = self.timing.lock().unwrap();
+        if timing.sampled_notify_sequence != eventfd_sequence {
+            return;
+        }
+        if timing.sampled_kqueue_ready_sequence == eventfd_sequence {
+            if let Some(started) = timing.sampled_kqueue_ready_started.take() {
+                let elapsed = started.elapsed().as_nanos() as u64;
+                timing.snapshot.kqueue_ready_to_eventfd_samples += 1;
+                timing.snapshot.kqueue_ready_to_eventfd_sample_ns += elapsed;
+                timing.snapshot.kqueue_ready_to_eventfd_max_ns =
+                    timing.snapshot.kqueue_ready_to_eventfd_max_ns.max(elapsed);
+            }
+        }
+        if let Some(started) = timing.sampled_notify_started.take() {
+            let elapsed = started.elapsed().as_nanos() as u64;
+            timing.snapshot.notify_to_eventfd_samples += 1;
+            timing.snapshot.notify_to_eventfd_sample_ns += elapsed;
+            timing.snapshot.notify_to_eventfd_max_ns =
+                timing.snapshot.notify_to_eventfd_max_ns.max(elapsed);
+        }
+    }
+
+    pub fn record_irq_signal(&self, signal_sequence: u64) {
+        if !self.enabled.load(Ordering::Acquire)
+            || signal_sequence % QUEUE_NOTIFICATION_TIMING_SAMPLE_STRIDE != 0
+        {
+            return;
+        }
+
+        let mut timing = self.timing.lock().unwrap();
+        timing.pending_irq_started = Some(Instant::now());
+        self.irq_sample_pending.store(true, Ordering::Release);
+    }
+
+    pub fn load(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    pub fn timing_snapshot(&self) -> QueueNotificationTimingSnapshot {
+        self.timing.lock().unwrap().snapshot
     }
 }
 
@@ -98,6 +289,14 @@ pub trait VirtioDevice: AsAny + Send {
     /// Returns the queue configuration for this device.
     /// The transport uses this to construct the queues during initialization and after reset.
     fn queue_config(&self) -> &[QueueConfig];
+
+    /// Optionally exposes a profiling counter for guest notifications to one queue.
+    fn queue_notification_counter(
+        &self,
+        _queue_index: usize,
+    ) -> Option<Arc<QueueNotificationCounter>> {
+        None
+    }
 
     /// The set of feature bits shifted by `page * 32`.
     fn avail_features_by_page(&self, page: u32) -> u32 {

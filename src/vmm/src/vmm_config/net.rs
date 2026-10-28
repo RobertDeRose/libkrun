@@ -7,6 +7,7 @@ use std::result;
 use std::sync::{Arc, Mutex};
 
 use devices::virtio::net::device::VirtioNetBackend;
+use devices::virtio::net::stats::NetTxStatsHandle;
 use devices::virtio::Net;
 
 pub struct NetworkInterfaceConfig {
@@ -18,6 +19,10 @@ pub struct NetworkInterfaceConfig {
     pub mac: [u8; 6],
     /// virtio-net features for the network interface.
     pub features: u32,
+    /// Aggregate TX datapath instrumentation shared with libkrun.
+    pub tx_stats: NetTxStatsHandle,
+    /// RX/TX queue pairs to offer; above one enables VIRTIO_NET_F_MQ.
+    pub queue_pairs: u16,
 }
 
 /// Errors associated with `NetworkInterfaceConfig`.
@@ -65,7 +70,14 @@ impl NetBuilder {
     /// Creates a Net device from a NetworkInterfaceConfig.
     pub fn create_net(cfg: NetworkInterfaceConfig) -> Result<Net> {
         // Create and return the Net device
-        Net::new(cfg.iface_id, cfg.backend, cfg.mac, cfg.features)
+        Net::new(
+            cfg.iface_id,
+            cfg.backend,
+            cfg.mac,
+            cfg.features,
+            cfg.tx_stats,
+            cfg.queue_pairs,
+        )
             .map_err(NetworkInterfaceError::CreateNetworkDevice)
     }
 }

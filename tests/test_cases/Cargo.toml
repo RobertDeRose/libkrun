@@ -3,7 +3,7 @@ name = "test_cases"
 edition = "2021"
 
 [features]
-host = ["krun-sys", "serde", "serde_json"]
+host = ["krun-sys", "krun-sys/bindgen_clang_runtime", "serde", "serde_json"]
 guest = []
 
 [lib]

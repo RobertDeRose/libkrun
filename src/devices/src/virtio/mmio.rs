@@ -9,6 +9,7 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use utils::eventfd::EFD_NONBLOCK;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -74,6 +75,8 @@ pub struct MmioTransport {
     // Queue eventfds - kept by transport to send notifications.
     // Arc clones are passed to the device on activation.
     queue_evts: Vec<Arc<EventFd>>,
+    // Profiling counters are absent unless a device opts in for a queue.
+    queue_notify_counters: Vec<Option<Arc<QueueNotificationCounter>>>,
     // Stored queue config from device for recreating queues after reset.
     queue_config: Vec<QueueConfig>,
     shm_region_select: u32,
@@ -175,6 +178,9 @@ impl MmioTransport {
 
         let debug_log_target = format!("{}[{}]", module_path!(), locked.device_name());
         let queue_config: Vec<QueueConfig> = locked.queue_config().to_vec();
+        let queue_notify_counters = (0..queue_config.len())
+            .map(|index| locked.queue_notification_counter(index))
+            .collect();
         drop(locked);
 
         let queues = Self::create_queues(&queue_config);
@@ -191,6 +197,7 @@ impl MmioTransport {
             mem,
             queues: Some(queues),
             queue_evts,
+            queue_notify_counters,
             queue_config,
             shm_region_select: 0,
         })
@@ -472,8 +479,23 @@ impl BusDevice for MmioTransport {
                     0x44 => self.update_queue_field(|q| q.ready = v == 1),
                     0x50 => {
                         // Queue notification - write to the eventfd for the specified queue.
+                        let counter = self
+                            .queue_notify_counters
+                            .get(v as usize)
+                            .and_then(|counter| counter.as_ref());
+                        let timing_sequence = counter.and_then(|counter| counter.increment());
+                        let write_started = timing_sequence.map(|_| Instant::now());
+
                         if let Some(eventfd) = self.queue_evts.get(v as usize) {
                             eventfd.write(1).unwrap();
+                            if let (Some(counter), Some(sequence), Some(started)) =
+                                (counter, timing_sequence, write_started)
+                            {
+                                counter.record_eventfd_write(
+                                    sequence,
+                                    started.elapsed().as_nanos() as u64,
+                                );
+                            }
                         } else {
                             warn!("invalid queue index for notification: {v}");
                         }

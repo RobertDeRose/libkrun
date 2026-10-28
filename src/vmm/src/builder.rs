@@ -1058,7 +1058,12 @@ pub fn build_microvm(
     }
 
     #[cfg(feature = "net")]
-    attach_net_devices(&mut vmm, &vm_resources.net, intc.clone())?;
+    attach_net_devices(
+        &mut vmm,
+        &vm_resources.net,
+        intc.clone(),
+        vm_resources.vm_config().vcpu_count.unwrap_or(1),
+    )?;
     #[cfg(feature = "net")]
     if vm_resources.dhcp_client {
         vmm.kernel_cmdline.insert_str("KRUN_DHCP=1")?;
@@ -2167,9 +2172,20 @@ fn attach_net_devices(
     vmm: &mut Vmm,
     net_devices: &NetBuilder,
     intc: IrqChip,
+    vcpu_count: u8,
 ) -> Result<(), StartMicrovmError> {
     for net_device in net_devices.list.iter() {
-        let id = net_device.lock().unwrap().id().to_string();
+        let id = {
+            let mut net = net_device.lock().unwrap();
+            // Networks can be added before the VM configuration, so devices
+            // that follow the vCPU count get their queue layout here, before
+            // the MMIO transport reads it.
+            if net.auto_queue_pairs() {
+                let pairs = (vcpu_count as u16).clamp(1, devices::virtio::net::MAX_QUEUE_PAIRS);
+                net.set_queue_pairs(pairs);
+            }
+            net.id().to_string()
+        };
 
         attach_mmio_device(vmm, id, intc.clone(), net_device.clone())
             .map_err(StartMicrovmError::RegisterNetDevice)?;

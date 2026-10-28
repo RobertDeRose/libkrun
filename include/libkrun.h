@@ -426,6 +426,11 @@ int32_t krun_add_virtiofs4(uint32_t ctx_id, const char *c_tag,
 #define NET_FEATURE_HOST_TSO6 1 << 12
 #define NET_FEATURE_HOST_UFO 1 << 14
 
+/* Native vmnet TCP checksum/segmentation offloads in both directions. */
+#define VMNET_NATIVE_TCP_FEATURES (NET_FEATURE_CSUM | NET_FEATURE_GUEST_CSUM | \
+                                   NET_FEATURE_GUEST_TSO4 | NET_FEATURE_GUEST_TSO6 | \
+                                   NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6)
+
 /* These are the features enabled by krun_set_passt_fd and krun_set_gvproxy_path. */
 #define COMPAT_NET_FEATURES NET_FEATURE_CSUM | NET_FEATURE_GUEST_CSUM | \
                             NET_FEATURE_GUEST_TSO4 | NET_FEATURE_GUEST_UFO | \
@@ -527,15 +532,16 @@ int32_t krun_add_net_unixgram(uint32_t ctx_id,
  * is executing and does not retain it.
  *
  * This backend requires macOS 26 or later. Other platforms return
- * -ENOTSUP. The backend currently transports raw Ethernet frames only,
- * so "features" must be zero. NET_FLAG_DHCP_CLIENT is the only accepted
- * flag.
+ * -ENOTSUP. "features" may be zero or VMNET_NATIVE_TCP_FEATURES. With
+ * VMNET_NATIVE_TCP_FEATURES, libkrun passes large raw TCP frames in both
+ * directions with vmnet TSO and checksum offload enabled. No virtio header
+ * is exposed to vmnet. NET_FLAG_DHCP_CLIENT is the only accepted flag.
  *
  * Arguments:
  *  "ctx_id"                - the configuration context ID.
  *  "network_serialization" - opaque serialized vmnet network object.
  *  "c_mac"                 - MAC address as an array of 6 uint8_t entries.
- *  "features"              - virtio-net features; must be zero.
+ *  "features"              - zero or VMNET_NATIVE_TCP_FEATURES.
  *  "flags"                 - generic flags for the network interface.
  *
  * Returns:
@@ -557,7 +563,7 @@ int32_t krun_add_net_vmnet(uint32_t ctx_id,
  * configured statically by the caller and does not run a DHCP client; vmnet's
  * shared-mode DHCP service may remain available for other interfaces. MAC allocation
  * is disabled and c_mac supplies the six-byte unicast MAC used by virtio-net.
- * features and flags must both be zero (raw Ethernet; no offload or DHCP client).
+ * features may be zero or VMNET_NATIVE_TCP_FEATURES; flags must be zero.
  *
  * macOS 26+ and a net-enabled build are required. The caller needs vmnet setup
  * permission for this call, but may permanently drop privileges before booting
@@ -1031,6 +1037,21 @@ int32_t krun_add_vsock_port2(uint32_t ctx_id,
  *  Zero on success or a negative error number on failure.
  */
 int32_t krun_add_vsock(uint32_t ctx_id, uint32_t tsi_features);
+
+/**
+ * Connects to a listening vsock port in a running guest.
+ *
+ * The call blocks until the guest accepts or rejects the connection. The returned file descriptor
+ * is a bidirectional stream connected to the guest's AF_VSOCK listener.
+ *
+ * Arguments:
+ *  "ctx_id"    - the running configuration context ID.
+ *  "port"      - the guest vsock port to connect to.
+ *
+ * Returns:
+ *  A connected file descriptor on success or a negative error number on failure.
+ */
+int32_t krun_vsock_connect(uint32_t ctx_id, uint32_t port);
 
 /**
  * Returns the eventfd file descriptor to signal the guest to shut down orderly. This must be
